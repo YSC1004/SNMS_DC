@@ -1,0 +1,8 @@
+{
+    "python.analysis.extraPaths": [
+        "/home/ncadmin/SNMS/SNMS_DC"
+    ],
+    "python.autoComplete.extraPaths": [
+        "/home/ncadmin/SNMS/SNMS_DC"
+    ]
+}
