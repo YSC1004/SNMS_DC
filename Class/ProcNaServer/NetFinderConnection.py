@@ -52,7 +52,7 @@ class NetFinderConnection(AsSocket):
             self.m_NetFinderConnMgr.remove(self)
             return
 
-        from Server.AsciiServerWorld import AsciiServerWorld
+        from AsciiServerWorld import AsciiServerWorld
         world = AsciiServerWorld._instance
         
         # Start Alive Check

@@ -75,7 +75,7 @@ class ServerConnection(AsSocket):
         elif msg_id == AS_DB_SYNC_INFO_LIST:
             info_list = AsDbSyncInfoListT.unpack(packet.msg_body)
             if info_list:
-                from Server.AsciiServerWorld import AsciiServerWorld
+                from AsciiServerWorld import AsciiServerWorld
                 AsciiServerWorld._instance.update_db_sync_time(info_list)
 
         else:
@@ -152,7 +152,7 @@ class ServerConnection(AsSocket):
         
         if sync_kind == UNDEFINDED_SYNC: return
 
-        from Server.AsciiServerWorld import AsciiServerWorld
+        from AsciiServerWorld import AsciiServerWorld
         world = AsciiServerWorld._instance
 
         # 명령어 구성 (DbSyncUtil 호출)
@@ -187,7 +187,7 @@ class ServerConnection(AsSocket):
         """
         C++: void RecvMessage(int Message, void* AdditionInfo)
         """
-        from Server.AsciiServerWorld import AsciiServerWorld
+        from AsciiServerWorld import AsciiServerWorld
         world = AsciiServerWorld._instance
         
         if message == CMD_PARSING_RULE_DOWN:
@@ -219,11 +219,11 @@ class ServerConnection(AsSocket):
             self.m_ServerConnMgr.remove(self)
         else:
             # Standby Server로서 Active 연결이 끊김 -> Active로 승격
-            from Server.AsciiServerWorld import AsciiServerWorld
+            from AsciiServerWorld import AsciiServerWorld
             AsciiServerWorld._instance.stand_by_server_run()
 
     def session_identify(self, session_type, session_name):
-        from Server.AsciiServerWorld import AsciiServerWorld
+        from AsciiServerWorld import AsciiServerWorld
         world = AsciiServerWorld._instance
         
         print(f"[ServerConnection] Standby Server is running({session_name}, {self.get_peer_ip()})")

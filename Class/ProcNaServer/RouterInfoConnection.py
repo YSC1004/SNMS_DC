@@ -63,7 +63,7 @@ class RouterInfoConnection(AsSocket):
             print(f"[RouterInfoConnection] [CORE_ERROR] Invalid Router Info Req(equipNo over 50) {self.get_peer_ip()}")
             return
 
-        from Server.AsciiServerWorld import AsciiServerWorld
+        from AsciiServerWorld import AsciiServerWorld
         world = AsciiServerWorld._instance
         
         # 1. Get Router Info List from World

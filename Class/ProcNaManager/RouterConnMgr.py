@@ -71,7 +71,7 @@ class RouterConnMgr(SockMgrConnMgr):
         """
         self.send_process_info(name, STOP)
 
-        from Server.AsciiManagerWorld import AsciiManagerWorld
+        from AsciiManagerWorld import AsciiManagerWorld
         world = AsciiManagerWorld._instance
 
         if status == ORDER_KILL:
@@ -95,7 +95,7 @@ class RouterConnMgr(SockMgrConnMgr):
             if not self.get_process_info(session_name, proc_info):
                 return
 
-        from Server.AsciiManagerWorld import AsciiManagerWorld
+        from AsciiManagerWorld import AsciiManagerWorld
         AsciiManagerWorld._instance.send_process_info(proc_info)
 
     # -------------------------------------------------------

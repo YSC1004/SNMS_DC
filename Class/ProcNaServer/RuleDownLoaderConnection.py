@@ -51,7 +51,7 @@ class RuleDownLoaderConnection(AsSocket):
             self.m_RuleDownLoaderConnMgr.remove(self)
             return
 
-        from Server.AsciiServerWorld import AsciiServerWorld
+        from AsciiServerWorld import AsciiServerWorld
         world = AsciiServerWorld._instance
         
         # Alive Check Start

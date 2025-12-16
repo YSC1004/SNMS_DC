@@ -165,7 +165,7 @@ class ExternalConnection(AsSocket):
         ident_res = AsMmcIdentResT()
         # Initialize resultMode to 0 (Fail) by default if necessary, or handled in logic
 
-        from Server.AsciiServerWorld import AsciiServerWorld
+        from AsciiServerWorld import AsciiServerWorld
         world = AsciiServerWorld._instance
 
         # 1. Authenticate / Identify

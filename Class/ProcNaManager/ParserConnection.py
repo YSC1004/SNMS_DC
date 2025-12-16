@@ -47,7 +47,7 @@ class ParserConnection(AsSocket):
         Dispatches incoming packets from the Parser process.
         """
         msg_id = packet.msg_id
-        from Server.AsciiManagerWorld import AsciiManagerWorld
+        from AsciiManagerWorld import AsciiManagerWorld
         world = AsciiManagerWorld._instance
 
         if msg_id == CMD_OPEN_PORT_ACK:
@@ -85,7 +85,7 @@ class ParserConnection(AsSocket):
 
         print(f"[ParserConnection] SessionType : {AsUtil.get_process_type_string(session_type)}, SessionName : {session_name}")
 
-        from Server.AsciiManagerWorld import AsciiManagerWorld
+        from AsciiManagerWorld import AsciiManagerWorld
         world = AsciiManagerWorld._instance
 
         # Prepare Open Port Command
@@ -160,7 +160,7 @@ class ParserConnection(AsSocket):
         """
         print(f"[ParserConnection] Receive MMC Cmd Response : msgid({mmc_result.id}), resultMode({AsUtil.get_enum_type_string(mmc_result.resultMode)})")
         
-        from Server.AsciiManagerWorld import AsciiManagerWorld
+        from AsciiManagerWorld import AsciiManagerWorld
         AsciiManagerWorld._instance.send_command_response(mmc_result)
 
     def send_log_status(self):
@@ -172,7 +172,7 @@ class ParserConnection(AsSocket):
         log_status.logs = f"{AsUtil.get_process_type_string(self.get_session_type())},{self.get_session_name()},"
         log_status.status = LOG_DEL
         
-        from Server.AsciiManagerWorld import AsciiManagerWorld
+        from AsciiManagerWorld import AsciiManagerWorld
         AsciiManagerWorld._instance.send_log_status(log_status)
 
     def send_cmd_rule_down(self):
@@ -193,7 +193,7 @@ class ParserConnection(AsSocket):
         """
         print(f"[ParserConnection] AliveCheckFail({self.get_session_name()}) , Count : {fail_count}")
         
-        from Server.AsciiManagerWorld import AsciiManagerWorld
+        from AsciiManagerWorld import AsciiManagerWorld
         msg = f"The Process is killed on purpose for no reply from {self.get_session_name()}."
         AsciiManagerWorld._instance.send_ascii_error(1, msg)
         

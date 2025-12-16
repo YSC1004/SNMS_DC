@@ -97,7 +97,7 @@ class GuiConnMgr(ConnectionMgr):
         self.m_ParsingRuleDownReqCon = req_con
         print(f"[GuiConnMgr] Rule Down Request({req_con.get_peer_ip()})")
         
-        from Server.AsciiServerWorld import AsciiServerWorld
+        from AsciiServerWorld import AsciiServerWorld
         AsciiServerWorld._instance.cmd_parsing_rule_down()
 
     def recv_parsing_rule_down_result(self, ack):
@@ -242,7 +242,7 @@ class GuiConnMgr(ConnectionMgr):
         """
         self.m_CommandRuleDownReqCon = req_con
         
-        from Server.AsciiServerWorld import AsciiServerWorld
+        from AsciiServerWorld import AsciiServerWorld
         AsciiServerWorld._instance.cmd_command_rule_down()
 
     def recv_command_rule_down_result(self, ack):
@@ -263,7 +263,7 @@ class GuiConnMgr(ConnectionMgr):
         """
         self.m_SchedulerRuleDownReqCon = req_con
         
-        from Server.AsciiServerWorld import AsciiServerWorld
+        from AsciiServerWorld import AsciiServerWorld
         AsciiServerWorld._instance.cmd_scheduler_rule_down()
 
     def recv_scheduler_rule_down_result(self, ack):
@@ -285,7 +285,7 @@ class GuiConnMgr(ConnectionMgr):
         """
         self.m_MappingRuleDownReqCon = req_con
         
-        from Server.AsciiServerWorld import AsciiServerWorld
+        from AsciiServerWorld import AsciiServerWorld
         AsciiServerWorld._instance.cmd_mapping_rule_down()
 
     def recv_mapping_rule_down_result(self, ack):

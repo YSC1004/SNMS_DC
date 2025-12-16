@@ -82,7 +82,7 @@ class MMCGeneratorConnMgr(SockMgrConnMgr):
         if status == ORDER_KILL:
             pass
         else:
-            from Server.AsciiServerWorld import AsciiServerWorld
+            from AsciiServerWorld import AsciiServerWorld
             AsciiServerWorld._instance.process_dead(name, pid)
 
     def set_mmc_generator_session(self, session_type, mmc_con):
@@ -129,7 +129,7 @@ class MMCGeneratorConnMgr(SockMgrConnMgr):
         if status.status == LOG_ADD:
             self.m_LogStatusMap[status.name] = copy.deepcopy(status)
 
-        from Server.AsciiServerWorld import AsciiServerWorld
+        from AsciiServerWorld import AsciiServerWorld
         AsciiServerWorld._instance.send_log_status(status)
 
     def get_log_status_list(self, status_list):
@@ -159,7 +159,7 @@ class MMCGeneratorConnMgr(SockMgrConnMgr):
         """
         C++: void SendProcessInfo(...)
         """
-        from Server.AsciiServerWorld import AsciiServerWorld
+        from AsciiServerWorld import AsciiServerWorld
         
         proc_info = AsProcessStatusT()
         proc_info.ProcessId = session_name

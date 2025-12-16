@@ -51,7 +51,7 @@ class SubProcConnection(AsSocket):
         C++: void SubProcReqProcess(PACKET_T* Packet)
         """
         msg_id = packet.msg_id
-        from Server.AsciiServerWorld import AsciiServerWorld
+        from AsciiServerWorld import AsciiServerWorld
         world = AsciiServerWorld._instance
 
         if msg_id == PROC_INIT_END:
@@ -92,7 +92,7 @@ class SubProcConnection(AsSocket):
             self.m_SubProcConnMgr.remove(self)
             return
 
-        from Server.AsciiServerWorld import AsciiServerWorld
+        from AsciiServerWorld import AsciiServerWorld
         world = AsciiServerWorld._instance
 
         # 1. Update Info Status to STOP
@@ -157,7 +157,7 @@ class SubProcConnection(AsSocket):
         self.m_SubProcInfo.CurStatus = START
         self.m_SubProcInfo.RequestStatus = WAIT_NO
 
-        from Server.AsciiServerWorld import AsciiServerWorld
+        from AsciiServerWorld import AsciiServerWorld
         AsciiServerWorld._instance.recv_info_change(self.m_SubProcInfo)
 
         # 5. Start Keep-Alive
@@ -173,7 +173,7 @@ class SubProcConnection(AsSocket):
         msg = f"The SubProc({self.get_session_name()}) is killed on purpose for no reply."
         print(f"[SubProcConnection] {msg}")
 
-        from Server.AsciiServerWorld import AsciiServerWorld
+        from AsciiServerWorld import AsciiServerWorld
         AsciiServerWorld._instance.send_ascii_error(1, msg)
 
         if self.m_SubProcInfo:

@@ -48,7 +48,7 @@ class RuleDownLoaderConnMgr(SockMgrConnMgr):
             pass
         else:
             self.m_RuleDownLoaderConnection = None
-            from Server.AsciiServerWorld import AsciiServerWorld
+            from AsciiServerWorld import AsciiServerWorld
             AsciiServerWorld._instance.process_dead(name, pid)
 
     def accept_socket(self):
@@ -89,21 +89,21 @@ class RuleDownLoaderConnMgr(SockMgrConnMgr):
         """
         C++: void RecvRuleDownAck(AS_ASCII_ACK_T* Ack)
         """
-        from Server.AsciiServerWorld import AsciiServerWorld
+        from AsciiServerWorld import AsciiServerWorld
         AsciiServerWorld._instance.recv_parsing_rule_down_result(ack)
 
     def recv_mapping_rule_down_ack(self, ack):
         """
         C++: void RecvMappingRuleDownAck(AS_ASCII_ACK_T* Ack)
         """
-        from Server.AsciiServerWorld import AsciiServerWorld
+        from AsciiServerWorld import AsciiServerWorld
         AsciiServerWorld._instance.recv_mapping_rule_down_result(ack)
 
     def send_process_info(self, session_name, status):
         """
         C++: void SendProcessInfo(const char* SessionName, int Status)
         """
-        from Server.AsciiServerWorld import AsciiServerWorld
+        from AsciiServerWorld import AsciiServerWorld
         world = AsciiServerWorld._instance
         
         proc_info = AsProcessStatusT()
@@ -129,7 +129,7 @@ class RuleDownLoaderConnMgr(SockMgrConnMgr):
         if status.status == LOG_ADD:
             self.m_LogStatusMap[status.name] = copy.deepcopy(status)
 
-        from Server.AsciiServerWorld import AsciiServerWorld
+        from AsciiServerWorld import AsciiServerWorld
         AsciiServerWorld._instance.send_log_status(status)
 
     def get_log_status_list(self, status_list):

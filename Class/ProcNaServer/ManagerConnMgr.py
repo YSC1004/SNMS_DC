@@ -79,7 +79,7 @@ class ManagerConnMgr(ConnectionMgr):
         self.m_ManagerInfoMap.clear()
         
         # AsciiServerWorld -> DbManager 접근
-        from Server.AsciiServerWorld import AsciiServerWorld
+        from AsciiServerWorld import AsciiServerWorld
         db_mgr = AsciiServerWorld._instance.m_DbManager
         
         if not db_mgr.get_manager_info(self.m_ManagerInfoMap):
@@ -106,7 +106,7 @@ class ManagerConnMgr(ConnectionMgr):
 
         # 2. 개별 실행
         if info.m_ManagerInfo.RequestStatus == WAIT_NO:
-            from Server.AsciiServerWorld import AsciiServerWorld
+            from AsciiServerWorld import AsciiServerWorld
             world = AsciiServerWorld._instance
 
             print(f"[ManagerConnMgr] ManagerId : {info.m_ManagerInfo.ManagerId}, IP : {info.m_ManagerInfo.IP}")
@@ -172,7 +172,7 @@ class ManagerConnMgr(ConnectionMgr):
         info = self.find_manager_info(manager_id)
         if not info: return
         
-        from Server.AsciiServerWorld import AsciiServerWorld
+        from AsciiServerWorld import AsciiServerWorld
         cmd = f"{AsciiServerWorld._instance.get_script_dir()}/KillProcess.sh"
         self.run_command(info.m_ManagerInfo.SshID, info.m_ManagerInfo.SshPass, info.m_ManagerInfo.IP, cmd)
 
@@ -183,7 +183,7 @@ class ManagerConnMgr(ConnectionMgr):
             
         info.m_ManagerInfo.RequestStatus = WAIT_STOP
         
-        from Server.AsciiServerWorld import AsciiServerWorld
+        from AsciiServerWorld import AsciiServerWorld
         AsciiServerWorld._instance.send_info_change(info.m_ManagerInfo)
         
         if hasattr(con, 'stop_manager'):
@@ -253,7 +253,7 @@ class ManagerConnMgr(ConnectionMgr):
         """
         C++: bool RecvProcessControl(AS_PROC_CONTROL_T* ProcCtl)
         """
-        from Server.AsciiServerWorld import AsciiServerWorld
+        from AsciiServerWorld import AsciiServerWorld
         world = AsciiServerWorld._instance
         db_mgr = world.m_DbManager
 
@@ -329,7 +329,7 @@ class ManagerConnMgr(ConnectionMgr):
     # Info Change Handlers
     # ---------------------------------------------------
     def recv_info_change(self, info, result_msg=""):
-        from Server.AsciiServerWorld import AsciiServerWorld
+        from AsciiServerWorld import AsciiServerWorld
         world = AsciiServerWorld._instance
 
         # 1. Manager Info
@@ -467,7 +467,7 @@ class ManagerConnMgr(ConnectionMgr):
                 if hasattr(con, 'parser_rule_change'):
                     con.parser_rule_change(change_info)
                 
-                from Server.AsciiServerWorld import AsciiServerWorld
+                from AsciiServerWorld import AsciiServerWorld
                 AsciiServerWorld._instance.send_info_change(conn_info.m_ConnectorInfo)
                 return True
         return False
@@ -477,7 +477,7 @@ class ManagerConnMgr(ConnectionMgr):
         if not conn_info: return False
         
         conn_info.m_ConnectorInfo.Desc = info.Description
-        from Server.AsciiServerWorld import AsciiServerWorld
+        from AsciiServerWorld import AsciiServerWorld
         AsciiServerWorld._instance.send_info_change(conn_info.m_ConnectorInfo)
         return True
 
@@ -488,7 +488,7 @@ class ManagerConnMgr(ConnectionMgr):
         """
         C++: void ReceiveProcInfo(AS_PROCESS_STATUS_T* ProcInfo)
         """
-        from Server.AsciiServerWorld import AsciiServerWorld
+        from AsciiServerWorld import AsciiServerWorld
         world = AsciiServerWorld._instance
         
         if proc_info.ProcessType == ASCII_MANAGER:
@@ -524,7 +524,7 @@ class ManagerConnMgr(ConnectionMgr):
             conn_info.CurStatus = port_status.Status
             conn_info.RequestStatus = WAIT_NO
             
-            from Server.AsciiServerWorld import AsciiServerWorld
+            from AsciiServerWorld import AsciiServerWorld
             world = AsciiServerWorld._instance
             world.send_info_change(conn_info)
             
@@ -595,7 +595,7 @@ class ManagerConnMgr(ConnectionMgr):
 
             # MAINPTR / DBPTR 접근을 위한 싱글톤 가져오기
             # 순환 참조 방지를 위해 내부 Import
-            from Server.AsciiServerWorld import AsciiServerWorld
+            from AsciiServerWorld import AsciiServerWorld
             world = AsciiServerWorld._instance
             db_mgr = world.m_DbManager
 
@@ -669,7 +669,7 @@ class ManagerConnMgr(ConnectionMgr):
         else:
             # 3. 세션을 못 찾은 경우 에러 보고 (MAINPTR->SendAsciiError)
             # 순환 참조 방지를 위해 내부 Import
-            from Server.AsciiServerWorld import AsciiServerWorld
+            from AsciiServerWorld import AsciiServerWorld
             world = AsciiServerWorld._instance
             
             if world:
@@ -683,7 +683,7 @@ class ManagerConnMgr(ConnectionMgr):
         파싱 룰 변경 처리: 매니저 세션 확인 -> 커넥터 상태 확인 -> 룰 ID 갱신 -> 명령 전송
         """
         # 순환 참조 방지를 위한 내부 Import
-        from Server.AsciiServerWorld import AsciiServerWorld
+        from AsciiServerWorld import AsciiServerWorld
         world = AsciiServerWorld._instance
 
         # 1. 매니저 세션(Connection) 찾기
@@ -737,7 +737,7 @@ class ManagerConnMgr(ConnectionMgr):
 
         # 2. 메인 월드 인스턴스 접근 (스크립트 경로 획득용)
         # 순환 참조 방지를 위해 내부 Import
-        from Server.AsciiServerWorld import AsciiServerWorld
+        from AsciiServerWorld import AsciiServerWorld
         world = AsciiServerWorld._instance
 
         # 3. 커맨드 생성
@@ -857,7 +857,7 @@ class ManagerConnMgr(ConnectionMgr):
         매니저 정보 변경 처리 (메모리 갱신)
         """
         # 순환 참조 방지 Import
-        from Server.AsciiServerWorld import AsciiServerWorld
+        from AsciiServerWorld import AsciiServerWorld
         from Class.Common.AsciiServerType import ManagerInfo
 
         world = AsciiServerWorld._instance
@@ -948,7 +948,7 @@ class ManagerConnMgr(ConnectionMgr):
         커넥터 정보 변경 처리 (메모리 갱신)
         """
         # 순환 참조 방지
-        from Server.AsciiServerWorld import AsciiServerWorld
+        from AsciiServerWorld import AsciiServerWorld
         from Class.Common.AsciiServerType import ConnectorInfo
         
         world = AsciiServerWorld._instance
@@ -1069,7 +1069,7 @@ class ManagerConnMgr(ConnectionMgr):
         연결 정보 변경 처리 (메모리 갱신)
         """
         # 순환 참조 방지
-        from Server.AsciiServerWorld import AsciiServerWorld
+        from AsciiServerWorld import AsciiServerWorld
         from Class.Common.CommType import AsConnectionInfoT
         
         world = AsciiServerWorld._instance
@@ -1193,7 +1193,7 @@ class ManagerConnMgr(ConnectionMgr):
         커넥터 설명 정보 변경
         """
         # 순환 참조 방지를 위해 내부 Import
-        from Server.AsciiServerWorld import AsciiServerWorld
+        from AsciiServerWorld import AsciiServerWorld
         world = AsciiServerWorld._instance
 
         # 1. 커넥터 정보 찾기

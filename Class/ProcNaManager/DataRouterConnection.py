@@ -46,7 +46,7 @@ class DataRouterConnection(AsSocket):
         C++: void DataRouterProcReq(PACKET_T* Packet)
         """
         msg_id = packet.msg_id
-        from Server.AsciiManagerWorld import AsciiManagerWorld
+        from AsciiManagerWorld import AsciiManagerWorld
         world = AsciiManagerWorld._instance
 
         if msg_id == CMD_OPEN_PORT_ACK:
@@ -82,7 +82,7 @@ class DataRouterConnection(AsSocket):
 
         self.m_DataRouterConnMgr.send_process_info(self.get_session_name(), START)
 
-        from Server.AsciiManagerWorld import AsciiManagerWorld
+        from AsciiManagerWorld import AsciiManagerWorld
         world = AsciiManagerWorld._instance
 
         # 1. Send DATAROUTER_LISTEN info (Unix Domain Socket)
@@ -144,7 +144,7 @@ class DataRouterConnection(AsSocket):
         """
         print(f"[DataRouterConnection] Alive Check Fail(count : {fail_count}) Limite Over")
         
-        from Server.AsciiManagerWorld import AsciiManagerWorld
+        from AsciiManagerWorld import AsciiManagerWorld
         msg = f"The process is killed on purpose for no reply from {self.get_session_name()}."
         AsciiManagerWorld._instance.send_ascii_error(1, msg)
         
@@ -168,7 +168,7 @@ class DataRouterConnection(AsSocket):
         log_status.logs = f"{AsUtil.get_process_type_string(self.get_session_type())},{self.get_session_name()},"
         log_status.status = LOG_DEL
         
-        from Server.AsciiManagerWorld import AsciiManagerWorld
+        from AsciiManagerWorld import AsciiManagerWorld
         AsciiManagerWorld._instance.send_log_status(log_status)
 
     def stop_process(self):

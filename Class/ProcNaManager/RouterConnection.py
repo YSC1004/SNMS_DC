@@ -75,7 +75,7 @@ class RouterConnection(AsSocket):
         log_status.logs = f"{AsUtil.get_process_type_string(self.get_session_type())},{self.get_session_name()},"
         log_status.status = LOG_DEL
         
-        from Server.AsciiManagerWorld import AsciiManagerWorld
+        from AsciiManagerWorld import AsciiManagerWorld
         AsciiManagerWorld._instance.send_log_status(log_status)
 
     def router_proc_req(self, packet):
@@ -83,7 +83,7 @@ class RouterConnection(AsSocket):
         C++: void RouterProcReq(PACKET_T* Packet)
         """
         msg_id = packet.msg_id
-        from Server.AsciiManagerWorld import AsciiManagerWorld
+        from AsciiManagerWorld import AsciiManagerWorld
         world = AsciiManagerWorld._instance
 
         if msg_id == AS_LOG_INFO:
@@ -112,7 +112,7 @@ class RouterConnection(AsSocket):
         self.m_RouterConnMgr.send_process_info(self.get_session_name(), START)
 
         # Start Alive Check
-        from Server.AsciiManagerWorld import AsciiManagerWorld
+        from AsciiManagerWorld import AsciiManagerWorld
         world = AsciiManagerWorld._instance
         self.start_alive_check(world.get_proc_alive_check_time(), world.get_alive_check_limit_cnt())
         
@@ -123,7 +123,7 @@ class RouterConnection(AsSocket):
         """
         C++: void AliveCheckFail(int FailCount)
         """
-        from Server.AsciiManagerWorld import AsciiManagerWorld
+        from AsciiManagerWorld import AsciiManagerWorld
         world = AsciiManagerWorld._instance
         
         if fail_count > world.get_alive_check_limit_cnt():

@@ -39,7 +39,7 @@ class ServerConnection(AsSocket):
         """
         msg_id = packet.msg_id
         
-        from Server.AsciiManagerWorld import AsciiManagerWorld
+        from AsciiManagerWorld import AsciiManagerWorld
         world = AsciiManagerWorld._instance
 
         if msg_id == CMD_OPEN_PORT:
@@ -114,14 +114,14 @@ class ServerConnection(AsSocket):
         """
         C++: void RecvCmdOpenPortReq(AS_CMD_OPEN_PORT_T* PortInfo)
         """
-        from Server.AsciiManagerWorld import AsciiManagerWorld
+        from AsciiManagerWorld import AsciiManagerWorld
         AsciiManagerWorld._instance.send_cmd_open_info(port_info)
 
     def receive_mmc_command(self, mmc_com):
         """
         C++: void ReceiveMMCCommand(AS_MMC_PUBLISH_T* MMCCom)
         """
-        from Server.AsciiManagerWorld import AsciiManagerWorld
+        from AsciiManagerWorld import AsciiManagerWorld
         AsciiManagerWorld._instance.send_mmc_command(mmc_com)
 
     def send_command_response(self, mmc_result):
@@ -144,14 +144,14 @@ class ServerConnection(AsSocket):
         """
         C++: void ReceiveCmdLogStatusChange(AS_CMD_LOG_CONTROL_T* LogCtl)
         """
-        from Server.AsciiManagerWorld import AsciiManagerWorld
+        from AsciiManagerWorld import AsciiManagerWorld
         AsciiManagerWorld._instance.receive_cmd_log_status_change(log_ctl)
 
     def send_ascii_error(self, err_msg):
         """
         C++: void SendAsciiError(AS_ASCII_ERROR_MSG_T* ErrMsg)
         """
-        from Server.AsciiManagerWorld import AsciiManagerWorld
+        from AsciiManagerWorld import AsciiManagerWorld
         # Set ManagerId before sending
         err_msg.ManagerId = AsciiManagerWorld._instance.get_proc_name()
         

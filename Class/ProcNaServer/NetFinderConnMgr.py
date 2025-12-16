@@ -43,7 +43,7 @@ class NetFinderConnMgr(SockMgrConnMgr):
             pass
         else:
             self.m_NetFinderConnection = None
-            from Server.AsciiServerWorld import AsciiServerWorld
+            from AsciiServerWorld import AsciiServerWorld
             AsciiServerWorld._instance.process_dead(name, pid)
 
     def accept_socket(self):
@@ -72,7 +72,7 @@ class NetFinderConnMgr(SockMgrConnMgr):
         C++: void SendProcessInfo(const char* SessionName, int Status)
         Updates the global process information (World) regarding NetFinder status.
         """
-        from Server.AsciiServerWorld import AsciiServerWorld
+        from AsciiServerWorld import AsciiServerWorld
         world = AsciiServerWorld._instance
         
         proc_info = AsProcessStatusT()

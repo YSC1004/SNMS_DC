@@ -89,7 +89,7 @@ class DbManager:
 
         # 2. 메인 서버 인스턴스 가져오기 (MAINPTR 대응)
         # 순환 참조 방지를 위해 내부 Import
-        from Server.AsciiServerWorld import AsciiServerWorld
+        from AsciiServerWorld import AsciiServerWorld
         main_ptr = AsciiServerWorld._instance
 
         # 3. 세션 확인
@@ -691,7 +691,7 @@ class DbManager:
 
             # 3-3. 삭제 이력 저장 (DC_CNF_CONNECTOR_DELETED)
             # 메모리(AsciiServerWorld)에서 현재 정보를 가져옴
-            from Server.AsciiServerWorld import AsciiServerWorld
+            from AsciiServerWorld import AsciiServerWorld
             world = AsciiServerWorld._instance
             
             # conInfo는 ConnectorInfo 객체

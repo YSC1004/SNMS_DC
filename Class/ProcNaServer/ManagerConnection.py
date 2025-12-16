@@ -130,7 +130,7 @@ class ManagerConnection(AsSocket):
             return
 
         # 순환 참조 방지를 위해 내부 Import
-        from Server.AsciiServerWorld import AsciiServerWorld
+        from AsciiServerWorld import AsciiServerWorld
         from Class.Common.CommType import STOP, START, WAIT_NO, UNDEFINED, ASCII_MANAGER, AsProcessStatusT
         
         world = AsciiServerWorld._instance
@@ -225,7 +225,7 @@ class ManagerConnection(AsSocket):
         self.m_ManagerConnMgr.manager_session_identify(self.m_ManagerInfo.m_ManagerInfo.ManagerId)
 
         # 5. 세션 설정 (버퍼 크기 등 - AsciiServerWorld 위임)
-        from Server.AsciiServerWorld import AsciiServerWorld
+        from AsciiServerWorld import AsciiServerWorld
         world = AsciiServerWorld._instance
         # world.session_cfg(self, SESSION_TYPE_MGR) # 구현 필요 시 주석 해제
 
@@ -281,7 +281,7 @@ class ManagerConnection(AsSocket):
             conn_info.m_ConnectorInfo.RequestStatus = WAIT_START
             
             # GUI 알림
-            from Server.AsciiServerWorld import AsciiServerWorld
+            from AsciiServerWorld import AsciiServerWorld
             AsciiServerWorld._instance.send_info_change(conn_info.m_ConnectorInfo)
             
             delay_time += 1
@@ -302,7 +302,7 @@ class ManagerConnection(AsSocket):
 
         # 2. 메인 서버 에러 보고
         # 순환 참조 방지를 위해 내부 Import
-        from Server.AsciiServerWorld import AsciiServerWorld
+        from AsciiServerWorld import AsciiServerWorld
         world = AsciiServerWorld._instance
         
         if world:
@@ -336,7 +336,7 @@ class ManagerConnection(AsSocket):
 
         # 2. DB에서 IP 정보 조회 (Sequence -> IP 매핑)
         # 순환 참조 방지 Import
-        from Server.AsciiServerWorld import AsciiServerWorld
+        from AsciiServerWorld import AsciiServerWorld
         world = AsciiServerWorld._instance
         db_mgr = world.m_DbManager
         
@@ -412,7 +412,7 @@ class ManagerConnection(AsSocket):
         실행 중인 모든 DataHandler 정보를 현재 매니저 세션에 전송
         """
         # 순환 참조 방지 및 상수 Import
-        from Server.AsciiServerWorld import AsciiServerWorld
+        from AsciiServerWorld import AsciiServerWorld
         from Class.Common.CommType import START, AS_DATA_HANDLER_INFO, PacketT
 
         world = AsciiServerWorld._instance
@@ -510,7 +510,7 @@ class ManagerConnection(AsSocket):
         """
         # 필요한 상수 및 클래스 Import
         from Class.Common.CommType import LOG_ADD, AsLogStatusT
-        from Server.AsciiServerWorld import AsciiServerWorld
+        from AsciiServerWorld import AsciiServerWorld
         
         # 1. 기존 로그 정보 제거
         # C++: map.find() -> delete -> erase
@@ -594,7 +594,7 @@ class ManagerConnection(AsSocket):
         세션(Connection) 제어 명령 처리 (DB 업데이트 -> 패킷 전송)
         """
         # 순환 참조 방지 및 상수 Import
-        from Server.AsciiServerWorld import AsciiServerWorld
+        from AsciiServerWorld import AsciiServerWorld
         from Class.Common.CommType import (
             START, STOP, WAIT_NO, WAIT_START, WAIT_STOP,
             SESSION_CONTROL, AsCmdOpenPortT, PacketT

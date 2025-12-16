@@ -69,14 +69,14 @@ class MMCGenConnection(AsSocket):
         self.m_MMCGeneratorConnMgr.set_mmc_generator_session(session_type, self)
 
         if session_type == ASCII_JOB_MONITOR or session_type == ASCII_MMC_SCHEDULER:
-            from Server.AsciiServerWorld import AsciiServerWorld
+            from AsciiServerWorld import AsciiServerWorld
             # Register to World and get the Queue reference
             self.m_MMCRequestQueue = AsciiServerWorld._instance.register_mmc_req_conn(self, 100000)
 
         self.m_MMCGeneratorConnMgr.send_process_info(session_name, session_type, START)
         
         # Start Alive Check
-        from Server.AsciiServerWorld import AsciiServerWorld
+        from AsciiServerWorld import AsciiServerWorld
         world = AsciiServerWorld._instance
         self.start_alive_check(world.get_proc_alive_check_time(), world.get_alive_check_limit_cnt())
 
@@ -111,7 +111,7 @@ class MMCGenConnection(AsSocket):
         """
         print(f"[MMCGenConnection] AliveCheckFail({self.get_session_name()}) , Count : {fail_count}")
         
-        from Server.AsciiServerWorld import AsciiServerWorld
+        from AsciiServerWorld import AsciiServerWorld
         msg = f"The Process is killed on purpose for no reply from {self.get_session_name()}."
         AsciiServerWorld._instance.send_ascii_error(1, msg)
         
@@ -142,14 +142,14 @@ class MMCGenConnection(AsSocket):
             error = AsAsciiErrorMsgT.unpack(packet.msg_body)
             if error:
                 error.ProcessId = self.get_session_name()
-                from Server.AsciiServerWorld import AsciiServerWorld
+                from AsciiServerWorld import AsciiServerWorld
                 # Assuming send_ascii_error handles the object logging
                 AsciiServerWorld._instance.write_error_log(error) 
 
         elif msg_id == CMD_SCHEDULER_RULE_DOWN_ACK:
             ack = AsAsciiAckT.unpack(packet.msg_body)
             if ack:
-                from Server.AsciiServerWorld import AsciiServerWorld
+                from AsciiServerWorld import AsciiServerWorld
                 # World needs to have this method or delegate to GuiConnMgr
                 if hasattr(AsciiServerWorld._instance.m_GuiConnMgr, 'recv_scheduler_rule_down_result'):
                     AsciiServerWorld._instance.m_GuiConnMgr.recv_scheduler_rule_down_result(ack)
@@ -162,7 +162,7 @@ class MMCGenConnection(AsSocket):
         C++: void MMCGenProcReq(PACKET_T* Packet)
         """
         msg_id = packet.msg_id
-        from Server.AsciiServerWorld import AsciiServerWorld
+        from AsciiServerWorld import AsciiServerWorld
         world = AsciiServerWorld._instance
 
         if msg_id == PROC_INIT_END:
@@ -212,7 +212,7 @@ class MMCGenConnection(AsSocket):
             error = AsAsciiErrorMsgT.unpack(packet.msg_body)
             if error:
                 error.ProcessId = self.get_session_name()
-                from Server.AsciiServerWorld import AsciiServerWorld
+                from AsciiServerWorld import AsciiServerWorld
                 AsciiServerWorld._instance.write_error_log(error)
 
         else:
@@ -259,7 +259,7 @@ class MMCGenConnection(AsSocket):
         """
         # Debug Log
         # print(f"Recv Command Gen Size : {result.commandNo}")
-        from Server.AsciiServerWorld import AsciiServerWorld
+        from AsciiServerWorld import AsciiServerWorld
         # Note: In C++, MAINPTR->MMCResFromMMCGen(Result) is called.
         # Ensure AsciiServerWorld has this method.
         AsciiServerWorld._instance.mmc_res_from_mmc_gen(result)

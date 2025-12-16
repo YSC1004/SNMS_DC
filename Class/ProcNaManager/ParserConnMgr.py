@@ -53,7 +53,7 @@ class ParserConnMgr(SockMgrConnMgr):
         (C++ source has this commented out, implemented here for reference)
         """
         # print(f"[ParserConnMgr] SendRouterConnInfo : {router_name}")
-        # from Server.AsciiManagerWorld import AsciiManagerWorld
+        # from AsciiManagerWorld import AsciiManagerWorld
         # world = AsciiManagerWorld._instance
         # socket_path = world.get_router_listen_socket_path("Router")
         
@@ -70,7 +70,7 @@ class ParserConnMgr(SockMgrConnMgr):
         Called when Parser finishes initialization.
         Syncs DataHandler info to the new Parser.
         """
-        from Server.AsciiManagerWorld import AsciiManagerWorld
+        from AsciiManagerWorld import AsciiManagerWorld
         world = AsciiManagerWorld._instance
 
         # 1. Update Process Status in World
@@ -101,7 +101,7 @@ class ParserConnMgr(SockMgrConnMgr):
         """
         self.send_process_info(name, STOP)
 
-        from Server.AsciiManagerWorld import AsciiManagerWorld
+        from AsciiManagerWorld import AsciiManagerWorld
         world = AsciiManagerWorld._instance
 
         if status == ORDER_KILL:
@@ -167,7 +167,7 @@ class ParserConnMgr(SockMgrConnMgr):
             if not self.get_process_info(session_name, proc_info):
                 return
 
-        from Server.AsciiManagerWorld import AsciiManagerWorld
+        from AsciiManagerWorld import AsciiManagerWorld
         AsciiManagerWorld._instance.send_process_info(proc_info)
 
     def send_cmd_rule_down(self):

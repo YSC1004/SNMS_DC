@@ -57,7 +57,7 @@ class ConnectorConnection(AsSocket):
         self.m_ConnectorConnMgr.send_process_info(self.get_session_name(), START)
 
         # Start Alive Check
-        from Server.AsciiManagerWorld import AsciiManagerWorld
+        from AsciiManagerWorld import AsciiManagerWorld
         world = AsciiManagerWorld._instance
         self.start_alive_check(world.get_proc_alive_check_time(), world.get_alive_check_limit_cnt())
 
@@ -103,7 +103,7 @@ class ConnectorConnection(AsSocket):
         Dispatches requests received from the Connector process.
         """
         msg_id = packet.msg_id
-        from Server.AsciiManagerWorld import AsciiManagerWorld
+        from AsciiManagerWorld import AsciiManagerWorld
         world = AsciiManagerWorld._instance
 
         if msg_id == CMD_OPEN_PORT_ACK:
@@ -156,7 +156,7 @@ class ConnectorConnection(AsSocket):
         log_status.logs = f"{AsUtil.get_process_type_string(self.get_session_type())},{self.get_session_name()},"
         log_status.status = LOG_DEL
         
-        from Server.AsciiManagerWorld import AsciiManagerWorld
+        from AsciiManagerWorld import AsciiManagerWorld
         AsciiManagerWorld._instance.send_log_status(log_status)
 
     def send_session_control(self, session_ctl):
@@ -173,7 +173,7 @@ class ConnectorConnection(AsSocket):
         print(f"[ConnectorConnection] Receive MMC Cmd Response From Connector({self.get_session_name()})")
         # print(f" msgid({mmc_result.id}), resultMode({mmc_result.resultMode})") # Debug log
         
-        from Server.AsciiManagerWorld import AsciiManagerWorld
+        from AsciiManagerWorld import AsciiManagerWorld
         AsciiManagerWorld._instance.send_command_response(mmc_result)
 
     def alive_check_fail(self, fail_count):
@@ -182,7 +182,7 @@ class ConnectorConnection(AsSocket):
         """
         print(f"[ConnectorConnection] AliveCheckFail({self.get_session_name()}) , Count : {fail_count}")
         
-        from Server.AsciiManagerWorld import AsciiManagerWorld
+        from AsciiManagerWorld import AsciiManagerWorld
         msg = f"The process is killed on purpose for no reply from {self.get_session_name()}."
         AsciiManagerWorld._instance.send_ascii_error(1, msg)
         

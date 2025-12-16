@@ -50,7 +50,7 @@ class DataHandlerConnection(AsSocket):
         C++: void DataHandlerReqProcess(PACKET_T* Packet)
         """
         msg_id = packet.msg_id
-        from Server.AsciiServerWorld import AsciiServerWorld
+        from AsciiServerWorld import AsciiServerWorld
         world = AsciiServerWorld._instance
 
         if msg_id == PROC_INIT_END:
@@ -95,7 +95,7 @@ class DataHandlerConnection(AsSocket):
             self.m_DataHandlerConnMgr.remove(self)
             return
 
-        from Server.AsciiServerWorld import AsciiServerWorld
+        from AsciiServerWorld import AsciiServerWorld
         world = AsciiServerWorld._instance
 
         # Update Info Status
@@ -165,7 +165,7 @@ class DataHandlerConnection(AsSocket):
         self.m_DataHandlerInfo.CurStatus = START
         self.m_DataHandlerInfo.RequestStatus = WAIT_NO
 
-        from Server.AsciiServerWorld import AsciiServerWorld
+        from AsciiServerWorld import AsciiServerWorld
         AsciiServerWorld._instance.recv_info_change(self.m_DataHandlerInfo)
         
         # Start Alive Check
@@ -180,7 +180,7 @@ class DataHandlerConnection(AsSocket):
         msg = f"The DataHandler({self.get_session_name()}) is killed on purpose for no reply."
         print(f"[DataHandlerConnection] {msg}")
         
-        from Server.AsciiServerWorld import AsciiServerWorld
+        from AsciiServerWorld import AsciiServerWorld
         AsciiServerWorld._instance.send_ascii_error(1, msg)
         
         if self.m_DataHandlerInfo:

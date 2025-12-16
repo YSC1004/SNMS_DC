@@ -69,7 +69,7 @@ class GuiConnection(AsSocket):
     # Request Processors
     # ---------------------------------------------------
     def rule_editor_req_process(self, packet):
-        from Server.AsciiServerWorld import AsciiServerWorld
+        from AsciiServerWorld import AsciiServerWorld
         world = AsciiServerWorld._instance
         
         if packet.msg_id == CMD_PARSING_RULE_DOWN:
@@ -82,7 +82,7 @@ class GuiConnection(AsSocket):
                               "Already Rule Down Load is start\nPlease retry some time later")
 
     def gw_command_gui_req_process(self, packet):
-        from Server.AsciiServerWorld import AsciiServerWorld
+        from AsciiServerWorld import AsciiServerWorld
         world = AsciiServerWorld._instance
         
         if packet.msg_id == CMD_COMMAND_RULE_DOWN:
@@ -105,7 +105,7 @@ class GuiConnection(AsSocket):
         """
         print(f"[GuiConnection] Recv Request Status GUI : {packet.msg_id}")
         
-        from Server.AsciiServerWorld import AsciiServerWorld
+        from AsciiServerWorld import AsciiServerWorld
         world = AsciiServerWorld._instance
         ret = False
         result_msg = "" # Python에서는 참조로 문자열 변경 불가하므로 리턴값 등으로 처리 필요하지만 단순화
@@ -223,7 +223,7 @@ class GuiConnection(AsSocket):
         C++: void ReceiveDbSyncInfoReq()
         DB 동기화 정보 요청 처리 -> Standby Server 여부 확인 후 응답
         """
-        from Server.AsciiServerWorld import AsciiServerWorld
+        from AsciiServerWorld import AsciiServerWorld
         from Class.Common.CommType import AS_DB_SYNC_INFO_LIST, AS_DB_SYNC_INFO_REQ_ACK
         
         world = AsciiServerWorld._instance
@@ -279,7 +279,7 @@ class GuiConnection(AsSocket):
         C++: void SendInitInfo(int MsgId, unsigned int Mask)
         초기화 데이터 전송 전, 전송할 데이터의 총 개수를 계산하여 알림
         """
-        from Server.AsciiServerWorld import AsciiServerWorld
+        from AsciiServerWorld import AsciiServerWorld
         from Class.Common.CommType import (
             PacketT, AsGuiInitInfoT,
             INIT_INFO_MANAGER_MASK, INIT_INFO_PROCESS_MASK,
@@ -354,7 +354,7 @@ class GuiConnection(AsSocket):
         self.packet_send(PacketT(msg_id, len(body), body))
 
     def send_all_manager_info(self):
-        from Server.AsciiServerWorld import AsciiServerWorld
+        from AsciiServerWorld import AsciiServerWorld
         world = AsciiServerWorld._instance
         
         # Manager Info
@@ -369,7 +369,7 @@ class GuiConnection(AsSocket):
                     self.packet_send(PacketT(AS_CONNECTION_INFO, len(c.pack()), c.pack()))
 
     def send_all_data_handler_info(self):
-        from Server.AsciiServerWorld import AsciiServerWorld
+        from AsciiServerWorld import AsciiServerWorld
         world = AsciiServerWorld._instance
         
         for info in world.m_DataHandlerConnMgr.get_data_handler_info_map().values():
@@ -380,7 +380,7 @@ class GuiConnection(AsSocket):
         C++: void SendAllCommandAuthorityInfo()
         모든 명령어 권한 정보를 GUI로 전송
         """
-        from Server.AsciiServerWorld import AsciiServerWorld
+        from AsciiServerWorld import AsciiServerWorld
         from Class.Common.CommType import AS_COMMAND_AUTHORITY_INFO, PacketT
 
         world = AsciiServerWorld._instance
@@ -408,7 +408,7 @@ class GuiConnection(AsSocket):
         전체 프로세스 상태 정보를 GUI로 전송
         구조: Map(ManagerId) -> Map(ProcessId) -> StatusObj
         """
-        from Server.AsciiServerWorld import AsciiServerWorld
+        from AsciiServerWorld import AsciiServerWorld
         from Class.Common.CommType import AS_PROCESS_INFO, PacketT
 
         world = AsciiServerWorld._instance
@@ -439,7 +439,7 @@ class GuiConnection(AsSocket):
         C++: void SendAllEtcInfo()
         시스템 정보 및 세션 설정 정보 전송
         """
-        from Server.AsciiServerWorld import AsciiServerWorld
+        from AsciiServerWorld import AsciiServerWorld
         from Class.Common.CommType import AS_SYSTEM_INFO, AS_SESSION_CFG, PacketT
 
         world = AsciiServerWorld._instance
@@ -476,7 +476,7 @@ class GuiConnection(AsSocket):
         C++: void ReceiveMMCReq(AS_MMC_REQUEST_T* MMCReq)
         MMC 요청 처리 및 결과 전송
         """
-        from Server.AsciiServerWorld import AsciiServerWorld
+        from AsciiServerWorld import AsciiServerWorld
         from Class.Common.CommType import (
             AsMmcPublishT, AsMmcResultT, PacketT,
             NO_RESPONSE, IMMEDIATE, R_ERROR, AS_MMC_RES
@@ -512,7 +512,7 @@ class GuiConnection(AsSocket):
         if log_ctl.Type == GET_LOG_INFO:
             self.send_all_log_status()
         else:
-            from Server.AsciiServerWorld import AsciiServerWorld
+            from AsciiServerWorld import AsciiServerWorld
             AsciiServerWorld._instance.receive_cmd_log_status_change(log_ctl)
 
     def send_all_log_status(self):
@@ -520,7 +520,7 @@ class GuiConnection(AsSocket):
         C++: void SendAllLogStatus()
         시스템의 모든 로그 상태 정보를 조회하여 GUI로 전송
         """
-        from Server.AsciiServerWorld import AsciiServerWorld
+        from AsciiServerWorld import AsciiServerWorld
         
         # 1. 로그 상태 리스트 수집
         # C++: LogStatusVector logStatusList; MAINPTR->GetLogStatusList(&logStatusList);
@@ -549,7 +549,7 @@ class GuiConnection(AsSocket):
 
         # 필요한 상수 Import
         from Class.Common.CommType import GET_LOG_INFO
-        from Server.AsciiServerWorld import AsciiServerWorld
+        from AsciiServerWorld import AsciiServerWorld
 
         # 1. 로그 정보 조회 요청 (GET_LOG_INFO)
         if log_ctl.Type == GET_LOG_INFO:
@@ -585,7 +585,7 @@ class GuiConnection(AsSocket):
         """
         print(f"[GuiConnection] Recv Request Cmd GUI : {packet.msg_id}")
 
-        from Server.AsciiServerWorld import AsciiServerWorld
+        from AsciiServerWorld import AsciiServerWorld
         from Class.Common.CommType import (
             CMD_COMMAND_RULE_DOWN, CMD_COMMAND_RULE_DOWN_ACK,
             CMD_SCHEDULER_RULE_DOWN, CMD_SCHEDULER_RULE_DOWN_ACK
@@ -627,7 +627,7 @@ class GuiConnection(AsSocket):
         # 디버그 로그
         # print(f"[GuiConnection] Recv Request Status GUI : {packet.msg_id}")
 
-        from Server.AsciiServerWorld import AsciiServerWorld
+        from AsciiServerWorld import AsciiServerWorld
         from Class.Common.CommType import (
             MANAGER_MODIFY, MANAGER_MODIFY_ACK,
             CONNECTOR_MODIFY, CONNECTOR_MODIFY_ACK,
