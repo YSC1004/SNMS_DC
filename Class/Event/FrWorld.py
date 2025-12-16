@@ -69,53 +69,60 @@ class FrWorld:
     m_Argv = []
 
     def __init__(self, mode=FR_MODE.FR_SUB):
+        """
+        C++: FrWorld Constructor
+        """
+        # [수정] 메서드 호출 전에 멤버 변수들을 가장 먼저 초기화합니다.
+        self.m_WorldId = FrWorld.m_GlobalWorldId
+        FrWorld.m_GlobalWorldId += 1
+        self.m_EventThreadId = 0
+        
         self.m_FrMode = mode
         self.m_RunStatus = False
         
         self.m_EventSrcList = [] # List of FrEventSrc
         
         # ---------------------------------------------------
-        # Event Sources 초기화 및 등록
+        # Event Sources Initialization
         # ---------------------------------------------------
         
-        # 1. Input Event Source (소켓 I/O)
+        # 1. Input Event Source (Socket I/O)
         if FrInputEventSrc:
             self.m_InputEventSrc = FrInputEventSrc()
         else:
             self.m_InputEventSrc = FrEventSrc() # Fallback
 
-        # 2. Timer Event Source (타이머)
+        # 2. Timer Event Source (Timer)
         if FrTimerEventSrc:
             self.m_TimerEventSrc = FrTimerEventSrc()
         else:
             self.m_TimerEventSrc = FrEventSrc() # Fallback
         
-        # 리스트에 등록 (우선순위: Input -> Timer)
+        # Register Event Sources
         self.register_event_src(self.m_InputEventSrc)
         self.register_event_src(self.m_TimerEventSrc)
 
-        # 3. Signal Event Source (시그널 - Main World만 가짐)
+        # 3. Signal Event Source (Signal - Main World only)
         self.m_SignalEventSrc = None
         if self.m_FrMode == FR_MODE.FR_MAIN:
             if FrSignalEventSrc:
                 self.m_SignalEventSrc = FrSignalEventSrc()
                 self.register_event_src(self.m_SignalEventSrc)
             
-            # 메인 월드 등록
+            # Register Main World
             FrWorld.m_MainWorldPtr = self
             self.m_EventThreadId = threading.get_ident()
+            
+            # 이제 m_WorldId가 이미 초기화되었으므로 안전하게 호출할 수 있습니다.
             self.register_world(self, self.m_EventThreadId)
 
         self.m_WorldPipe = None 
-        
-        self.m_WorldId = FrWorld.m_GlobalWorldId
-        FrWorld.m_GlobalWorldId += 1
         
         self.m_MajorVersion = 0
         self.m_MinorVersion = 0
         self.m_VersionInfo = ""
         
-        # Select용 변수
+        # Select Variables
         self.rd_fds = []
         self.wr_fds = []
         self.ex_fds = []

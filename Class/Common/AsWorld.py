@@ -2,13 +2,17 @@ import sys
 import os
 import threading
 
-# 프로젝트 경로 설정
+# -------------------------------------------------------
+# Project Path Setup
+# -------------------------------------------------------
 current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.abspath(os.path.join(current_dir, '../..'))
 if project_root not in sys.path:
     sys.path.append(project_root)
 
-# 모듈 Import
+# -------------------------------------------------------
+# Imports
+# -------------------------------------------------------
 from Class.Event.FrWorld import FrWorld, FR_MODE
 from Class.Event.FrThreadWorld import FrThreadWorld
 from Class.Common.AsEnvrion import AsEnvrion
@@ -17,18 +21,13 @@ from Class.Common.AsWorldLogTimer import AsWorldLogTimer
 from Class.Common.AsWorldTimer import AsWorldTimer
 from Class.Util.FrArgParser import FrArgParser
 from Class.Util.FrTime import FrTime
-from Class.Event.FrLogger import FrLogger, FrLogDef
+from Class.Event.FrLogger import FrLogger
 
-# 임시 Import (나중에 구현 필요)
+# Lazy / Optional Imports
 try:
     from Class.Common.SockMgrConnMgr import SockMgrConnMgr
 except ImportError:
     SockMgrConnMgr = None
-
-try:
-    from Class.Common.AsSystemChecker import AsSystemChecker
-except ImportError:
-    AsSystemChecker = None
 
 try:
     from Class.Common.CommType import *
@@ -37,19 +36,24 @@ except ImportError:
 
 # -------------------------------------------------------
 # AsWorld Class
-# 애플리케이션 메인 비즈니스 로직을 담는 World 클래스
 # -------------------------------------------------------
 class AsWorld(FrWorld):
-    # Static Members
+    """
+    Application Core Logic World Class.
+    Manages Config, Directories, Logging, Timers, and Connection Managers.
+    Inherits from FrWorld (Event Loop Engine).
+    """
+    
+    # Static Members (Shared across instances if multiple, though usually Singleton)
     m_ConnectionMgrVector = []
     m_ConnectionMgrVectorLock = threading.Lock()
     m_StartDir = ""
 
-    def __init__(self):
+    def __init__(self, mode=FR_MODE.FR_MAIN):
         """
         C++: AsWorld()
         """
-        super().__init__(FR_MODE.FR_MAIN)
+        super().__init__(mode)
         
         self.m_ProcName = ""
         self.m_ProcessType = -1
@@ -62,13 +66,13 @@ class AsWorld(FrWorld):
         self.m_SockMgrConnMgr = None
         self.m_SockMgrWorld = None
         
-        # System Info (AsSystemInfoT 구조체)
+        # System Info (AsSystemInfoT)
         self.m_SystemInfo = None 
         
         # Config Parser
         self.m_Envrion = AsEnvrion()
         
-        # Paths
+        # Directory Paths
         self.m_RootDir = ""
         self.m_BinDir = ""
         self.m_LogDir = ""
@@ -93,13 +97,13 @@ class AsWorld(FrWorld):
         """
         C++: ~AsWorld()
         """
-        if self.m_AsWorldTimer:
+        # Cleanup Timers (Check existence to avoid AttributeError during failed init)
+        if hasattr(self, 'm_AsWorldTimer') and self.m_AsWorldTimer:
             self.m_AsWorldTimer.unregister_sensor()
-        if self.m_AsWorldLogTimer:
+            
+        if hasattr(self, 'm_AsWorldLogTimer') and self.m_AsWorldLogTimer:
             self.m_AsWorldLogTimer.unregister_sensor()
             
-        # Vector 자체는 Static이라 여기서 지우면 안 될 수 있음 (C++ 로직 확인)
-        # Python GC에 맡김
         super().__del__()
 
     # ---------------------------------------------------
@@ -108,7 +112,7 @@ class AsWorld(FrWorld):
     def init_config(self):
         """
         C++: bool InitConfig()
-        환경변수에서 설정파일 경로를 읽어 로딩
+        Loads configuration from file specified in env NETADAPTER_CONFIG_FILE.
         """
         env_file = os.environ.get("NETADAPTER_CONFIG_FILE")
         if not env_file:
@@ -124,7 +128,7 @@ class AsWorld(FrWorld):
             print("[AsWorld] Use default netadapter_start_dir_name : [NAA]")
             self.m_StartDir = "NAA"
         
-        # Root Dir
+        # Root Dir (Home + StartDir)
         home_dir = AsUtil.get_home_dir()
         if not home_dir:
             print("[AsWorld] Can't find home dir (env : HOME)")
@@ -151,6 +155,9 @@ class AsWorld(FrWorld):
         return True
 
     def get_env_value(self, section, sub_section):
+        """
+        C++: string GetEnvValue(string Section, string SubSection)
+        """
         return self.m_Envrion.get_env_value(section, sub_section)
 
     # ---------------------------------------------------
@@ -169,19 +176,23 @@ class AsWorld(FrWorld):
     def get_unix_socket_dir(self):
         self.m_UnixSocketListenDir = os.path.join(self.get_system_dir(), "UnixSocket")
         return self.m_UnixSocketListenDir
-
-    # ... (기타 GetDir 함수들은 패턴이 같으므로 생략 가능하나 필요시 추가) ...
+        
+    def get_raw_dir(self):
+        self.m_RawDir = os.path.join(self.m_RootDir, "RawLog")
+        return self.m_RawDir
 
     def ascii_system_dir_check(self):
         """
-        필수 디렉토리가 있는지 확인하고 없으면 생성
+        C++: bool AsciiSystemDirCheck()
+        Checks if required directories exist, creates them if not.
         """
         dirs = [
             self.get_log_dir(),
             self.get_bin_dir(),
             self.get_system_dir(),
             self.get_unix_socket_dir(),
-            # ...
+            self.get_raw_dir()
+            # Add other dirs as needed
         ]
         
         for d in dirs:
@@ -213,21 +224,28 @@ class AsWorld(FrWorld):
         return self.m_ProcName
 
     def set_log_file(self, proc_type):
+        """
+        C++: void SetLogFile(int ProcType)
+        Sets up the log file based on process type and rotation cycle.
+        """
         self.m_ProcType = proc_type
         self.log_file_changed_event()
 
     def log_file_changed_event(self):
         """
-        로그 파일명 생성 및 Open, 다음 변경 타이머 설정
+        C++: void LogFileChangedEvent()
+        Handles log rotation logic.
         """
         cur_time = FrTime()
         hour_buf = ""
         
-        # Argv 파싱 (로그 주기 확인)
-        arg_parser = FrArgParser(FrWorld.m_Argv)
-        log_cycle = arg_parser.get_value("-logcycle") # ARG_LOG_CYCLE
-        
-        if log_cycle == "HOUR":
+        # Parse argv to find -logcycle
+        log_cycle = "DAY" # Default
+        # Using FrWorld.m_Argv directly (assuming it's set in init)
+        parser = FrArgParser(FrWorld.m_Argv)
+        val = parser.get_value("-logcycle")
+        if val == "HOUR":
+            log_cycle = "HOUR"
             hour_buf = f"{cur_time.get_hour():02d}"
         
         proc_type_str = AsUtil.get_process_type_string(self.m_ProcType)
@@ -245,10 +263,11 @@ class AsWorld(FrWorld):
         logger = FrLogger.get_instance()
         logger.open(full_path)
 
-        # 타이머 설정 (다음 변경 시점)
+        # Set Timer for Next Rotation
         if self.m_AsWorldLogTimer is None:
             self.m_AsWorldLogTimer = AsWorldLogTimer(self)
 
+        sec_val = 0
         if log_cycle == "HOUR":
             sec_val = cur_time.get_remain_hour_sec()
             if sec_val == 0: sec_val = 3600
@@ -256,13 +275,17 @@ class AsWorld(FrWorld):
             sec_val = cur_time.get_remain_day_sec()
             if sec_val == 0: sec_val = 86400
             
-        # 20초 여유를 둠
+        # Add 20 seconds buffer
         self.m_AsWorldLogTimer.set_timer(sec_val + 20, 1)
 
     # ---------------------------------------------------
-    # Timer Management (Delegate to AsWorldTimer)
+    # Timer Management
     # ---------------------------------------------------
     def set_timer(self, interval, reason, extra_reason=None):
+        """
+        C++: int SetTimer(int Interval, int Reason, void* ExtraReason)
+        Delegates to AsWorldTimer.
+        """
         if self.m_AsWorldTimer is None:
             self.m_AsWorldTimer = AsWorldTimer(self)
         return self.m_AsWorldTimer.set_timer(interval, reason, extra_reason)
@@ -270,9 +293,8 @@ class AsWorld(FrWorld):
     def receive_time_out(self, reason, extra_reason):
         """
         C++: virtual void ReceiveTimeOut(...)
-        자식 클래스에서 구현
+        To be overridden by child classes.
         """
-        # print("[AsWorld] ReceiveTimeOut virtual function")
         pass
 
     # ---------------------------------------------------
@@ -295,25 +317,43 @@ class AsWorld(FrWorld):
     # SockMgr Session (Separate Thread)
     # ---------------------------------------------------
     def enable_sock_mgr_session(self, session_name, port):
+        """
+        C++: bool EnableSockMgrSession(string SessionName, int Port)
+        Creates a separate thread/world for socket management (e.g. Admin interface).
+        """
         if not SockMgrConnMgr:
-            print("[AsWorld] SockMgrConnMgr not found")
+            print("[AsWorld] SockMgrConnMgr not found (Import Error)")
             return False
 
         self.m_SockMgrConnMgr = SockMgrConnMgr()
         self.m_SockMgrConnMgr.set_object_name(session_name)
 
-        # 리스너 생성 (Create -> Listen) - SockMgrConnMgr 내부 구현 가정
         if not self.m_SockMgrConnMgr.listen(port):
             print(f"[AsWorld] Enable SockMgr Session Fail (Port:{port})")
             return False
 
-        # 별도 스레드 월드 생성 및 실행
         self.m_SockMgrWorld = FrThreadWorld()
         if not self.m_SockMgrWorld.run():
             return False
 
-        # 소켓 매니저를 새 월드로 이동
         self.m_SockMgrConnMgr.change_world(self.m_SockMgrWorld)
         
         print(f"[AsWorld] Enable SockMgr Session Success (Port:{port})")
         return True
+
+    # ---------------------------------------------------
+    # Helper Methods
+    # ---------------------------------------------------
+    def get_proc_alive_check_time(self):
+        return self.m_AliveCheckIntervalTime
+
+    def get_alive_check_limit_cnt(self):
+        return self.m_AliveCheckLimitCnt
+        
+    def set_system_info(self, proc_type, proc_name):
+        """
+        Initialize System Info structure.
+        """
+        # Needs AsSystemInfoT definition
+        # self.m_SystemInfo = AsSystemInfoT()
+        pass
