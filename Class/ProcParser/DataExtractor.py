@@ -14,8 +14,14 @@ if project_root not in sys.path:
 
 from Class.Common.CommType import AsParsedDataT, PARSED_DATA_SEG_BLK_SIZE
 from Class.ProcParser.ParsingIdentMgr import ParsingIdentMgr
-from Class.ProcParser.RuleType import * 
-# XML related imports would go here if XML parsing is needed
+from Class.ProcParser.RuleType import * # Import Rule Constants
+
+# -------------------------------------------------------
+# XML Related Imports
+# -------------------------------------------------------
+import xml.parsers.expat  # C++ expat 대응 (Error 처리 등)
+
+from Class.ProcParser.XMLParserMgr import XmlParserMgr
 
 class GUIDMaker:
     """
@@ -75,12 +81,36 @@ class DataExtractor:
         self.m_EndLineNumber = -1
         self.m_MsgBuf = "" # Current Message String
 
+        # [XML 파서 활성화]
+        if XmlParserMgr:
+            self.m_XmlParserMgr = XmlParserMgr()
+        else:
+            self.m_XmlParserMgr = None
+
     def __del__(self):
         """
         C++: ~DataExtractor()
+        Performs cleanup. In Python, GC handles memory, but explicit clearing
+        can help break circular references or release resources immediately.
         """
-        pass
+        # m_SplitMsgMap.clear()
+        if hasattr(self, 'm_SplitMsgMap') and self.m_SplitMsgMap:
+            self.m_SplitMsgMap.clear()
 
+        # m_TokenListMap.Clear()
+        if hasattr(self, 'm_TokenListMap') and self.m_TokenListMap:
+            self.m_TokenListMap.clear()
+
+        # delete m_ParsedData
+        self.m_ParsedData = None
+
+        # delete m_LongResult
+        self.m_LongResult = None
+
+        # if(m_XmlParserMgr) delete m_XmlParserMgr
+        if hasattr(self, 'm_XmlParserMgr'):
+            self.m_XmlParserMgr = None
+    
     def init_guid_maker(self, pid, thread_id, host_ip):
         self.m_GUIDMaker.init(pid, thread_id, host_ip)
 
