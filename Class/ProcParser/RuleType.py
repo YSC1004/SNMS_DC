@@ -108,6 +108,16 @@ PARSING_RULE_DATE_MASK              = 0x00000002
 PARSING_RULE_TIME_MASK              = 0x00000004
 PARSING_RULE_DATE_TIME_MASK         = 0x00000008
 
+# 기존 내용 아래에 추가
+
+# -------------------------------------------------------
+# XML Parsing Return Codes
+# -------------------------------------------------------
+XML_DATA_END = -3
+XML_FIND_PCDATA_ERROR = -2
+XML_FIND_PCDATA_NOEXIST = 0
+XML_FIND_ATTRNAME_ERROR = -4
+
 # -------------------------------------------------------
 # Classes
 # -------------------------------------------------------

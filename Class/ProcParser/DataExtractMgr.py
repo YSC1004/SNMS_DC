@@ -9,62 +9,60 @@ project_root = os.path.abspath(os.path.join(current_dir, '../..'))
 if project_root not in sys.path:
     sys.path.append(project_root)
 
-# Lazy Import to avoid circular dependency issues if DataExtractor imports Mgr
-try:
-    from Class.ProcParser.DataExtractor import DataExtractor
-except ImportError:
-    pass
+from Class.ProcParser.DataExtractor import DataExtractor
 
 class DataExtractMgr:
     """
-    Manager class for Data Extraction.
-    Delegates actual parsing tasks to the DataExtractor instance.
+    Manages the extraction of data from raw messages.
+    Acts as a bridge between DataRouterConnection and DataExtractor.
     """
-    def __init__(self):
+    def __init__(self, conn):
         """
-        C++: DataExtractMgr::DataExtractMgr()
+        C++: DataExtractManager(DataRouterConnection* Conn)
         """
-        # Create DataExtractor instance, passing self as parent/manager
-        self.m_DataExtractor = DataExtractor(self)
+        self.m_Conn = conn
+        
+        # Create the core parsing engine
+        # Pass 'self' so DataExtractor can callback (ParsingResult)
+        self.m_DataExtractor = DataExtractor(self) 
 
     def __del__(self):
         """
-        C++: DataExtractMgr::~DataExtractMgr()
+        C++: ~DataExtractManager()
         """
         pass
 
-    def init_guid_maker(self, pid, thread_id, host_ip):
+    def init_guid_maker(self, pid, tid, ip):
         """
-        C++: void InitGUIDMaker(int Pid, int ThreadId, string HostIP)
+        Initialize GUID Maker in DataExtractor.
         """
         if self.m_DataExtractor:
-            self.m_DataExtractor.init_guid_maker(pid, thread_id, host_ip)
+            self.m_DataExtractor.init_guid_maker(pid, tid, ip)
 
-    def data_extract_by_info(self, info, consumer):
+    def data_extract(self, ident_rule, ident_id_string, raw_msg, session_name):
         """
-        C++: void DataExtract(IdentInfo* Info, const char* Consumer)
-        Overloaded method wrapper for IdentInfo object.
+        Entry point called by DataRouterConnection.
+        Delegates the actual parsing work to DataExtractor.
         """
         if self.m_DataExtractor:
-            # Extract fields from IdentInfo and delegate
-            self.m_DataExtractor.parsing(
-                info.m_IdentRulePtr, 
-                info.m_IdentIdString, 
-                info.m_ConvertMsg, 
-                consumer
-            )
+            self.m_DataExtractor.parsing(ident_rule, ident_id_string, raw_msg, session_name)
 
-    def data_extract(self, ident_rule, id_string, convert_msg, consumer):
+    def parsing_result(self, consumers, p_data):
         """
-        C++: void DataExtract(IdentRule* IdentRule, const char* IdString, char* ConvertMsg, const char* Consumer)
-        Direct parsing method.
+        C++: void ParsingResult(const char* Consumers, const AS_PARSED_DATA_T* Pdata)
+        Callback method called by DataExtractor when parsing is successful.
+        Forwards the result to the Connection.
         """
-        if self.m_DataExtractor:
-            self.m_DataExtractor.parsing(ident_rule, id_string, convert_msg, consumer)
+        if self.m_Conn:
+            self.m_Conn.parsing_result(consumers, p_data)
 
-    def remake_msg(self):
+    def parse_error(self, error_info):
         """
-        C++: void ReMakeMsg()
+        C++: void ParseError(ParseErrorInfo& ErrorInfo)
+        Callback method called by DataExtractor (XML parsing) when an error occurs.
         """
-        if self.m_DataExtractor:
-            self.m_DataExtractor.remake_msg()
+        if self.m_Conn:
+            # Assuming connection handles logging or error reporting
+            # In C++: m_Conn->SendParseError(errorInfo) or similar
+            # For now, we just print or delegate if method exists
+            print(f"[DataExtractMgr] Parse Error: {error_info.m_ErrorStr}")
