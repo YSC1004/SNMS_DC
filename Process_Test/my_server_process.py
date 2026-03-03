@@ -7,7 +7,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 # 2. 모듈 Import (C++의 #include "frMySQLSession.h" 와 유사)
 # Class 폴더 안의 Sql 폴더 안의 FrMySQLSession 파일에서 FrMySQLSession 클래스를 가져옴
-from Class.Sql.FrMySQLSession import FrMySQLSession, FrDbParam
+from Class.Sql.fr_mysql_session import FrMySQLSession, FrDbParam
 
 def main():
     print(">> Starting Server Process...")

@@ -46,7 +46,7 @@ from Class.Sql.FrDbBaseType import *
 
 # Mock Framework Imports (Replace with actual implementations)
 try:
-    from Class.Util.FrUtilMisc import FrUtilMisc
+    from Class.Util.fr_util_misc import FrUtilMisc
     from Class.Common.AsUtil import AsUtil
     from Class.Sql.FrDbParam import FrDbParam, FrDbRecord
 

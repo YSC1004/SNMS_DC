@@ -14,7 +14,7 @@ if project_root not in sys.path:
 # 2. 모듈 Import
 # -------------------------------------------------------
 # FrDbParam 위치: Class/SqlType/FrDbParam.py
-from Class.SqlType.FrDbParam import FrDbParam, FrDbRecord
+from Class.SqlType.fr_db_param import FrDbParam, FrDbRecord
 # FrBaseType 위치: Class/Sql/FrBaseType.py
 from Class.Sql.FrBaseType import EDB_TYPE
 

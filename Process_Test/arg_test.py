@@ -9,7 +9,7 @@ project_root = os.path.abspath(os.path.join(current_dir, '..'))
 if project_root not in sys.path:
     sys.path.append(project_root)
 
-from Class.Util.FrArgParser import FrArgParser
+from Class.Util.fr_arg_parser import FrArgParser
 
 # -------------------------------------------------------------
 # 2. 테스트 시나리오

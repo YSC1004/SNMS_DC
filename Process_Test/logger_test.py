@@ -8,7 +8,7 @@ if project_root not in sys.path:
     sys.path.append(project_root)
 
 # 메인 프로세스 초기화 부분
-from Class.Event.FrLogger import FrLogger, FrLogDef
+from Class.Util.fr_logger import FrLogger, FrLogDef
 import logging
 
 # 1. 로거 초기화 및 파일 오픈

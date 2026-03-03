@@ -19,10 +19,10 @@ from Class.Common.AsciiServerType import ManagerInfo, ConnectorInfo, ConnectionI
 from Class.Common.CommType import *
 from Class.Common.AsUtil import AsUtil
 from Class.ProcNaServer.ManagerConnection import ManagerConnection
-from Class.Util.FrSshUtil import FrSshUtil
+from Class.Util.fr_ssh_util import FrSshUtil
 from Class.Event.FrTimerSensor import FrTimerSensor
-from Class.Util.FrBaseList import StringIntKey
-from Class.Util.FrTime import FrTime
+from Class.Util.fr_base_list import StringIntKey
+from Class.Util.fr_time import FrTime
 
 # -------------------------------------------------------
 # ManagerConnMgr Class

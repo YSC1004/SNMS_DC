@@ -10,7 +10,7 @@ if project_root not in sys.path:
     sys.path.append(project_root)
 
 # 파일: Server/ssh_test.py
-from Class.Util.FrSshUtil import FrSshUtil
+from Class.Util.fr_ssh_util import FrSshUtil
 
 ssh = FrSshUtil()
 

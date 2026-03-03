@@ -13,10 +13,10 @@ if project_root not in sys.path:
     sys.path.append(project_root)
 
 # Import Dependencies
-from Class.procNaDBGw.DBGwMgr import DBGwMgr
+from Class.ProcNaDBGw.DBGwMgr import DBGwMgr
 from Class.libDBGw.libDBGwSvr.DBGwServerSession import DBGwServerSession
 from Class.Sql.FrDbBaseType import eDB_TYPE
-from Class.Util.FrUtilMisc import FrUtilMisc
+from Class.Util.fr_util_misc import FrUtilMisc
 
 class DBGwWorld:
     """

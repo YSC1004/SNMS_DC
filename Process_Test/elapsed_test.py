@@ -8,7 +8,7 @@ project_root = os.path.abspath(os.path.join(current_dir, '..'))
 if project_root not in sys.path:
     sys.path.append(project_root)
 
-from Class.Util.ElaspedTime import ElaspedTime
+from Class.Util.elasped_time import ElaspedTime
 
 def main():
     print(">> ElapsedTime Test Start")

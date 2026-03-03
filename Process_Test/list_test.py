@@ -7,7 +7,7 @@ project_root = os.path.abspath(os.path.join(current_dir, '..'))
 if project_root not in sys.path:
     sys.path.append(project_root)
 
-from Class.Util.FrBaseList import FrStringList, FrStringVector, FrIntVector
+from Class.Util.fr_base_list import FrStringList, FrStringVector, FrIntVector
 
 def main():
     print(">> List/Vector Test Start")

@@ -7,7 +7,7 @@ project_root = os.path.abspath(os.path.join(current_dir, '..'))
 if project_root not in sys.path:
     sys.path.append(project_root)
 
-from Class.Util.FrTokenizer import FrTokenizer
+from Class.Util.fr_tokenizer import FrTokenizer
 
 def main():
     print(">> Tokenizer Test Start\n")

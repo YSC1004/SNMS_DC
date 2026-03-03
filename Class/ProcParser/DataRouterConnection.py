@@ -16,7 +16,7 @@ from Class.Common.CommType import *
 from Class.Common.AsUtil import AsUtil
 from Class.ProcParser.ParserType import *
 from Class.ProcParser.DataExtractManager import DataExtractManager
-from Class.Util.FrUtilMisc import FrUtilMisc
+from Class.Util.fr_util_misc import FrUtilMisc
 
 class DataRouterConnection(AsSocket):
     """

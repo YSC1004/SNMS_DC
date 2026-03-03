@@ -16,8 +16,8 @@ if project_root not in sys.path:
 from Class.Event.FrRdFdSensor import FrRdFdSensor
 from Class.Event.FrSensor import SENSOR_MODE
 from Class.Event.FrSockFdManager import FrSocketInfo, SOCK_INFO_MODE, SOCK_INFO_USE_TYPE
-from Class.Util.FrTime import FrTime
-from Class.Util.FrUtilMisc import FrUtilMisc
+from Class.Util.fr_time import FrTime
+from Class.Util.fr_util_misc import FrUtilMisc
 
 # -------------------------------------------------------
 # Constants

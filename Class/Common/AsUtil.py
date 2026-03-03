@@ -14,7 +14,7 @@ if project_root not in sys.path:
 # -------------------------------------------------------
 # 2. 모듈 Import
 # -------------------------------------------------------
-from Class.Util.FrUtilMisc import FrUtilMisc
+from Class.Util.fr_util_misc import FrUtilMisc
 
 # CommType의 모든 상수와 구조체를 가져옴
 try:

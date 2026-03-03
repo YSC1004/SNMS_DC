@@ -8,9 +8,9 @@ if project_root not in sys.path:
     sys.path.append(project_root)
 
 # 모듈 Import
-from Class.Sql.FrDbSession import FrDbSession
+from Class.Sql.fr_db_session import FrDbSession
 from Class.Sql.FrBaseType import EDB_TYPE, E_QUERY_DATA_TYPE
-from Class.SqlType.FrDbParam import FrDbParam
+from Class.SqlType.fr_db_param import FrDbParam
 from Class.Common.CommType import *
 from Class.Common.AsciiServerType import *
 from Class.Common.AsUtil import AsUtil

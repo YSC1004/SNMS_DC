@@ -14,7 +14,7 @@ if project_root not in sys.path:
     sys.path.append(project_root)
 # -------------------------------------------------------------
 
-from Class.Util.FrDirReader import FrDirReader, READ_TYPE
+from Class.Util.fr_dir_reader import FrDirReader, READ_TYPE
 
 # 1. 객체 생성 및 디렉토리 읽기
 reader = FrDirReader("/home/ncadmin/log")

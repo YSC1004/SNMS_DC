@@ -30,8 +30,8 @@ from Class.Common.CommType import NO_SEG, SEG_ING, SEG_END
 # Mock Imports for External Frameworks (fr)
 # These should be replaced with actual implementations (e.g., pymysql wrappers)
 try:
-    from Class.Sql.FrDbSession import FrDbSession, QueryResult
-    from Class.Util.FrUtilMisc import FrUtilMisc
+    from Class.Sql.fr_db_session import FrDbSession, QueryResult
+    from Class.Util.fr_util_misc import FrUtilMisc
     from Class.Event.FrLogger import FrLogger
 except ImportError:
     # Placeholder classes for compilation
@@ -262,7 +262,7 @@ class DBGwServer:
         C++: void DbQueryReqSelectBulk(...)
         Executes Select query and sends ALL results in bulk chunks.
         """
-        from Class.Sql.FrDbSession import QueryResult
+        from Class.Sql.fr_db_session import QueryResult
         result = QueryResult()
         
         start_time = time.time()

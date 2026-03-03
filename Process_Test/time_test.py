@@ -15,7 +15,7 @@ if project_root not in sys.path:
 # -------------------------------------------------------------
 
 # 이제 Class 모듈을 찾을 수 있습니다
-from Class.Util.FrTime import FrTime
+from Class.Util.fr_time import FrTime
 
 # 1. 현재 시간
 t1 = FrTime()

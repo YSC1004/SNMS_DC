@@ -11,7 +11,7 @@ if project_root not in sys.path:
 
 from Class.ProcParser.IdentMgr import IdentMgr
 from Class.Common.CommType import AsMmcResultT, MAX_RESULT_MSG, R_CONTINUE, R_COMPLETE, MMC_CMD_RESULT
-from Class.Util.FrUtilMisc import FrUtilMisc
+from Class.Util.fr_util_misc import FrUtilMisc
 
 class IdentManager(IdentMgr):
     """

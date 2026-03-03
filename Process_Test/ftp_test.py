@@ -10,7 +10,7 @@ if project_root not in sys.path:
     sys.path.append(project_root)
 
 # 파일: Server/ftp_test.py
-from Class.Util.FrFtpUtil import FrFtpUtil
+from Class.Util.fr_ftp_util import FrFtpUtil
 
 ftp = FrFtpUtil()
 

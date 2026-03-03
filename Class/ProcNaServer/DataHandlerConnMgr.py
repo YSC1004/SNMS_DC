@@ -17,7 +17,7 @@ from Class.Common.SockMgrConnMgr import SockMgrConnMgr
 from Class.ProcNaServer.DataHandlerConnection import DataHandlerConnection
 from Class.Common.CommType import *
 from Class.Common.AsUtil import AsUtil
-from Class.Util.FrSshUtil import FrSshUtil 
+from Class.Util.fr_ssh_util import FrSshUtil 
 
 class DataHandlerConnMgr(SockMgrConnMgr):
     """

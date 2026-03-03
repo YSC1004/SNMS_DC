@@ -9,7 +9,7 @@ project_root = os.path.abspath(os.path.join(current_dir, '../..'))
 if project_root not in sys.path:
     sys.path.append(project_root)
 
-from Class.Util.FrUtilMisc import FrUtilMisc
+from Class.Util.fr_util_misc import FrUtilMisc
 
 # -------------------------------------------------------
 # Enums
