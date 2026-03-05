@@ -8,8 +8,8 @@ project_root = os.path.abspath(os.path.join(current_dir, '../..'))
 if project_root not in sys.path:
     sys.path.append(project_root)
 
-from Class.Event.FrSignalSensor import FrSignalSensor
-from Class.Event.FrWorld import FrWorld
+from Class.Event.fr_signal_sensor import FrSignalSensor
+from Class.Event.fr_world import FrWorld
 
 # -------------------------------------------------------
 # ClearSignalSensor Class

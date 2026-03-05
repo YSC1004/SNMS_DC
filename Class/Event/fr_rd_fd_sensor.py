@@ -9,8 +9,8 @@ project_root = os.path.abspath(os.path.join(current_dir, '../..'))
 if project_root not in sys.path:
     sys.path.append(project_root)
 
-from Class.Event.FrSensor import FrSensor, SENSOR_TYPE, SENSOR_MODE
-from Class.Event.FrRdFdSensorTimer import FrRdFdSensorTimer
+from Class.Event.fr_sensor import FrSensor, SENSOR_TYPE, SENSOR_MODE
+from Class.Event.fr_rd_fd_sensor_timer import FrRdFdSensorTimer
 
 # -------------------------------------------------------
 # FrRdFdSensor Class

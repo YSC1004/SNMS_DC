@@ -16,29 +16,29 @@ if project_root not in sys.path:
 # -------------------------------------------------------
 # 2. 모듈 Import
 # -------------------------------------------------------
-from Class.Event.FrEventSrc import FrEventSrc
+from Class.Event.fr_event_src import FrEventSrc
 
 # [Input Event Source]
 try:
-    from Class.Event.FrInputEventSrc import FrInputEventSrc
+    from Class.Event.fr_input_event_src import FrInputEventSrc
 except ImportError:
     FrInputEventSrc = None
 
 # [Timer Event Source]
 try:
-    from Class.Event.FrTimerEventSrc import FrTimerEventSrc
+    from Class.Event.fr_timer_event_src import FrTimerEventSrc
 except ImportError:
     FrTimerEventSrc = None
 
 # [Signal Event Source]
 try:
-    from Class.Event.FrSignalEventSrc import FrSignalEventSrc
+    from Class.Event.fr_signal_event_src import FrSignalEventSrc
 except ImportError:
     FrSignalEventSrc = None
 
 # [World Pipe & Message Info]
 try:
-    from Class.Event.FrWorldPipe import FrWorldPipe, FrMessageInfo
+    from Class.Event.fr_world_pipe import FrWorldPipe, FrMessageInfo
 except ImportError:
     FrWorldPipe = None
     FrMessageInfo = None

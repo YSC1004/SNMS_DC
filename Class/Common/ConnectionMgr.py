@@ -13,7 +13,7 @@ if project_root not in sys.path:
 # -------------------------------------------------------
 # 2. 모듈 Import
 # -------------------------------------------------------
-from Class.Event.FrSockFdManager import FrSockFdManager, FrSocketInfo, \
+from Class.Event.fr_sock_fd_manager import FrSockFdManager, FrSocketInfo, \
     SOCK_INFO_WRITERABLE_STATUS_OK, SOCK_INFO_WRITERABLE_STATUS_NOK
 
 # [주의] AsWorld는 여기서 import 하지 않고 __init__ 내부에서 import 합니다.

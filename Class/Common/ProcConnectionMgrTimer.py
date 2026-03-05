@@ -7,7 +7,7 @@ project_root = os.path.abspath(os.path.join(current_dir, '../..'))
 if project_root not in sys.path:
     sys.path.append(project_root)
 
-from Class.Event.FrTimerSensor import FrTimerSensor
+from Class.Event.fr_timer_sensor import FrTimerSensor
 
 # -------------------------------------------------------
 # ProcConnectionMgrTimer Class

@@ -1,178 +1,118 @@
+# -*- coding: utf-8 -*-
 """
 frDbResultSet.h / frDbResultSet.C  →  fr_db_result_set.py
+Python 3.11
 
-변환 매핑:
-  frDbRecordSet          → DbRecordSet
-  frDbSession* (friend)  → DbSession 참조 (순환 참조 방지: TYPE_CHECKING)
-  frDbParam*             → DbParam
-  frDbDescRecordList*    → DbDescRecordList
-  frDbDefRecordList*     → DbDefRecordList
-  RsFetchInfo*           → RsFetchInfo
-  void* m_Cursor         → Any (DB 드라이버 커서 객체)
+변환 설계:
+  frDbRecordSet → DbRecordSet
 
-  MoveNext()             → move_next()   : 한 행씩 fetch
-  MoveFirst()            → move_first()  : 첫 행으로 이동 (결과 재순회)
-  MoveLast()             → move_last()   : 마지막 행까지 모두 fetch
-  IsValid()              → is_valid()
-
-설계:
-  - C++ 에서 frDbSession 이 friend 로 내부 멤버를 직접 설정했던 부분은
-    Python 에서 DbSession 이 DbRecordSet 의 메서드를 통해 설정.
-  - MoveFirst() 는 C++ 헤더에 선언됐지만 구현이 없었음 →
-    Python 에서 rewind + 첫 레코드 반환으로 구현.
-  - MoveLast() 도 선언만 있었음 → 전체 fetch 후 마지막 행 반환으로 구현.
-  - Python iterator 지원 추가 (for record in rs:)
+C++ → Python 주요 변환:
+  friend class frDbSession   → DbSession 의 _fetch_data / _close_cursor 호출
+  frDbDescRecordList*        → DbDescRecordList (인스턴스)
+  frDbDefRecordList*         → DbDefRecordList  (인스턴스)
+  frDbParam*                 → DbParam          (인스턴스)
+  void* m_Cursor             → object (cx_Oracle cursor 또는 None)
+  MoveFirst / MoveLast       → 원본 미구현 → 구현 추가
 """
 
-from __future__ import annotations
-
 import logging
-from typing import TYPE_CHECKING, Any, Iterator, Optional
+from typing import Optional, TYPE_CHECKING
 
 from Class.SqlType.fr_db_base_type import (
-    DbDescRecordList,
-    DbDefRecordList,
     DbType,
+    DbDescRecordList, DbDefRecordList,
     RsFetchInfo,
 )
 from Class.SqlType.fr_db_param import DbParam, DbRecord
 
 if TYPE_CHECKING:
-    from Class.Sql.fr_db_session import DbSession   # 순환 참조 방지
+    from Class.Sql.fr_db_session import DbSession
 
 logger = logging.getLogger(__name__)
 
 
 class DbRecordSet:
     """
-    DB 쿼리 결과 커서 및 레코드 순회 클래스 (frDbRecordSet 대응).
+    C++ frDbRecordSet 대응.
+    execute_rs() 가 반환하는 스트리밍 커서 래퍼.
 
-    DbSession.execute_query() 가 반환하며, 직접 생성하지 않는 것이 원칙.
+    MoveNext() 를 반복 호출하여 한 행씩 fetch.
+    모든 행을 소비하거나 소멸 시 커서를 자동 해제.
+
+    사용 예:
+        rs = session.execute_rs("SELECT ...")
+        if rs.is_valid():
+            while True:
+                record = rs.move_next()
+                if record is None:
+                    break
+                print(record.values)
     """
 
-    def __init__(self, db_session: "DbSession", db_kind: int):
-        """
-        C++ frDbRecordSet(frDbSession*, int DbKind) 대응.
-        db_kind: DbType enum 값
-        """
-        self._is_valid:   bool                      = False
-        self._is_end_row: bool                      = False
-        self._db_session: "DbSession"               = db_session
-        self._db_kind:    int                       = db_kind
-        self._cursor:     Any                       = None
-        self._desc_list:  DbDescRecordList          = DbDescRecordList()
-        self._def_list:   DbDefRecordList           = DbDefRecordList()
-        self._db_param:   DbParam                   = DbParam()
-        self._fetch_info: Optional[RsFetchInfo]     = None
+    def __init__(self, db_session: "DbSession", db_kind: int) -> None:
+        self._db_session: "DbSession"       = db_session
+        self._db_kind:    int               = db_kind
 
-        # 외부에서 읽기 가능한 속성
-        self.error: str = ""
-        self.query: str = ""
+        self._is_valid:   bool              = False
+        self._is_end_row: bool              = False
 
-    def __del__(self):
+        self._cursor:     object            = None   # C++ void* m_Cursor
+        self._db_param:   DbParam           = DbParam()
+        self._desc_list:  DbDescRecordList  = DbDescRecordList()
+        self._def_list:   DbDefRecordList   = DbDefRecordList()
+        self._fetch_info: RsFetchInfo | None = None
+
+        self.error: str = ""    # C++ m_Error
+        self.query: str = ""    # C++ m_Query
+
+    def __del__(self) -> None:
         self._close()
 
-    def __enter__(self) -> "DbRecordSet":
+    def __iter__(self):
+        """Python iterator 지원 — for record in rs: 사용 가능."""
         return self
 
-    def __exit__(self, *_) -> None:
-        self._close()
+    def __next__(self) -> DbRecord:
+        record = self.move_next()
+        if record is None:
+            raise StopIteration
+        return record
 
     # ------------------------------------------------------------------ #
-    # 유효성 확인
+    # 내부 해제
     # ------------------------------------------------------------------ #
+    def _close(self) -> None:
+        """C++ 소멸자 대응. 커서 및 리소스 해제."""
+        if self._cursor is not None:
+            try:
+                self._db_session._close_cursor(self._cursor)
+            except Exception:
+                pass
+            self._cursor = None
 
+        if self._fetch_info is not None:
+            self._fetch_info = None
+
+    # ------------------------------------------------------------------ #
+    # 유효성
+    # ------------------------------------------------------------------ #
     def is_valid(self) -> bool:
         """C++ IsValid() 대응."""
         return self._is_valid
 
     # ------------------------------------------------------------------ #
-    # 행 이동 / Fetch
-    # ------------------------------------------------------------------ #
-
-    def move_next(self) -> Optional[DbRecord]:
-        """
-        C++ MoveNext() 대응.
-        다음 행을 DB 에서 fetch 하여 반환.
-        더 이상 행이 없으면 None.
-
-        동작:
-          1) FetchInfo 미생성 시 최초 1회 생성
-          2) DbSession._fetch_data() 로 한 행 fetch
-          3) 결과를 m_DbParam 에 AddRecord
-          4) 행 없으면 m_IsEndRow = True
-        """
-        if not self._db_param.get_col():
-            return None
-
-        if self._is_end_row:
-            return None
-
-        # FetchInfo 최초 생성
-        if self._fetch_info is None:
-            self._fetch_info = RsFetchInfo(
-                cursor    = self._cursor,
-                col_cnt   = self._db_param.get_col(),
-                desc_list = self._desc_list,
-                def_list  = self._def_list,
-            )
-
-        record = self._db_session._fetch_data(self._fetch_info)
-        if record:
-            self._db_param.add_record(record)
-        else:
-            self._is_end_row = True
-
-        return record
-
-    def move_first(self) -> Optional[DbRecord]:
-        """
-        C++ MoveFirst() 대응 (구현 없었음 → 첫 레코드 반환으로 구현).
-        이미 fetch 된 레코드가 있으면 첫 번째 반환,
-        없으면 move_next() 호출.
-        """
-        if self._db_param.get_row() > 0:
-            return self._db_param.get_record_head()
-        return self.move_next()
-
-    def move_last(self) -> Optional[DbRecord]:
-        """
-        C++ MoveLast() 대응 (구현 없었음 → 전체 fetch 후 마지막 반환).
-        """
-        last: Optional[DbRecord] = None
-        while True:
-            rec = self.move_next()
-            if rec is None:
-                break
-            last = rec
-        return last
-
-    def fetch_all(self) -> list[DbRecord]:
-        """
-        모든 행을 fetch 하여 리스트로 반환 (Python 추가 편의 메서드).
-        """
-        records: list[DbRecord] = []
-        while True:
-            rec = self.move_next()
-            if rec is None:
-                break
-            records.append(rec)
-        return records
-
-    # ------------------------------------------------------------------ #
     # 행/열 수
     # ------------------------------------------------------------------ #
-
     def get_col(self) -> int:
         """C++ GetCol() 대응."""
         return self._db_param.get_col()
 
     def get_row(self) -> int:
-        """C++ GetRow() 대응. (fetch 된 행 수)"""
+        """C++ GetRow() — 현재까지 fetch 된 행 수."""
         return self._db_param.get_row()
 
     def set_col(self, col: int) -> None:
-        """C++ SetCol() 대응. DbSession 이 쿼리 실행 후 설정."""
+        """C++ SetCol() 대응. execute_rs() 내부에서 호출."""
         self._db_param.set_col(col)
 
     def set_row(self, row: int) -> None:
@@ -180,69 +120,67 @@ class DbRecordSet:
         self._db_param.set_row(row)
 
     # ------------------------------------------------------------------ #
-    # DbParam / Cursor 접근 (DbSession friend 접근 대응)
+    # 커서 이동
     # ------------------------------------------------------------------ #
-
-    @property
-    def db_param(self) -> DbParam:
-        """내부 DbParam 접근 (DbSession 에서 사용)."""
-        return self._db_param
-
-    def set_cursor(self, cursor: Any) -> None:
-        """DB 드라이버 커서 설정 (DbSession 이 호출)."""
-        self._cursor = cursor
-
-    def set_valid(self, valid: bool) -> None:
-        """유효성 플래그 설정 (DbSession 이 호출)."""
-        self._is_valid = valid
-
-    # ------------------------------------------------------------------ #
-    # Python iterator 지원
-    # ------------------------------------------------------------------ #
-
-    def __iter__(self) -> Iterator[DbRecord]:
+    def move_next(self) -> DbRecord | None:
         """
-        for record in rs: 직접 순회 지원.
-        이미 fetch 된 레코드 + 미fetch 행 모두 순회.
+        C++ MoveNext() 대응.
+        다음 행을 fetch 하여 DbRecord 반환.
+        더 이상 행이 없으면 None 반환.
         """
-        # 이미 fetch 된 레코드 먼저 반환
-        for rec in self._db_param.get_value() or []:
-            yield DbRecord(rec)
+        if not self.get_col() or self._is_end_row:
+            return None
 
-        # 나머지 fetch
-        while not self._is_end_row:
-            rec = self.move_next()
-            if rec is None:
+        # FetchInfo 최초 생성 (커서 + 컬럼 메타 묶음)
+        if self._fetch_info is None:
+            self._fetch_info = RsFetchInfo(
+                cursor    = self._cursor,
+                col_cnt   = self.get_col(),
+                desc_list = self._desc_list,
+                def_list  = self._def_list,
+            )
+
+        record = self._db_session._fetch_data(self._fetch_info)
+        if record is not None:
+            self._db_param.add_record(record)
+        else:
+            self._is_end_row = True
+
+        return record
+
+    def move_first(self) -> DbRecord | None:
+        """
+        C++ MoveFirst() 대응 (원본 미구현).
+        이미 fetch 된 레코드가 있으면 첫 번째 반환,
+        없으면 move_next() 로 첫 행 fetch.
+        """
+        if self._db_param.get_row() > 0:
+            self._db_param.rewind()
+            return self._db_param.get_record_head()
+        return self.move_next()
+
+    def move_last(self) -> DbRecord | None:
+        """
+        C++ MoveLast() 대응 (원본 미구현).
+        모든 행을 fetch 한 뒤 마지막 레코드 반환.
+        """
+        last: DbRecord | None = None
+        while True:
+            record = self.move_next()
+            if record is None:
                 break
-            yield rec
+            last = record
+        return last
 
-    def __len__(self) -> int:
-        return self._db_param.get_row()
-
-    def __repr__(self) -> str:
-        return (
-            f"DbRecordSet(valid={self._is_valid}, "
-            f"rows={self.get_row()}, cols={self.get_col()}, "
-            f"end={self._is_end_row})"
-        )
-
-    # ------------------------------------------------------------------ #
-    # 내부 정리
-    # ------------------------------------------------------------------ #
-
-    def _close(self) -> None:
+    def fetch_all(self) -> list[DbRecord]:
         """
-        C++ ~frDbRecordSet() 대응.
-        커서 닫기 + 내부 객체 정리.
+        전체 행을 한 번에 fetch 하여 리스트로 반환.
+        Python 편의 메서드 (C++ 원본 없음).
         """
-        try:
-            if self._cursor and self._db_session:
-                self._db_session._close_cursor(self._cursor)
-                self._cursor = None
-        except Exception as e:
-            logger.debug("DbRecordSet._close: %s", e)
-
-        self._desc_list.clear_all()
-        self._def_list.clear_all()
-        self._db_param.clear()
-        self._fetch_info = None
+        records: list[DbRecord] = []
+        while True:
+            record = self.move_next()
+            if record is None:
+                break
+            records.append(record)
+        return records

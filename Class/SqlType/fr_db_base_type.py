@@ -1,433 +1,401 @@
+# -*- coding: utf-8 -*-
 """
-frDbBaseType.h / frDbBaseType.C  →  fr_db_base_type.py
+frDbBaseType.h  →  fr_db_base_type.py
+Python 3.11
 
-변환 매핑:
-  C++ typedef (sb1~ub4)           → Python int (크기 제한 없음, 주석으로 범위 표기)
-  eDB_TYPE                        → DbType(IntEnum)
-  eDB_CHARACTER_SET               → DbCharSet(IntEnum)
-  eQUERY_DATA_TYPE                → QueryDataType(IntEnum)
-  eQUERY_JOIN_POSITION            → QueryJoinPosition(IntEnum)
-  QueryBindData::BIND_TYPE        → BindType(IntEnum)
-  frDbDescRecord                  → DbDescRecord (dataclass)
-  frDbDescRecordList              → DbDescRecordList (list 래퍼)
-  frDbDefRecord                   → DbDefRecord (dataclass)
-  frDbDefRecordList               → DbDefRecordList (list 래퍼)
-  RsFetchInfo                     → RsFetchInfo (dataclass)
-  QueryResult                     → QueryResult
-  QueryBindData                   → QueryBindData (dataclass)
-  BindParamByPos                  → BindParamByPos (list 래퍼)
-  BindParamByName                 → BindParamByName (list 래퍼)
-  FR_DB_INFO_T (struct)           → DbInfo (dataclass)
-  frOCIDate / frOCITime           → OciDate / OciTime (dataclass)
-  frMySQLDate                     → MySQLDate (dataclass)
-  char***  m_Buf                  → list[list[str | None]]
-  DB_MAX_ITEM_BUF_SIZE = 2048     → 상수로 유지
+변환 설계:
+  eDB_TYPE            → DbType       (IntEnum)
+  eDB_CHARACTER_SET   → DbCharSet    (IntEnum)
+  eQUERY_DATA_TYPE    → QueryDataType  (IntEnum)
+  eQUERY_JOIN_POSITION→ QueryJoinPosition (IntEnum)
+  frDbDescRecord      → DbDescRecord
+  frDbDescRecordList  → DbDescRecordList (list 상속)
+  frDbDefRecord       → DbDefRecord
+  frDbDefRecordList   → DbDefRecordList  (list 상속)
+  RsFetchInfo         → RsFetchInfo
+  QueryResult         → QueryResult
+  QueryBindData       → QueryBindData
+  BindParamByPos      → BindParamByPos   (list 상속)
+  BindParamByName     → BindParamByName  (list 상속)
+  FR_DB_INFO_T        → DbInfo          (dataclass)
+  frOCIDate/Time      → 내부 참조용 (cx_Oracle datetime 으로 대체)
 """
-
-from __future__ import annotations
 
 import logging
+import datetime
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import Any, Optional
+from typing import Optional, TYPE_CHECKING
 
-from Class.Util.fr_time import FrTime
+if TYPE_CHECKING:
+    from Class.SqlType.fr_db_param import DbParam
 
 logger = logging.getLogger(__name__)
 
-# ── 상수 ─────────────────────────────────────────────────────────────────────
 DB_MAX_ITEM_BUF_SIZE = 2048
-NEW_INSTANCE         = 0
-ALREADY_INSTANCE     = 1
 
-# ── DB 타입 상수 문자열 ───────────────────────────────────────────────────────
+# ── DB 타입 문자열 상수 ────────────────────────────────────────────────────────
 DB_ORACLE_OCI_STR = "ORACLE"
 DB_MYSQL_STR      = "MYSQL"
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
 # Enum 정의
-# ══════════════════════════════════════════════════════════════════════════════
-
+# ─────────────────────────────────────────────────────────────────────────────
 class DbType(IntEnum):
-    """eDB_TYPE 대응."""
-    ORACLE_OCI2   = 0
-    MYSQL         = 1
-    MSSQL_ODBC    = 2
-    ORACLE_ODBC   = 3
-    ASCA_DB_GW    = 4
-    ORACLE_OCI_OLD= 5
-    UNKNOWN       = 99
-
-    @classmethod
-    def from_str(cls, s: str) -> "DbType":
-        s = s.upper()
-        if s == DB_ORACLE_OCI_STR:
-            return cls.ORACLE_OCI2
-        if s == DB_MYSQL_STR:
-            return cls.MYSQL
-        return cls.UNKNOWN
+    """C++ eDB_TYPE 대응."""
+    ORACLE_OCI2  = 0
+    MYSQL        = 1
+    MSSQL_ODBC   = 2
+    ORACLE_ODBC  = 3
+    ASCA_DB_GW   = 4
+    ORACLE_OCI_OLD = 5
+    UNKNOWN      = 99
 
 
 class DbCharSet(IntEnum):
-    """eDB_CHARACTER_SET 대응."""
-    NONE = 0
+    """C++ eDB_CHARACTER_SET 대응."""
+    NOTE = 0
     UTF8 = 1
 
 
 class QueryDataType(IntEnum):
-    """eQUERY_DATA_TYPE 대응."""
-    DATE_TYPE = 0
-    SYSDATE   = 1
+    """C++ eQUERY_DATA_TYPE 대응."""
+    DATE_TYPE = 0   # eDATE_TYPE
+    SYSDATE   = 1   # eSYSDATE
 
 
 class QueryJoinPosition(IntEnum):
-    """eQUERY_JOIN_POSITION 대응."""
-    LEFT_JOIN  = 0
-    RIGHT_JOIN = 1
+    """C++ eQUERY_JOIN_POSITION 대응."""
+    LEFT_JOIN  = 0  # eLEFT_JOIN
+    RIGHT_JOIN = 1  # eRIGHT_JOIN
 
 
-class BindType(IntEnum):
-    """QueryBindData::BIND_TYPE 대응."""
-    BIND_STR  = 0
-    BIND_INT  = 1
-    BIND_FLT  = 2
-    BIND_DATE = 3
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# OCI / MySQL 날짜 구조체
-# ══════════════════════════════════════════════════════════════════════════════
-
+# ─────────────────────────────────────────────────────────────────────────────
+# Oracle OCI 날짜 구조체 (cx_Oracle datetime 으로 대체 가능하나 호환용 유지)
+# ─────────────────────────────────────────────────────────────────────────────
 @dataclass
-class OciTime:
-    """frOCITime 대응."""
-    hour:   int = 0   # 0 ~ 23
-    minute: int = 0   # 0 ~ 59
-    second: int = 0   # 0 ~ 59
+class FrOCITime:
+    """C++ frOCITime 대응."""
+    hour:   int = 0
+    minute: int = 0
+    second: int = 0
 
 
 @dataclass
-class OciDate:
-    """frOCIDate 대응."""
-    year:     int     = 0
-    month:    int     = 1
-    day:      int     = 1
-    datetime: OciTime = field(default_factory=OciTime)
+class FrOCIDate:
+    """C++ frOCIDate 대응."""
+    year:  int = 0
+    month: int = 1
+    day:   int = 1
+    time:  FrOCITime = field(default_factory=FrOCITime)
+
+    def to_datetime(self) -> datetime.datetime:
+        return datetime.datetime(
+            self.year, self.month, self.day,
+            self.time.hour, self.time.minute, self.time.second,
+        )
 
 
 @dataclass
-class MySQLDate:
-    """frMySQLDate 대응."""
-    year:        int  = 0
-    month:       int  = 0
-    day:         int  = 0
-    hour:        int  = 0
-    minute:      int  = 0
-    second:      int  = 0
-    second_part: int  = 0
+class FrMySQLDate:
+    """C++ frMySQLDate 대응."""
+    year:        int = 0
+    month:       int = 0
+    day:         int = 0
+    hour:        int = 0
+    minute:      int = 0
+    second:      int = 0
+    second_part: int = 0
     neg:         bool = False
-    time_type:   int  = 0
+
+    def to_datetime(self) -> datetime.datetime:
+        return datetime.datetime(
+            self.year, self.month, self.day,
+            self.hour, self.minute, self.second,
+        )
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# frDbDescRecord / frDbDescRecordList
-# ══════════════════════════════════════════════════════════════════════════════
-
-@dataclass
+# ─────────────────────────────────────────────────────────────────────────────
+# Oracle Describe / Define 레코드 (OraSession2 내부 전용)
+# ─────────────────────────────────────────────────────────────────────────────
 class DbDescRecord:
     """
-    frDbDescRecord 대응.
-    DB 컬럼 메타 정보(타입, 크기, 정밀도 등).
+    C++ frDbDescRecord 대응.
+    cx_Oracle 에서는 cursor.description 으로 대체되므로
+    OraSession2 내부에서만 참조.
     """
-    db_size:   int   = 0
-    db_type:   int   = 0
-    buf:       bytes = field(default_factory=lambda: bytes(DB_MAX_ITEM_BUF_SIZE))
-    buf_len:   int   = 0
-    dsize:     int   = 0
-    precision: int   = 0
-    scale:     int   = 0
-    null_ok:   int   = 0
+    __slots__ = ('db_size', 'db_type', 'buf', 'buf_len',
+                 'dsize', 'precision', 'scale', 'null_ok')
+
+    def __init__(self) -> None:
+        self.db_size:  int   = 0
+        self.db_type:  int   = 0
+        self.buf:      bytes = b'\x00' * DB_MAX_ITEM_BUF_SIZE
+        self.buf_len:  int   = 0
+        self.dsize:    int   = 0
+        self.precision:int   = 0
+        self.scale:    int   = 0
+        self.null_ok:  int   = 0
 
 
 class DbDescRecordList(list):
-    """
-    frDbDescRecordList 대응.
-    list[DbDescRecord] 래퍼. clear_all() 로 명시적 초기화.
-    """
-    def clear_all(self) -> None:
-        """C++ Clear() 대응 (GC 자동 처리)."""
-        self.clear()
+    """C++ frDbDescRecordList 대응."""
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# frDbDefRecord / frDbDefRecordList
-# ══════════════════════════════════════════════════════════════════════════════
-
-@dataclass
-class DbDefRecord:
-    """
-    frDbDefRecord 대응.
-    DB fetch 결과 버퍼.
-    """
-    buf:          bytearray = field(
-                      default_factory=lambda: bytearray(DB_MAX_ITEM_BUF_SIZE)
-                  )
-    long_buf:     Optional[bytearray] = None   # m_LongBuf (동적 할당 대응)
-    flt_buf:      float                = 0.0
-    int_buf:      int                  = 0
-    indp:         int                  = 0     # sb2 m_Indp (NULL 지시자)
-    col_ret_len:  int                  = 0
-    col_ret_code: int                  = 0
-
-
-class DbDefRecordList(list):
-    """
-    frDbDefRecordList 대응.
-    list[DbDefRecord] 래퍼.
-    """
     def clear_all(self) -> None:
         """C++ Clear() 대응."""
         self.clear()
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# RsFetchInfo
-# ══════════════════════════════════════════════════════════════════════════════
+class DbDefRecord:
+    """
+    C++ frDbDefRecord 대응.
+    cx_Oracle 에서는 cursor fetch 결과가 Python 객체로 반환되므로
+    OraSession2 내부에서만 참조.
+    """
+    __slots__ = ('buf', 'long_buf', 'flt_buf', 'int_buf',
+                 'indp', 'col_ret_len', 'col_ret_code')
 
+    def __init__(self) -> None:
+        self.buf:          bytearray = bytearray(DB_MAX_ITEM_BUF_SIZE)
+        self.long_buf:     bytearray | None = None
+        self.flt_buf:      float = 0.0
+        self.int_buf:      int   = 0
+        self.indp:         int   = 0    # < 0 이면 NULL
+        self.col_ret_len:  int   = 0
+        self.col_ret_code: int   = 0
+
+
+class DbDefRecordList(list):
+    """C++ frDbDefRecordList 대응."""
+
+    def clear_all(self) -> None:
+        """C++ Clear() 대응."""
+        self.clear()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RsFetchInfo  (OraSession2 내부 전용)
+# ─────────────────────────────────────────────────────────────────────────────
 class RsFetchInfo:
     """
-    frRsFetchInfo 대응.
-    커서 + 컬럼 수 + 메타/결과 리스트 묶음.
+    C++ RsFetchInfo 대응.
+    frDbRecordSet 스트리밍 fetch 시 커서·컬럼 정보를 묶어 전달.
     """
-    def __init__(
-        self,
-        cursor:    Any,
-        col_cnt:   int,
-        desc_list: DbDescRecordList,
-        def_list:  DbDefRecordList,
-    ):
+    __slots__ = ('cursor', 'col_cnt', 'desc_list', 'def_list')
+
+    def __init__(self,
+                 cursor:    object,
+                 col_cnt:   int,
+                 desc_list: DbDescRecordList,
+                 def_list:  DbDefRecordList) -> None:
         self.cursor    = cursor
         self.col_cnt   = col_cnt
         self.desc_list = desc_list
         self.def_list  = def_list
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
 # QueryResult
-# ══════════════════════════════════════════════════════════════════════════════
-
+# ─────────────────────────────────────────────────────────────────────────────
 class QueryResult:
     """
-    frQueryResult 대응.
-    DB 쿼리 결과를 담는 컨테이너.
+    C++ QueryResult 대응.
+    sql_query() 실행 결과를 담는 컨테이너.
 
-    C++ char*** m_Buf → list[list[str | None]]
-    (row 우선, None = SQL NULL 값)
+    buf 구조: buf[row][col] → str  (C++ char*** m_Buf)
     """
 
-    def __init__(self):
-        self.buf:          list[list[Optional[str]]] = []
+    def __init__(self) -> None:
+        self.init()
+
+    def init(self) -> None:
+        """C++ Init() 대응."""
+        self.buf:          list[list[str]] | None = None  # C++ char*** m_Buf
         self.error_string: str  = ""
-        self.error_code:   int  = -1
+        self.error_code:   int  = 0
         self.row_cnt:      int  = 0
         self.col_cnt:      int  = 0
         self.result:       int  = 0
-        self.param:        Any  = None
-
-    def init(self) -> None:
-        """C++ Init() 대응. 모든 필드 초기화."""
-        self.buf          = []
-        self.error_string = ""
-        self.error_code   = -1
-        self.row_cnt      = 0
-        self.col_cnt      = 0
-        self.result       = 0
-        self.param        = None
+        self.param:        "DbParam | None" = None        # C++ frDbParam* m_Param
 
     def free(self) -> None:
-        """C++ Free() 대응. param 해제."""
-        self.param = None
+        """C++ Free() 대응. param 해제 후 초기화."""
+        if self.param is not None:
+            self.param.clear()
+            self.param = None
+        self.buf = None
 
-    def print(self) -> None:
-        """C++ Print() 대응. 결과를 stdout 에 출력."""
-        for row_idx, row in enumerate(self.buf):
-            row_str = "".join(
-                f"[{col if col is not None else ''}]"
-                for col in row
-            )
-            print(f"(ROW:{row_idx + 1}){row_str}")
-
-    def get(self, row: int, col: int) -> Optional[str]:
-        """buf[row][col] 안전 접근 (Python 추가)."""
-        try:
-            return self.buf[row][col]
-        except IndexError:
-            return None
-
-    def __repr__(self) -> str:
-        return (
-            f"QueryResult(rows={self.row_cnt}, cols={self.col_cnt}, "
-            f"result={self.result}, error={self.error_code})"
-        )
+    def print_info(self) -> None:
+        """C++ Print() 대응."""
+        print(f"QueryResult: result={self.result}, "
+              f"rows={self.row_cnt}, cols={self.col_cnt}")
+        if self.buf:
+            for r, row in enumerate(self.buf):
+                print(f"  [{r}] {row}")
+        if self.error_string:
+            print(f"  Error: {self.error_string} (code={self.error_code})")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
 # QueryBindData
-# ══════════════════════════════════════════════════════════════════════════════
-
+# ─────────────────────────────────────────────────────────────────────────────
 class QueryBindData:
     """
-    frQueryBindData 대응.
-    SQL 바인드 변수 단일 항목.
+    C++ QueryBindData 대응.
+    BindParamByPos / BindParamByName 의 원소.
     """
 
-    def __init__(self):
-        self.bind_type:   BindType        = BindType.BIND_STR
-        self.int_data:    int             = 0
-        self.str_data:    str             = ""
-        self.number_data: float           = 0.0
-        self.date:        FrTime          = FrTime()
-        self.oci_date:    OciDate         = OciDate()
-        self.bind_name:   str             = ""
-        self.bind_name2:  str             = ""   # ":bindname" (Oracle OCI 용)
-        # Oracle7 OCI 날짜 인코딩 (7바이트 배열)
-        self.ora7_time:   bytearray       = bytearray(7)
+    class BindType(IntEnum):
+        BIND_STR  = 0
+        BIND_INT  = 1
+        BIND_FLT  = 2
+        BIND_DATE = 3
 
-    def _set_ora7_time(self) -> None:
-        """
-        frTime → Oracle7 7바이트 날짜 인코딩.
-        C++ 원본 AddVariable(frTime) 내 로직 그대로 재현.
-        """
-        d = self.date
-        self.ora7_time[0] = 120
-        self.ora7_time[1] = 100 + (d.get_year() - 2000)
-        self.ora7_time[2] = d.get_month()
-        self.ora7_time[3] = d.get_day()
-        self.ora7_time[4] = d.get_hour()   + 1
-        self.ora7_time[5] = d.get_minute() + 1
-        self.ora7_time[6] = d.get_second() + 1
+    # 클래스 레벨 상수 (C++ QueryBindData::BIND_STR 접근 호환)
+    BIND_STR  = BindType.BIND_STR
+    BIND_INT  = BindType.BIND_INT
+    BIND_FLT  = BindType.BIND_FLT
+    BIND_DATE = BindType.BIND_DATE
+
+    def __init__(self) -> None:
+        self.int_data:    int      = 0
+        self.str_data:    str      = ""
+        self.number_data: float    = 0.0
+        self.date:        datetime.datetime = datetime.datetime.now()
+        self.oci_date:    FrOCIDate = FrOCIDate()
+        self.db_date_ptr: bytes | None = None   # MySQL MYSQL_TIME 포인터 대체
+
+        self.bind_name:   str      = ""
+        self.bind_type:   QueryBindData.BindType = QueryBindData.BIND_STR
+        self.str_len:     int      = 0          # MySQL 전용
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# BindParamByPos  ←  위치 기반 바인드 파라미터
-# ══════════════════════════════════════════════════════════════════════════════
-
+# ─────────────────────────────────────────────────────────────────────────────
+# BindParamByPos / BindParamByName
+# ─────────────────────────────────────────────────────────────────────────────
 class BindParamByPos(list):
     """
-    BindParamByPos 대응.
-    위치(순서) 기반 SQL 바인드 파라미터 리스트.
-
-    사용:
-        bp = BindParamByPos()
-        bp.add("hello")
-        bp.add(42)
-        bp.add(3.14)
-        bp.add(FrTime())
+    C++ BindParamByPos (vector<QueryBindData*>) 대응.
+    위치 기반 바인드 파라미터 리스트.
     """
 
     def clear_all(self) -> None:
         """C++ Clear() 대응."""
         self.clear()
 
-    def add(self, value) -> None:
-        """
-        타입에 따라 BIND_STR / INT / FLT / DATE 자동 선택.
-        C++ AddVariable() 오버로드 통합.
-        """
+    # ── AddVariable 오버로드 통합 ─────────────────────────────────────────── #
+    def add_str(self, value: str) -> None:
+        """C++ AddVariable(char*) 대응."""
         bd = QueryBindData()
-        if isinstance(value, FrTime):
-            bd.bind_type = BindType.BIND_DATE
-            bd.date      = value
-            bd._set_ora7_time()
-        elif isinstance(value, bool):
-            bd.bind_type = BindType.BIND_INT
-            bd.int_data  = int(value)
-        elif isinstance(value, int):
-            bd.bind_type = BindType.BIND_INT
-            bd.int_data  = value
-        elif isinstance(value, float):
-            bd.bind_type = BindType.BIND_FLT
-            bd.number_data = value
-        else:
-            bd.bind_type = BindType.BIND_STR
-            bd.str_data  = str(value) if value is not None else ""
+        bd.bind_type = QueryBindData.BIND_STR
+        bd.str_data  = value
+        bd.str_len   = len(value)
         self.append(bd)
 
-    # C++ 원본 호환 메서드명
-    def add_variable(self, value) -> None:
-        self.add(value)
+    def add_int(self, value: int) -> None:
+        """C++ AddVariable(int) 대응."""
+        bd = QueryBindData()
+        bd.bind_type = QueryBindData.BIND_INT
+        bd.int_data  = value
+        self.append(bd)
 
+    def add_float(self, value: float) -> None:
+        """C++ AddVariable(double) 대응."""
+        bd = QueryBindData()
+        bd.bind_type    = QueryBindData.BIND_FLT
+        bd.number_data  = value
+        self.append(bd)
 
-# ══════════════════════════════════════════════════════════════════════════════
-# BindParamByName  ←  이름 기반 바인드 파라미터
-# ══════════════════════════════════════════════════════════════════════════════
+    def add_date(self, value: datetime.datetime) -> None:
+        """C++ AddVariable(frTime) 대응."""
+        bd = QueryBindData()
+        bd.bind_type = QueryBindData.BIND_DATE
+        bd.date      = value
+        self.append(bd)
+
+    def add_variable(self, value: str | int | float | datetime.datetime) -> None:
+        """타입 자동 감지 래퍼."""
+        if isinstance(value, str):
+            self.add_str(value)
+        elif isinstance(value, int):
+            self.add_int(value)
+        elif isinstance(value, float):
+            self.add_float(value)
+        elif isinstance(value, datetime.datetime):
+            self.add_date(value)
+        else:
+            raise TypeError(f"Unsupported bind type: {type(value)}")
+
 
 class BindParamByName(list):
     """
-    BindParamByName 대응.
-    이름(`:name`) 기반 SQL 바인드 파라미터 리스트.
-
-    사용:
-        bp = BindParamByName()
-        bp.add("user_id", "ncadmin")
-        bp.add("port",    8080)
-        bp.add("ratio",   1.5)
-        bp.add("reg_dt",  FrTime())
+    C++ BindParamByName (vector<QueryBindData*>) 대응.
+    이름 기반 바인드 파라미터 리스트 (Oracle 전용).
     """
 
     def clear_all(self) -> None:
-        """C++ Clear() 대응."""
         self.clear()
 
-    def add(self, bind_name: str, value) -> None:
-        """
-        C++ AddVariable(BindName, Value) 오버로드 통합.
-        bind_name2 = ":" + bind_name (Oracle OCI 규칙).
-        """
-        bd              = QueryBindData()
-        bd.bind_name    = bind_name or ""
-        bd.bind_name2   = ":" + bd.bind_name
-
-        if isinstance(value, FrTime):
-            bd.bind_type = BindType.BIND_DATE
-            bd.date      = value
-            bd._set_ora7_time()
-        elif isinstance(value, bool):
-            bd.bind_type = BindType.BIND_INT
-            bd.int_data  = int(value)
-        elif isinstance(value, int):
-            bd.bind_type = BindType.BIND_INT
-            bd.int_data  = value
-        elif isinstance(value, float):
-            bd.bind_type = BindType.BIND_FLT
-            bd.number_data = value
-        else:
-            bd.bind_type = BindType.BIND_STR
-            bd.str_data  = str(value) if value is not None else ""
-
+    def _add(self, bind_name: str, bd: QueryBindData) -> None:
+        bd.bind_name = bind_name
         self.append(bd)
 
-    # C++ 원본 호환 메서드명
-    def add_variable(self, bind_name: str, value) -> None:
-        self.add(bind_name, value)
+    def add_str(self, bind_name: str, value: str) -> None:
+        """C++ AddVariable(char* BindName, char* Value) 대응."""
+        bd = QueryBindData()
+        bd.bind_type = QueryBindData.BIND_STR
+        bd.str_data  = value
+        bd.str_len   = len(value)
+        self._add(bind_name, bd)
+
+    def add_int(self, bind_name: str, value: int) -> None:
+        """C++ AddVariable(char* BindName, int Value) 대응."""
+        bd = QueryBindData()
+        bd.bind_type = QueryBindData.BIND_INT
+        bd.int_data  = value
+        self._add(bind_name, bd)
+
+    def add_float(self, bind_name: str, value: float) -> None:
+        """C++ AddVariable(char* BindName, double Value) 대응."""
+        bd = QueryBindData()
+        bd.bind_type   = QueryBindData.BIND_FLT
+        bd.number_data = value
+        self._add(bind_name, bd)
+
+    def add_date(self, bind_name: str, value: datetime.datetime) -> None:
+        """C++ AddVariable(char* BindName, frTime Date) 대응."""
+        bd = QueryBindData()
+        bd.bind_type = QueryBindData.BIND_DATE
+        bd.date      = value
+        self._add(bind_name, bd)
+
+    def add_variable(self, bind_name: str,
+                     value: str | int | float | datetime.datetime) -> None:
+        """타입 자동 감지 래퍼."""
+        if isinstance(value, str):
+            self.add_str(bind_name, value)
+        elif isinstance(value, int):
+            self.add_int(bind_name, value)
+        elif isinstance(value, float):
+            self.add_float(bind_name, value)
+        elif isinstance(value, datetime.datetime):
+            self.add_date(bind_name, value)
+        else:
+            raise TypeError(f"Unsupported bind type: {type(value)}")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# FR_DB_INFO_T  →  DbInfo
-# ══════════════════════════════════════════════════════════════════════════════
-
+# ─────────────────────────────────────────────────────────────────────────────
+# DbInfo  (C++ FR_DB_INFO_T struct 대응)
+# ─────────────────────────────────────────────────────────────────────────────
 @dataclass
 class DbInfo:
-    """
-    FR_DB_INFO_T struct 대응.
-    DB 접속 정보.
-    """
-    db_type:       DbType    = DbType.UNKNOWN
-    user_id:       str       = ""
-    user_pw:       str       = ""
-    db_name:       str       = ""
-    db_ip:         str       = ""
-    db_port:       int       = 0
-    db_charset:    str       = ""
-    reserved:      str       = ""
+    """C++ FR_DB_INFO_T 대응. DB 접속 정보 구조체."""
+    db_type:       DbType = DbType.UNKNOWN
+    user_id:       str    = ""
+    user_pw:       str    = ""
+    db_name:       str    = ""
+    db_ip:         str    = ""
+    db_port:       int    = 0
+    db_charset:    str    = ""
+    reserved:      str    = ""

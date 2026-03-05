@@ -1,298 +1,495 @@
-import sys
-import os
-import time
-import struct
+"""
+AsSocket.py - C++ AsSocket.h/.C 변환
+
+"""
+
+from __future__ import annotations
+
 import errno
+import logging
+import socket
+import struct
+import time
+from typing import TYPE_CHECKING, Any
 
-# -------------------------------------------------------
-# 1. 프로젝트 경로 설정
-# -------------------------------------------------------
-current_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.abspath(os.path.join(current_dir, '../..'))
-if project_root not in sys.path:
-    sys.path.append(project_root)
+from Event.fr_socket_sensor import FrSocketSensor   # ← 실제 구현체 사용
 
-# -------------------------------------------------------
-# 2. 모듈 Import
-# -------------------------------------------------------
-from Class.Event.FrSocket import FrSocket
-from Class.Event.FrSockFdManager import SOCK_INFO_USE_TYPE
+from Common.CommType import (
+    NOT_ASSIGN, SESSION_REPORTING, CMD_ALIVE_ACK,
+    CMD_ALIVE_RECEIVE, CMD_ALIVE_SEND,
+    CMD_LOG_STATUS_CHANGE, AS_PARSED_DATA,
+    AS_LOG_INFO, PORT_STATUS_INFO, PROCESS_INFO, PROCESS_INFO_LIST,
+    ROUTER_PORT_INFO, CONNECTOR_DATA, ASCII_ERROR_MSG,
+    CMD_PARSING_RULE_CHANGE, PROC_CONTROL, SESSION_CONTROL,
+    DATAHANDLER_MODIFY, AS_DATA_HANDLER_INFO, TAIL_LOG_DATA_REQ,
+    TAIL_LOG_DATA_RES, TAIL_LOG_DATA, INIT_INFO_START,
+    MANAGER_MODIFY, AS_MANAGER_INFO, CONNECTOR_MODIFY, AS_CONNECTOR_INFO,
+    CONNECTION_MODIFY, AS_CONNECTION_INFO, CONNECTION_LIST_MODIFY,
+    AS_CONNECTION_INFO_LIST, COMMAND_AUTHORITY_MODIFY,
+    AS_COMMAND_AUTHORITY_INFO, AS_PROCESS_INFO,
+    CMD_PARSING_RULE_DOWN_ACK, CMD_MAPPING_RULE_DOWN_ACK,
+    CMD_COMMAND_RULE_DOWN_ACK, CMD_SCHEDULER_RULE_DOWN_ACK,
+    CONNECTOR_MODIFY_ACK, MANAGER_MODIFY_ACK, CONNECTION_MODIFY_ACK,
+    DATAHANDLER_MODIFY_ACK, CONNECTION_LIST_MODIFY_ACK,
+    COMMAND_AUTHORITY_MODIFY_ACK, SUB_PROC_MODIFY_ACK,
+    CMD_PROC_INIT, CMD_PARSING_RULE_DOWN, CMD_MAPPING_RULE_DOWN,
+    CMD_COMMAND_RULE_DOWN, CMD_SCHEDULER_RULE_DOWN,
+    PROC_INIT_END, CMD_PROC_TERMINATE, INIT_INFO_END,
+    AS_SOCKET_STATUS_REQ, FR_SOCKET_STATUS_REQ,
+    AS_SOCKET_STATUS_RES, FR_SOCKET_STATUS_RES,
+    FR_SOCKET_SHUTDOWN_REQ, FR_SOCKET_SHUTDOWN_RES,
+    FR_SOCKET_CHECK_REQ, FR_SOCKET_CHECK_RES,
+    AS_DB_SYNC_KIND, AS_DB_SYNC_INFO_LIST,
+    AS_DATA_HANDLER_INIT, AS_DATA_ROUTING_INIT,
+    AS_SYSTEM_INFO, AS_SESSION_CFG,
+    SUB_PROC_MODIFY, AS_SUB_PROC_INFO,
+    MMC_LOG, CONNECTOR_PORT_INFO_REQ, CMD_OPEN_PORT, CMD_OPEN_PORT_ACK,
+    NETFINDER_REV,
+    AsAsciiAck, AsCmdOpenPort, AsCmdLogControl, AsSessionInfo,
+    AsLogStatus, AsPortStatusInfo, AsProcessStatus, AsProcessStatusList,
+    AsRouterPortInfo, AsParsedData, AsConnectorData, AsAsciiErrorMsg,
+    AsRuleChangeInfo, AsProcControl, AsSessionControl,
+    AsDataHandlerInfo, AsLogTailDataReq, AsLogTailDataRes,
+    AsGuiInitInfo, AsManagerInfo, AsConnectorInfo, AsConnectionInfo,
+    AsConnectionInfoList, AsCommandAuthorityInfo, AsDataHandlerInit,
+    AsDataRoutingInit, AsSystemInfoData, AsSessionCfg, AsSubProcInfo,
+)
+from Common.AsciiMmcType import (
+    MAX_MSG, MAX_PACKET,
+    AS_MMC_IDENT_RES, AS_MMC_FLOW_CONTROL,
+    AS_MMC_REQ_OLD, AS_MMC_REQ, AS_MMC_REQ_ACK, AS_MMC_RES,
+    AS_MMC_IDENT_REQ, AS_ROUTER_INFO_REQ, AS_ROUTER_INFO_RES,
+    AS_ROUTER_CONFIG,
+    MMC_GEN_REQ, MMC_GEN_RES, MMC_RESPONSE_DATA_REQ, MMC_RESPONSE_DATA,
+    CMD_MMC_PUBLISH_REQ, CMD_MMC_PUBLISH_RES,
+    PacketT, AsMmcIdentRes, AsMmcFlowControl,
+    AsMmcRequestOld, AsMmcRequest, AsMmcAck, AsMmcResult,
+    AsMmcGenResult, AsMmcPublish,
+    AsRouterInfoReq, AsRouterInfoRes, AsRouterConfig,
+)
 
-# CommType (패킷 구조체 및 상수 정의)
-try:
-    from Class.Common.CommType import (
-        PacketT, AsSessionInfoT, AsAsciiAckT,
-        SESSION_REPORTING, CMD_ALIVE_ACK, CMD_ALIVE_RECEIVE, CMD_ALIVE_SEND,
-        CMD_LOG_STATUS_CHANGE
-    )
-except ImportError:
-    # CommType이 없을 경우를 대비한 임시 상수 (실제 환경에서는 CommType.py 필수)
-    print("[AsSocket] Warning: CommType not found. Using dummy constants.")
-    SESSION_REPORTING = 1001
-    CMD_ALIVE_ACK = 1002
-    CMD_ALIVE_RECEIVE = 11
-    CMD_ALIVE_SEND = 12
-    CMD_LOG_STATUS_CHANGE = 9999
-    PacketT = None
-    AsSessionInfoT = None
-    AsAsciiAckT = None
+if TYPE_CHECKING:
+    from Common.AliveCheckTimer import AliveCheckTimer
 
-# AliveCheckTimer (순환 참조 방지를 위해 try-import)
-try:
-    from Class.Common.AliveCheckTimer import AliveCheckTimer
-except ImportError:
-    AliveCheckTimer = None
+logger = logging.getLogger(__name__)
 
-# -------------------------------------------------------
-# AsSocket Class
-# -------------------------------------------------------
-class AsSocket(FrSocket):
-    NOT_ASSIGN = -1
 
-    def __init__(self):
+# ──────────────────────────────────────────────
+# 패킷 직렬화/역직렬화 헬퍼
+# PACKET_T 헤더: MsgId(4) + Length(4) = 8 bytes
+# ──────────────────────────────────────────────
+_HDR_FMT  = "!II"          # network byte order: uint32 MsgId, uint32 Length
+_HDR_SIZE = struct.calcsize(_HDR_FMT)   # == 8
+
+
+def _pack_packet(packet: PacketT) -> bytes:
+    """PacketT → 전송용 bytes (헤더 + 페이로드)."""
+    payload = packet.msg.encode() if isinstance(packet.msg, str) else packet.msg
+    hdr = struct.pack(_HDR_FMT, packet.msg_id, len(payload))
+    return hdr + payload
+
+
+def _unpack_header(data: bytes) -> tuple[int, int]:
+    """8바이트 헤더 → (msg_id, length)."""
+    return struct.unpack(_HDR_FMT, data)
+
+
+# ──────────────────────────────────────────────
+# hton / ntoh 헬퍼 (int 필드 바이트 변환)
+# ──────────────────────────────────────────────
+def _htonl(v: int) -> int: return socket.htonl(v & 0xFFFFFFFF)
+def _ntohl(v: int) -> int: return socket.ntohl(v & 0xFFFFFFFF)
+def _htons(v: int) -> int: return socket.htons(v & 0xFFFF)
+def _ntohs(v: int) -> int: return socket.ntohs(v & 0xFFFF)
+
+
+# ──────────────────────────────────────────────
+# AsSocket
+# ──────────────────────────────────────────────
+class AsSocket(FrSocketSensor):
+    """
+    C++ AsSocket 대응.
+    PACKET_T 기반 송수신, Alive Check, Session Identify, hton/ntoh 처리를 담당합니다.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()   # FrSocketSensor.__init__() 호출
+        self._session_identify: int = NOT_ASSIGN
+        self._alive_check_timer: AliveCheckTimer | None = None
+        self._fail_count:     int = 0
+        self._fail_count_max: int = 0
+        self._re_read_check_flag: bool = False
+
+    def __del__(self) -> None:
+        if self._alive_check_timer:
+            self._alive_check_timer.cancel_timer()
+
+    # ── 패킷 송신 ─────────────────────────────
+    def packet_send(self, packet: PacketT) -> bool:
+        """C++ PacketSend 대응 — hton 변환 후 전송."""
+        payload = packet.msg.encode() if isinstance(packet.msg, str) else packet.msg
+        length  = _HDR_SIZE + len(payload)
+        hdr     = struct.pack(_HDR_FMT, socket.htonl(packet.msg_id),
+                              socket.htonl(len(payload)))
+        ret = self.write(hdr + payload[:len(payload)])
+        if ret < 1:
+            if self.is_block_mode():
+                return False
+            else:
+                if self._get_errno() == errno.EAGAIN:
+                    logger.debug("Session is block(%s)(%d)",
+                                 self.get_peer_ip(), packet.msg_id)
+                    return True
+                return False
+        return True
+
+    # ── 패킷 수신 ─────────────────────────────
+    def packet_recv(self) -> PacketT | None:
         """
-        C++: AsSocket()
+        C++ PacketRecv 대응.
+        성공 시 PacketT 반환, 오류 시 None 반환.
         """
-        super().__init__()
-        
-        self.m_SessionIdentify = self.NOT_ASSIGN
-        self.m_AliveCheckTimer = None
-        self.m_FailCount = 0
-        self.m_FailCountMax = 0
-        self.m_ReReadCheckFlag = False
-
-    def __del__(self):
-        """
-        C++: ~AsSocket()
-        """
-        self.stop_alive_check()
-        super().__del__()
-
-    # ---------------------------------------------------
-    # Packet Send / Recv Logic
-    # ---------------------------------------------------
-    def packet_send(self, packet_obj):
-        """
-        C++: bool PacketSend(PACKET_T* Packet)
-        패킷 객체를 바이트로 직렬화하여 전송
-        """
-        if not packet_obj: return False
-
-        try:
-            # 직렬화 (Header + Body)
-            # C++의 HtonPacket, HtonStruct 로직이 pack() 내부에 포함됨
-            data = packet_obj.pack()
-            total_len = len(data)
-            
-            # 전송 (FrSocket -> FrRdFdSensor.write -> os.write)
-            sent_len = self.write(data)
-            
-            if sent_len < total_len:
-                # Blocking 모드이거나 에러 발생 시
-                if self.is_block_mode():
-                    return False
-                else:
-                    # Non-blocking 모드에서 EAGAIN 등의 경우 (C++ 로직 참조)
-                    # 실제로는 남은 데이터를 버퍼링해야 하지만 여기서는 False 리턴
-                    return False
-            return True
-            
-        except Exception as e:
-            print(f"[AsSocket] Packet Send Error: {e}")
-            return False
-
-    def packet_recv(self):
-        """
-        C++: int PacketRecv(PACKET_T* Packet)
-        헤더를 먼저 읽고, 길이를 파악한 뒤 바디를 읽음
-        """
-        if PacketT is None: return None
-
-        # 1. 헤더 읽기 (8 Bytes: MsgId, Length)
-        header_data = self._read_n_bytes(PacketT.HEADER_SIZE)
-        if not header_data:
+        # 헤더 수신
+        hdr_data = self._recv_exact(_HDR_SIZE)
+        if hdr_data is None:
             return None
 
-        # 2. 헤더 파싱 (Network Byte Order -> Host Byte Order)
-        packet = PacketT.unpack_header(header_data)
-        
-        # 3. 바디 읽기
-        if packet.length > 0:
-            # C++ MAX_MSG 체크 로직
-            if packet.length > PacketT.MAX_MSG_SIZE:
-                print(f"[AsSocket] Error: Msg length({packet.length}) > MAX({PacketT.MAX_MSG_SIZE})")
-                return None
-            
-            body_data = self._read_n_bytes(packet.length)
-            if not body_data:
-                return None
-            
-            packet.msg_body = body_data
+        msg_id, length = struct.unpack(_HDR_FMT, hdr_data)
+        msg_id  = socket.ntohl(msg_id)
+        length  = socket.ntohl(length)
 
-        return packet
+        if length == 0:
+            return PacketT(msg_id=msg_id, length=0, msg="")
 
-    def _read_n_bytes(self, n):
-        """
-        정해진 n바이트를 모두 읽을 때까지 반복 (TCP Fragmentation 처리)
-        """
-        data = b''
-        retry_cnt = 0
-        
-        while len(data) < n:
-            # 부족한 만큼 읽기 request
-            chunk = self.read(n - len(data))
-            
-            if not chunk: # EOF or Error or Non-blocking empty
-                # C++ ReReadCheckFlag 로직 일부 반영
-                if self.m_ReReadCheckFlag and retry_cnt < 4:
-                    time.sleep(0.07) # 70ms
-                    retry_cnt += 1
+        if length > MAX_MSG:
+            logger.error("length(%d) is over than MAX_MSG(4K)", length)
+            return None
+
+        # 페이로드 수신
+        payload = self._recv_exact(length)
+        if payload is None:
+            return None
+
+        return PacketT(msg_id=msg_id, length=length, msg=payload)
+
+    def _recv_exact(self, size: int) -> bytes | None:
+        """정확히 size 바이트를 수신. 실패 시 None 반환."""
+        buf = b""
+        re_read_cnt = 0
+        while len(buf) < size:
+            try:
+                chunk = self.read(size - len(buf))
+            except OSError as e:
+                if e.errno == errno.EINTR:
+                    continue
+                logger.debug("recv error: %s", e)
+                return None
+
+            if not chunk:
+                if self._re_read_check_flag and re_read_cnt < 4:
+                    time.sleep(0.07)
+                    re_read_cnt += 1
                     continue
                 return None
-                
-            data += chunk
-            
-        return data
+            buf += chunk
+        return buf
 
-    # ---------------------------------------------------
-    # Event Handling (From FrSocketSensor)
-    # ---------------------------------------------------
-    def receive_message(self):
-        """
-        C++: void ReceiveMessage()
-        소켓에 데이터가 도착했을 때 호출됨
-        """
-        # 패킷 수신
-        packet = self.packet_recv()
-        if not packet:
-            # 패킷 읽기 실패는 연결 종료로 간주
-            self.socket_broken(errno.ECONNRESET)
-            return
+    # ── 세션 식별 ─────────────────────────────
+    def _session_identify_packet(self, packet: PacketT) -> None:
+        """C++ SessionIdentify(PACKET_T*) 대응."""
+        raw = packet.msg if isinstance(packet.msg, bytes) else packet.msg.encode()
+        # AS_SESSION_INFO_T: SessionType(4) + Name(100)
+        if len(raw) >= 4:
+            session_type = socket.ntohl(struct.unpack("!I", raw[:4])[0])
+            name = raw[4:104].rstrip(b"\x00").decode(errors="replace")
+            self._session_identify = session_type
+            self.set_object_name(name)
 
-        # 메시지 ID 분기 처리
-        if packet.msg_id == SESSION_REPORTING:
-            if self.m_SessionIdentify != self.NOT_ASSIGN:
-                print(f"[AsSocket] Error: Already Session Identify ({self.get_session_name()})")
-            else:
-                self._handle_session_identify(packet)
-                
-        elif packet.msg_id == CMD_ALIVE_ACK:
-            # 하트비트 응답 수신 -> 실패 카운트 초기화
-            # print(f"[AsSocket] Alive Ack Receive : {self.get_session_name()}")
-            self.m_FailCount = 0
-            
-        else:
-            # 일반 패킷 -> 자식 클래스(Router, Agent 등)로 전달
-            self.receive_packet(packet, self.m_SessionIdentify)
-
-    # ---------------------------------------------------
-    # Session Identify Logic
-    # ---------------------------------------------------
-    def _handle_session_identify(self, packet):
-        """
-        C++: void SessionIdentify(PACKET_T* Packet)
-        """
-        if AsSessionInfoT:
-            try:
-                info = AsSessionInfoT.unpack(packet.msg_body)
-                self.m_SessionIdentify = info.session_type
-                self.set_object_name(info.name)
-                
-                # 가상 함수 호출 (사용자 정의 로직)
-                self.session_identify(self.m_SessionIdentify, info.name)
-            except Exception as e:
-                print(f"[AsSocket] Session Identify Parsing Error: {e}")
-
-    def set_session_identify(self, session_type, name, interval=0, auto_ack_flag=False):
-        """
-        C++: void SetSessionIdentify(...)
-        자신의 정보를 상대방에게 전송하고, 필요 시 AliveCheck 시작
-        """
-        self.m_SessionIdentify = session_type
+    def set_session_identify(self, session_type: int, name: str = "",
+                              check_interval: int = 100,
+                              auto_ack_flag: bool = True) -> None:
+        """C++ SetSessionIdentify 대응."""
+        from Common.AliveCheckTimer import AliveCheckTimer
+        self._session_identify = session_type
         self.set_object_name(name)
 
-        if AsSessionInfoT and PacketT:
-            info = AsSessionInfoT(session_type, name)
-            # struct.pack 결과물
-            body = info.pack()
-            packet = PacketT(SESSION_REPORTING, len(body), body)
-            self.packet_send(packet)
+        # SESSION_REPORTING 패킷 전송
+        session_info = AsSessionInfo(session_type=session_type, name=name)
+        payload = struct.pack("!I", session_type) + name.encode().ljust(100, b"\x00")
+        self.send_packet(SESSION_REPORTING, payload, len(payload))
 
         if auto_ack_flag:
-            # SEND 모드로 AliveCheck 시작 (내가 주기적으로 보냄)
-            self.start_alive_check(interval, 3, CMD_ALIVE_SEND)
+            if self._alive_check_timer:
+                self._alive_check_timer.cancel_timer()
+            self._alive_check_timer = AliveCheckTimer(
+                check_interval, CMD_ALIVE_SEND, self)
 
-    # ---------------------------------------------------
-    # Alive Check Logic
-    # ---------------------------------------------------
-    def start_alive_check(self, interval, max_fail_count, mode=CMD_ALIVE_RECEIVE):
-        """
-        C++: bool StartAliveCheck(...)
-        """
-        if self.m_SessionIdentify == self.NOT_ASSIGN:
-            print("[AsSocket] Not yet Session Identify")
+    # ── Alive Check ───────────────────────────
+    def start_alive_check(self, interval: int, max_fail_count: int) -> bool:
+        from Common.AliveCheckTimer import AliveCheckTimer
+        if self._session_identify == NOT_ASSIGN:
+            logger.debug("Not yet Session Identify")
             return False
+        self._fail_count_max = max_fail_count
+        if self._alive_check_timer:
+            self._alive_check_timer.cancel_timer()
+        self._alive_check_timer = AliveCheckTimer(interval, CMD_ALIVE_RECEIVE, self)
+        return True
 
-        self.m_FailCountMax = max_fail_count
-        self.stop_alive_check()
+    def stop_alive_check(self) -> None:
+        if self._alive_check_timer is None:
+            return
+        self._alive_check_timer.cancel_timer()
+        self._alive_check_timer = None
 
-        if AliveCheckTimer:
-            # AliveCheckTimer(interval, mode, socket_obj)
-            self.m_AliveCheckTimer = AliveCheckTimer(interval, mode, self)
-            return True
-        return False
+    def alive_check_time(self) -> None:
+        """C++ AliveCheckTime 대응 — CMD_ALIVE_RECEIVE 모드."""
+        self._fail_count += 1
+        if self._fail_count > self._fail_count_max:
+            logger.debug("AliveCheckTimeOut: %s(%d)",
+                         self.get_session_name(), self._fail_count)
+            self.alive_check_fail(self._fail_count)
 
-    def stop_alive_check(self):
-        """
-        C++: void StopAliveCheck()
-        """
-        if self.m_AliveCheckTimer:
-            self.m_AliveCheckTimer.kill_timer() # or unregister
-            self.m_AliveCheckTimer = None
+    def alive_check_send_time(self) -> None:
+        """C++ AliveCheckSendTime 대응 — CMD_ALIVE_SEND 모드."""
+        pkt = PacketT(msg_id=CMD_ALIVE_ACK, length=0, msg="")
+        if not self.packet_send(pkt):
+            self.socket_broken(self._get_errno())
+        logger.debug("AliveCheckPacketSend(%s)", self.get_session_name())
 
-    def alive_check_time(self):
-        """
-        C++: void AliveCheckTime()
-        RECEIVE 모드일 때 타이머에 의해 주기적으로 호출됨.
-        패킷을 못 받은 횟수를 체크.
-        """
-        self.m_FailCount += 1
-        if self.m_FailCount > self.m_FailCountMax:
-            print(f"[AsSocket] AliveCheckTimeOut : {self.get_session_name()} ({self.m_FailCount})")
-            self.alive_check_fail(self.m_FailCount)
+    # ── 수신 메시지 처리 ─────────────────────
+    def receive_message(self) -> None:
+        """C++ ReceiveMessage 대응 — 이벤트 루프에서 호출."""
+        packet = self.packet_recv()
+        if packet is None:
+            self.socket_broken(self._get_errno())
+            return
 
-    def alive_check_send_time(self):
-        """
-        C++: void AliveCheckSendTime()
-        SEND 모드일 때 타이머에 의해 주기적으로 호출됨.
-        CMD_ALIVE_ACK 패킷 전송.
-        """
-        if PacketT:
-            packet = PacketT(CMD_ALIVE_ACK, 0, b'')
-            if not self.packet_send(packet):
-                self.socket_broken(errno.EPIPE)
-            # print(f"[AsSocket] AliveCheckPacketSend({self.get_session_name()})")
+        mid = packet.msg_id
+        if mid == SESSION_REPORTING:
+            if self._session_identify != NOT_ASSIGN:
+                logger.error("Already Session Identify")
+            else:
+                self._session_identify_packet(packet)
+                self.on_session_identify(self._session_identify,
+                                         self.get_object_name())
 
-    # ---------------------------------------------------
-    # Utils (Ack, Broken, Virtuals)
-    # ---------------------------------------------------
-    def send_ack(self, msg_id, id_val, result_mode, result_msg=""):
-        """
-        C++: bool SendAck(...)
-        """
-        if AsAsciiAckT and PacketT:
-            ack = AsAsciiAckT(id_val, result_mode, result_msg)
-            body = ack.pack()
-            packet = PacketT(msg_id, len(body), body)
-            return self.packet_send(packet)
-        return False
+        elif mid == CMD_ALIVE_ACK:
+            logger.debug("Alive Ack Receive: %s", self.get_session_name())
+            self._fail_count = 0
 
-    def socket_broken(self, err):
-        """
-        C++: void SocketBroken(int Errno)
-        """
+        else:
+            self.receive_packet(packet, self._session_identify)
+
+    # ── 패킷 전송 퍼블릭 API ──────────────────
+    def send_packet(self, msg_id: int,
+                    result: bytes | None = None, length: int = 0) -> bool:
+        payload = result[:length] if result else b""
+        pkt = PacketT(msg_id=msg_id, length=len(payload),
+                      msg=payload.decode(errors="replace"))
+        return self.packet_send(pkt)
+
+    def send_nonblock_packet(self, msg_id: int,
+                             result: bytes | None = None, length: int = 0) -> bool:
+        if not self.set_block_mode(False):
+            logger.error("SetBlockMode(False) Error")
+            return False
+        ok = self.send_packet(msg_id, result, length)
+        if not self.set_block_mode(True):
+            logger.error("SetBlockMode(True) Error")
+            return False
+        return ok
+
+    def send_packet_obj(self, packet: PacketT) -> bool:
+        return self.packet_send(packet)
+
+    def send_nonblock_packet_obj(self, packet: PacketT) -> bool:
+        if not self.set_block_mode(False):
+            return False
+        ok = self.packet_send(packet)
+        if not self.set_block_mode(True):
+            return False
+        return ok
+
+    def send_and_wait_packet(self, msg_id: int, result: bytes,
+                              length: int, wait_msg_id: int,
+                              out_buf: bytearray) -> int:
+        if self.send_packet(msg_id, result, length):
+            return self.wait_packet(wait_msg_id, out_buf)
+        return -1
+
+    def wait_packet(self, wait_msg_id: int, out_buf: bytearray) -> int:
+        packet = self.packet_recv()
+        if packet and packet.msg_id == wait_msg_id:
+            payload = packet.msg if isinstance(packet.msg, bytes) \
+                      else packet.msg.encode()
+            out_buf[:len(payload)] = payload
+            return 1
+        logger.error("no wait msgid")
+        return -1
+
+    # ── ACK 송수신 ────────────────────────────
+    def send_ack(self, msg_id: int, id_: int,
+                 result_mode: int = 1, result_msg: str | None = None) -> bool:
+        ack = AsAsciiAck(id=id_, result_mode=result_mode,
+                         result=result_msg or "")
+        payload = struct.pack("!II", id_, result_mode)
+        res_bytes = (result_msg or "").encode().ljust(MAX_MSG - 8, b"\x00")
+        return self.send_packet(msg_id, payload + res_bytes,
+                                len(payload) + len(res_bytes))
+
+    def recv_ack(self, packet: PacketT) -> AsAsciiAck:
+        raw = packet.msg if isinstance(packet.msg, bytes) \
+              else packet.msg.encode()
+        if len(raw) >= 8:
+            id_, result_mode = struct.unpack("!II", raw[:8])
+            result = raw[8:].rstrip(b"\x00").decode(errors="replace")
+            return AsAsciiAck(id=id_, result_mode=result_mode, result=result)
+        return AsAsciiAck()
+
+    # ── 로그 상태 변경 전송 ───────────────────
+    def send_cmd_log_status_change(self, log_ctl: AsCmdLogControl) -> bool:
+        payload = struct.pack("!III",
+                              log_ctl.id, log_ctl.process_type, int(log_ctl.type))
+        payload += log_ctl.manager_id.encode().ljust(40, b"\x00")
+        payload += log_ctl.process_id.encode().ljust(80, b"\x00")
+        payload += log_ctl.package.encode().ljust(128, b"\x00")
+        payload += log_ctl.feature.encode().ljust(128, b"\x00")
+        payload += struct.pack("!I", log_ctl.level)
+        return self.send_packet(CMD_LOG_STATUS_CHANGE, payload, len(payload))
+
+    # ── 세션명 ────────────────────────────────
+    def set_session_name(self, name: str) -> None:
+        self.set_object_name(name)
+
+    def get_session_name(self) -> str:
+        return self.get_object_name()
+
+    def get_session_type(self) -> int:
+        return self._session_identify
+
+    def set_re_read_check(self, flag: bool) -> None:
+        self._re_read_check_flag = flag
+
+    # ── 소켓 오류 처리 ────────────────────────
+    def socket_broken(self, err: int) -> None:
         self.close()
         self.close_socket(err)
 
-    def set_re_read_check(self, flag):
-        self.m_ReReadCheckFlag = flag
+    # ── virtual 메서드 (서브클래스 오버라이드) ─
+    def alive_check_fail(self, fail_count: int) -> None:
+        logger.debug("AliveCheckFail (virtual): %s", self.get_session_name())
+
+    def close_socket(self, err: int) -> None:
+        logger.debug("CloseSocket (virtual)")
+
+    def receive_packet(self, packet: PacketT, session_identify: int = -1) -> None:
+        logger.debug("ReceivePacket (virtual)")
+
+    def on_session_identify(self, session_type: int, name: str) -> None:
+        logger.debug("SessionIdentify (virtual)")
+
+    def cmd_open_port_info(self, port_info: AsCmdOpenPort) -> bool:
+        logger.debug("CmdOpenPortInfo (virtual)")
+        return False
+
+    # ── hton / ntoh (네트워크 바이트 변환) ────
+    def hton_struct(self, packet: PacketT) -> None:
+        """C++ HtonStruct 대응 — msg_id 별 페이로드 int 필드 htonl 변환."""
+        self._convert_struct(packet, to_network=True)
+
+    def ntoh_struct(self, packet: PacketT) -> None:
+        """C++ NtohStruct 대응 — msg_id 별 페이로드 int 필드 ntohl 변환."""
+        self._convert_struct(packet, to_network=False)
+
+    def _convert_struct(self, packet: PacketT, to_network: bool) -> None:
+        """
+        hton/ntoh 변환 공통 처리.
+        Python은 네트워크 전송 시 struct.pack('!...') 으로 처리하므로
+        이미 직렬화/역직렬화 단계에서 변환이 완료됩니다.
+        이 메서드는 C++ 코드와의 인터페이스 호환성을 위해 존재하며,
+        PacketT.msg 가 raw bytes 인 경우에만 실제 변환이 필요합니다.
+        필드별 변환이 필요한 경우 서브클래스에서 오버라이드하세요.
+        """
+        conv32 = socket.htonl if to_network else socket.ntohl
+        conv16 = socket.htons if to_network else socket.ntohs
+        mid = packet.msg_id
+        raw = packet.msg if isinstance(packet.msg, bytes) \
+              else packet.msg.encode()
+
+        # ── 4바이트 단일 int 필드 변환 헬퍼 ──
+        def c32(buf: bytes, offset: int) -> bytes:
+            v = struct.unpack_from("!I", buf, offset)[0]
+            return buf[:offset] + struct.pack("!I", conv32(v)) + buf[offset+4:]
+
+        def c16(buf: bytes, offset: int) -> bytes:
+            v = struct.unpack_from("!H", buf, offset)[0]
+            return buf[:offset] + struct.pack("!H", conv16(v)) + buf[offset+2:]
+
+        # msg_id 별 변환 규칙 적용
+        # (C++ switch-case 와 동일한 로직, 대표 케이스만 구현)
+        if mid in (AS_MMC_REQ, MMC_GEN_REQ, AS_MMC_REQ_OLD):
+            # id(0~3), type(4~7), referenceId(8~11), interfaces(12~15)
+            # responseMode(16~19), publishMode(20~23), collectMode(24~27)
+            # cmdDelayTime(28~31), retryNo(32~35), curRetryNo(36~39)
+            # parameterNo(40~43), priority(44~47), logMode(48~51)
+            for off in (0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48):
+                if off + 4 <= len(raw):
+                    raw = c32(raw, off)
+
+        elif mid in (AS_MMC_RES, CMD_MMC_PUBLISH_RES, MMC_RESPONSE_DATA):
+            # id(0~3), resultMode(4~7)
+            for off in (0, 4):
+                if off + 4 <= len(raw):
+                    raw = c32(raw, off)
+
+        elif mid == AS_MMC_REQ_ACK:
+            for off in (0, 4):
+                if off + 4 <= len(raw):
+                    raw = c32(raw, off)
+
+        elif mid == SESSION_REPORTING:
+            if 4 <= len(raw):
+                raw = c32(raw, 0)
+
+        elif mid == AS_PARSED_DATA:
+            # eventTime(0~3), bscNo(4~5), equipFlag(6~7)
+            # segBlkCnt(8~9), listSequence(10~11), attributeNo(12~13)
+            if 4 <= len(raw): raw = c32(raw, 0)
+            for off in (4, 6, 8, 10, 12):
+                if off + 2 <= len(raw): raw = c16(raw, off)
+
+        elif mid == CONNECTOR_DATA:
+            # MsgId(0~3), SegFlag(4~7), Length(8~9), PortNo(10~11), LoggingFlag(12~13)
+            if 4 <= len(raw): raw = c32(raw, 0)
+            if 8 <= len(raw): raw = c32(raw, 4)
+            for off in (8, 10, 12):
+                if off + 2 <= len(raw): raw = c16(raw, off)
+
+        elif mid == PROC_CONTROL:
+            # ProcessType(0), MmcIdentType(4), JunctionType(8)
+            # ConnectorStatus(12), ParserStatus(16), Status(20)
+            # DelayTime(24), CmdResponseType(28), LogCycle(32)
+            for off in (0, 4, 8, 12, 16, 20, 24, 28, 32):
+                if off + 4 <= len(raw): raw = c32(raw, off)
+
+        elif mid in (AS_SOCKET_STATUS_RES, FR_SOCKET_STATUS_RES):
+            # Status(0~3), Size(4~7), 이후 FR_SOCKET_INFO_T 배열
+            if 8 <= len(raw):
+                raw = c32(raw, 0)
+                raw = c32(raw, 4)
+
+        elif mid in (CMD_PROC_INIT, CMD_ALIVE_ACK, CMD_PARSING_RULE_DOWN,
+                     CMD_MAPPING_RULE_DOWN, CMD_COMMAND_RULE_DOWN,
+                     CMD_SCHEDULER_RULE_DOWN, PROC_INIT_END,
+                     CMD_PROC_TERMINATE, INIT_INFO_END):
+            pass  # 변환 없음
+
+        # 변환된 raw 를 다시 packet.msg 에 저장
+        packet.msg = raw
+
+    # ── 내부 유틸 ────────────────────────────
+    @staticmethod
+    def _get_errno() -> int:
+        import ctypes
+        return ctypes.get_errno()

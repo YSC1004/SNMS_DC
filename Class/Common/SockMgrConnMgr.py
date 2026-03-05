@@ -7,7 +7,7 @@ project_root = os.path.abspath(os.path.join(current_dir, '../..'))
 if project_root not in sys.path:
     sys.path.append(project_root)
 
-from Class.Event.FrSocketSensor import FrSocketSensor
+from Class.Event.fr_socket_sensor import FrSocketSensor
 from Class.Common.ConnectionMgr import ConnectionMgr
 
 # SockMgrConnection은 이 클래스에 의해 생성되는 자식 연결 객체입니다.

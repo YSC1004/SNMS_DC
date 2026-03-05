@@ -1,23 +1,22 @@
+# -*- coding: utf-8 -*-
 """
 frDbType.h  →  fr_db_type.py
 
 원본 역할:
-  frDbType.h 는 frDbBaseType.h 를 포함하는 래퍼 헤더로,
-  실제 타입 정의는 모두 frDbBaseType.h / frDbBaseType.C 에 있음.
+  frDbType.h 는 frDbBaseType.h 를 포함하는 래퍼 헤더.
+  실제 타입 정의는 모두 frDbBaseType.h 에 있음.
 
-Python 에서는 fr_db_base_type 의 모든 심볼을 re-export 하는
-패스-스루(pass-through) 모듈로 구현.
+Python 에서는 fr_db_base_type / fr_db_param 의 심볼을
+re-export 하는 pass-through 모듈로 구현.
 
-다른 모듈에서 frDbType.h 를 include 하던 코드는
-'from Class.SqlType.fr_db_type import *' 또는
-'from Class.SqlType.fr_db_type import DbParam, QueryResult, ...' 로 대체.
+사용법:
+    from Class.SqlType.fr_db_type import DbType, QueryResult, DbParam
+    from Class.SqlType.fr_db_type import BindParamByPos, BindParamByName
 """
 
-from Class.SqlType.fr_db_base_type import (   # noqa: F401  (re-export)
+from Class.SqlType.fr_db_base_type import (   # noqa: F401
     # 상수
     DB_MAX_ITEM_BUF_SIZE,
-    NEW_INSTANCE,
-    ALREADY_INSTANCE,
     DB_ORACLE_OCI_STR,
     DB_MYSQL_STR,
 
@@ -26,22 +25,25 @@ from Class.SqlType.fr_db_base_type import (   # noqa: F401  (re-export)
     DbCharSet,
     QueryDataType,
     QueryJoinPosition,
-    BindType,
 
-    # 날짜 구조체
-    OciTime,
-    OciDate,
-    MySQLDate,
+    # 날짜 구조체  (변환 시 FrOCI* / FrMySQL* 로 명명)
+    FrOCITime,
+    FrOCIDate,
+    FrMySQLDate,
 
-    # DB 메타/결과 타입
+    # Oracle Describe / Define (OraSession2 내부 전용)
     DbDescRecord,
     DbDescRecordList,
     DbDefRecord,
     DbDefRecordList,
+
+    # Fetch 정보
     RsFetchInfo,
+
+    # 쿼리 결과
     QueryResult,
 
-    # 바인드 타입
+    # 바인드 파라미터
     QueryBindData,
     BindParamByPos,
     BindParamByName,
@@ -50,9 +52,8 @@ from Class.SqlType.fr_db_base_type import (   # noqa: F401  (re-export)
     DbInfo,
 )
 
-from Class.SqlType.fr_db_param import (       # noqa: F401  (re-export)
-    BinderType,
-    DbBinder,
+from Class.SqlType.fr_db_param import (       # noqa: F401
     DbRecord,
+    DbBinder,
     DbParam,
 )

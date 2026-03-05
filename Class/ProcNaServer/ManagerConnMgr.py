@@ -20,7 +20,7 @@ from Class.Common.CommType import *
 from Class.Common.AsUtil import AsUtil
 from Class.ProcNaServer.ManagerConnection import ManagerConnection
 from Class.Util.fr_ssh_util import FrSshUtil
-from Class.Event.FrTimerSensor import FrTimerSensor
+from Class.Event.fr_timer_sensor import FrTimerSensor
 from Class.Util.fr_base_list import StringIntKey
 from Class.Util.fr_time import FrTime
 

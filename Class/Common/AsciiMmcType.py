@@ -1,25 +1,30 @@
-import struct
+"""
+AsciiMmcType.py - C++ AsciiMmcType.h 변환
+MMC/패킷 공통 상수, Enum, 데이터클래스 정의
+CommType.py 가 이 모듈에 의존하므로 의존성 최하위 파일입니다.
+"""
 
-# ==========================================================================
-# [CONSTANTS] Defines
-# ==========================================================================
+from __future__ import annotations
+from dataclasses import dataclass, field
+from enum import IntEnum
 
+# ── 패킷 크기 상수 ─────────────────────────────────────────────────────
 MAX_PACKET      = 4096
 MAX_MSG         = 4088
 MAX_RESULT_MSG  = 4080
 
+# ── 필드 길이 상수 ─────────────────────────────────────────────────────
 EQUIP_ID_LEN    = 40
 MMC_CMD_LEN     = 128
 MMC_CMD_LEN_EX  = 1000
 MMC_CMD_LEN_EX2 = 500
-
 MMC_VAL_LEN     = 128
 USER_ID_LEN     = 16
 PASSWORD_LEN    = 16
-IP_ADDRESS_LEN  = 16
+IP_ADDRESS_LEN  = 16    # "xxx.xxx.xxx.xxx"
 EVENT_ID_LEN    = 32
 
-# Message IDs
+# ── MMC 메시지 ID 상수 ─────────────────────────────────────────────────
 AS_MMC_REQ          = 6
 AS_MMC_REQ_ACK      = 2
 AS_MMC_REQ_OLD      = 1
@@ -28,303 +33,189 @@ AS_MMC_RES_ACK      = 12
 AS_MMC_IDENT_REQ    = 21
 AS_MMC_IDENT_RES    = 22
 AS_MMC_FLOW_CONTROL = 31
-SESSION_TYPE_MMC    =   2
 
+# ── Router 메시지 ID 상수 ──────────────────────────────────────────────
 AS_ROUTER_INFO_REQ  = 101
 AS_ROUTER_INFO_RES  = 102
 AS_ROUTER_CONFIG    = 111
 
-# ==========================================================================
-# [ENUMS]
-# ==========================================================================
-# AS_MMC_TYPE
-FULL_CMD = 0; CMD_ID = 1; CMD_SET_ID = 2; RE_ISSUE = 3
+# ── Enum ───────────────────────────────────────────────────────────────
+class AsMmcType(IntEnum):
+    FULL_CMD    = 0
+    CMD_ID      = 1
+    CMD_SET_ID  = 2
+    RE_ISSUE    = 3
 
-# AS_MMC_INTERFACE
-ASCII = 0; Q3 = 1
+class AsMmcInterface(IntEnum):
+    ASCII   = 0
+    Q3      = 1
 
-# AS_MMC_RESPONSE_MODE
-NO_RESPONSE = 0; RESPONSE = 1; SAVE_AND_RESPONSE = 2; ONLY_SAVE_RESPONSE = 3
+class AsMmcResponseMode(IntEnum):
+    NO_RESPONSE         = 0
+    RESPONSE            = 1
+    SAVE_AND_RESPONSE   = 2
+    ONLY_SAVE_RESPONSE  = 3
 
-# AS_MMC_PUBLISH_MODE
-NO_IMMEDIATE = 0; IMMEDIATE = 1; NOT_PUBLISH = 2
+class AsMmcPublishMode(IntEnum):
+    NO_IMMEDIATE    = 0
+    IMMEDIATE       = 1
+    NOT_PUBLISH     = 2
 
-# AS_MMC_COLLECT_MODE
-NO_RECOLLECT = 0; RECOLLECT = 1
+class AsMmcCollectMode(IntEnum):
+    NO_RECOLLECT    = 0
+    RECOLLECT       = 1
 
-# AS_MMC_RESULT_MODE
-R_ERROR = 0; R_CONTINUE = 1; R_COMPLETE = 2
+class AsMmcResultMode(IntEnum):
+    R_ERROR     = 0
+    R_CONTINUE  = 1
+    R_COMPLETE  = 2
 
+# ── 데이터클래스 ───────────────────────────────────────────────────────
 
-# ==========================================================================
-# [PACKET STRUCTURES]
-# ==========================================================================
+@dataclass
+class PacketT:
+    """PACKET_T"""
+    msg_id: int = 0
+    length: int = 0
+    msg:    str = ""        # MAX_MSG(4088) 바이트
 
-class BasePacket:
-    """Helper class for pack/unpack"""
-    @classmethod
-    def _decode_str(cls, byte_data):
-        return byte_data.decode('utf-8', errors='ignore').strip('\x00')
+@dataclass
+class AsMmcIdentReq:
+    """AS_MMC_IDENT_REQ_T"""
+    name: str = ""          # max 80자
 
-    @classmethod
-    def _encode_str(cls, str_data, size):
-        return str_data.encode('utf-8')[:size]
+@dataclass
+class AsMmcIdentRes:
+    """AS_MMC_IDENT_RES_T"""
+    result_mode: int = 0    # 0: NOK, 1: OK
+    result:      str = ""   # max 256자
 
-# -------------------------------------------------------
-# 1. Basic Packet Header (Deprecated in Python, usually part of PacketT)
-# -------------------------------------------------------
-# typedef struct { int MsgId; int Length; char Msg[MAX_MSG]; } PACKET_T;
-# -> CommType.py의 PacketT 사용 권장
+@dataclass
+class AsMmcFlowControl:
+    """AS_MMC_FLOW_CONTROL_T"""
+    control_mode: int = 0   # 0: stop, 1: restart
+    msg_id:       int = 0
+    control_info: str = ""  # max 256자
 
-# -------------------------------------------------------
-# 2. MMC Related Structures
-# -------------------------------------------------------
+@dataclass
+class AsMmcParameter:
+    """AS_MMC_PARAMETER_T"""
+    sequence: int = 0
+    value:    str = ""      # max MMC_VAL_LEN(128)자
 
-class AsMmcIdentReqT(BasePacket):
-    # char name[80]
-    FMT = "!80s"
-    SIZE = struct.calcsize(FMT)
-    
-    def __init__(self, name=""):
-        self.name = name
-        
-    def pack(self):
-        return struct.pack(self.FMT, self._encode_str(self.name, 80))
-        
-    @classmethod
-    def unpack(cls, data):
-        if len(data) < cls.SIZE: return None
-        return cls(cls._decode_str(data[:cls.SIZE]))
+@dataclass
+class AsMmcRequestOld:
+    """AS_MMC_REQUEST_OLD_T (AS_MMC_REQ_OLD 구버전)"""
+    id:            int = 0
+    ne:            str = ""
+    type:          AsMmcType         = AsMmcType.FULL_CMD
+    reference_id:  int = 0
+    interfaces:    AsMmcInterface    = AsMmcInterface.ASCII
+    response_mode: AsMmcResponseMode = AsMmcResponseMode.NO_RESPONSE
+    publish_mode:  AsMmcPublishMode  = AsMmcPublishMode.NO_IMMEDIATE
+    collect_mode:  AsMmcCollectMode  = AsMmcCollectMode.NO_RECOLLECT
+    mmc:           str = ""          # max MMC_CMD_LEN(128)
+    userid:        str = ""          # max USER_ID_LEN(16)
+    display:       str = ""          # max IP_ADDRESS_LEN(16)
+    cmd_delay_time:int = 0
+    retry_no:      int = 0
+    cur_retry_no:  int = 0
+    parameter_no:  int = 0
+    priority:      int = 0
+    log_mode:      int = 0
+    parameters:    list[AsMmcParameter] = field(default_factory=list)  # max 20
 
-class AsMmcIdentResT(BasePacket):
-    # int resultMode; char result[256];
-    FMT = "!I256s"
-    SIZE = struct.calcsize(FMT)
+@dataclass
+class AsMmcRequest:
+    """AS_MMC_REQUEST_T (AS_MMC_REQ 현행)"""
+    id:            int = 0
+    ne:            str = ""
+    type:          AsMmcType         = AsMmcType.FULL_CMD
+    reference_id:  int = 0
+    interfaces:    AsMmcInterface    = AsMmcInterface.ASCII
+    response_mode: AsMmcResponseMode = AsMmcResponseMode.NO_RESPONSE
+    publish_mode:  AsMmcPublishMode  = AsMmcPublishMode.NO_IMMEDIATE
+    collect_mode:  AsMmcCollectMode  = AsMmcCollectMode.NO_RECOLLECT
+    mmc:           str = ""          # max MMC_CMD_LEN_EX(1000)
+    userid:        str = ""
+    display:       str = ""
+    cmd_delay_time:int = 0
+    retry_no:      int = 0
+    cur_retry_no:  int = 0
+    parameter_no:  int = 0
+    priority:      int = 0
+    log_mode:      int = 0
+    parameters:    list[AsMmcParameter] = field(default_factory=list)  # max 20
+    reserved:      str = ""          # max 100자
 
-    def __init__(self, result_mode=0, result=""):
-        self.resultMode = result_mode
-        self.result = result
+@dataclass
+class AsMmcRequestNetwin:
+    """AS_MMC_REQUEST_T_NETWIN — NetWindow 전용 확장 구조체"""
+    id:            int = 0
+    ne:            str = ""
+    type:          int = 0
+    reference_id:  int = 0
+    interfaces:    int = 0
+    response_mode: int = 0
+    publish_mode:  int = 0
+    collect_mode:  int = 0
+    mmc:           str = ""          # max 128
+    userid:        str = ""          # max 16
+    display:       str = ""          # max 16
+    cmd_delay_time:int = 0
+    retry_no:      int = 0
+    cur_retry_no:  int = 0
+    parameter_no:  int = 0
+    priority:      int = 0
+    log_mode:      int = 0
+    parameters:    str = ""          # raw 2664바이트 (직렬화된 파라미터)
+    mscid:         str = ""          # max 40
+    mscip:         str = ""          # max 15
+    bsmid:         str = ""          # max 40
+    bsmip:         str = ""          # max 15
+    minno:         str = ""          # max 16
+    trequesttime:  str = ""          # max 16+282
 
-    def pack(self):
-        return struct.pack(self.FMT, self.resultMode, self._encode_str(self.result, 256))
-        
-    @classmethod
-    def unpack(cls, data):
-        t = struct.unpack(cls.FMT, data[:cls.SIZE])
-        return cls(t[0], cls._decode_str(t[1]))
+@dataclass
+class AsMmcAck:
+    """AS_MMC_ACK_T"""
+    id:          int = 0
+    result_mode: int = 0    # 0: NOK, 1: OK
+    result:      list[int] = field(default_factory=list)  # int[40]
 
-class AsMmcParameterT:
-    # int sequence; char value[MMC_VAL_LEN];
-    FMT = f"!I{MMC_VAL_LEN}s"
-    SIZE = struct.calcsize(FMT)
-    
-    def __init__(self, seq=0, val=""):
-        self.sequence = seq
-        self.value = val
-        
-    def pack(self):
-        return struct.pack(self.FMT, self.sequence, BasePacket._encode_str(self.value, MMC_VAL_LEN))
-        
-    @classmethod
-    def unpack(cls, data):
-        t = struct.unpack(cls.FMT, data)
-        return cls(t[0], BasePacket._decode_str(t[1]))
+@dataclass
+class AsMmcResult:
+    """AS_MMC_RESULT_T"""
+    id:          int = 0
+    result_mode: AsMmcResultMode = AsMmcResultMode.R_ERROR
+    result:      str = ""        # max MAX_RESULT_MSG(4080)
 
-class AsMmcRequestT(BasePacket):
-    """
-    AS_MMC_REQUEST_T
-    """
-    # Header fields (13 ints) + Strings + Parameters Array
-    # int(id), char[40](ne), int(type), int(refId), int(if), int(resMode), int(pubMode), int(colMode)
-    # char[1000](mmc), char[16](userid), char[16](display)
-    # int(delay), int(retry), int(curRetry), int(paramNo), int(prio), int(logMode)
-    # AS_MMC_PARAMETER_T parameters[20]
-    # char[100](Reserved)
-    
-    def __init__(self):
-        self.id = 0
-        self.ne = ""
-        self.type = 0
-        self.referenceId = 0
-        self.interfaces = 0
-        self.responseMode = 0
-        self.publishMode = 0
-        self.collectMode = 0
-        self.mmc = ""
-        self.userid = ""
-        self.display = ""
-        self.cmdDelayTime = 0
-        self.retryNo = 0
-        self.curRetryNo = 0
-        self.parameterNo = 0
-        self.priority = 0
-        self.logMode = 0
-        self.parameters = [] # List of AsMmcParameterT
-        self.Reserved = ""
+@dataclass
+class AsRouterInfoReq:
+    """AS_ROUTER_INFO_REQ_T"""
+    userid:    str = ""
+    password:  str = ""
+    equip_no:  int = 0           # max 50
+    equip_ids: list[str] = field(default_factory=list)  # max 50 × EQUIP_ID_LEN
 
-    def pack(self):
-        # 1. Header Packing
-        # I(id) 40s(ne) I(type) I(ref) I(if) I(res) I(pub) I(col) 
-        # 1000s(mmc) 16s(user) 16s(disp) 
-        # I(delay) I(retry) I(cur) I(pNo) I(prio) I(log)
-        fmt_base = f"!I{EQUIP_ID_LEN}sIIIIII{MMC_CMD_LEN_EX}s{USER_ID_LEN}s{IP_ADDRESS_LEN}sIIIIII"
-        
-        packed = struct.pack(fmt_base,
-            self.id, self._encode_str(self.ne, EQUIP_ID_LEN),
-            self.type, self.referenceId, self.interfaces, self.responseMode, self.publishMode, self.collectMode,
-            self._encode_str(self.mmc, MMC_CMD_LEN_EX), self._encode_str(self.userid, USER_ID_LEN),
-            self._encode_str(self.display, IP_ADDRESS_LEN),
-            self.cmdDelayTime, self.retryNo, self.curRetryNo, self.parameterNo, self.priority, self.logMode
-        )
-        
-        # 2. Parameters Array (20 items fixed size)
-        for i in range(20):
-            if i < len(self.parameters):
-                packed += self.parameters[i].pack()
-            else:
-                # Empty parameter padding
-                packed += struct.pack(AsMmcParameterT.FMT, 0, b'')
-                
-        # 3. Reserved
-        packed += self._encode_str(self.Reserved, 100)
-        return packed
+@dataclass
+class AsRouterInfo:
+    """AS_ROUTER_INFO_T"""
+    result_mode: int = 0         # 0: NOK, 1: OK
+    equip_id:    str = ""
+    ipaddress:   str = ""
+    port_no:     int = 0
 
-    @classmethod
-    def unpack(cls, data):
-        obj = cls()
-        fmt_base = f"!I{EQUIP_ID_LEN}sIIIIII{MMC_CMD_LEN_EX}s{USER_ID_LEN}s{IP_ADDRESS_LEN}sIIIIII"
-        base_size = struct.calcsize(fmt_base)
-        
-        if len(data) < base_size: return None
-        
-        t = struct.unpack(fmt_base, data[:base_size])
-        obj.id = t[0]
-        obj.ne = cls._decode_str(t[1])
-        obj.type, obj.referenceId, obj.interfaces = t[2], t[3], t[4]
-        obj.responseMode, obj.publishMode, obj.collectMode = t[5], t[6], t[7]
-        obj.mmc = cls._decode_str(t[8])
-        obj.userid, obj.display = cls._decode_str(t[9]), cls._decode_str(t[10])
-        obj.cmdDelayTime, obj.retryNo, obj.curRetryNo = t[11], t[12], t[13]
-        obj.parameterNo, obj.priority, obj.logMode = t[14], t[15], t[16]
-        
-        # Parameters
-        offset = base_size
-        p_size = AsMmcParameterT.SIZE
-        for _ in range(20):
-            if offset + p_size > len(data): break
-            p_data = data[offset : offset + p_size]
-            obj.parameters.append(AsMmcParameterT.unpack(p_data))
-            offset += p_size
-            
-        return obj
+@dataclass
+class AsRouterInfoRes:
+    """AS_ROUTER_INFO_RES_T"""
+    router_no:    int = 0
+    router_infos: list[AsRouterInfo] = field(default_factory=list)  # max 50
 
-class AsMmcResultT(BasePacket):
-    # int id; int resultMode; char result[MAX_RESULT_MSG];
-    FMT = f"!II{MAX_RESULT_MSG}s"
-    SIZE = struct.calcsize(FMT)
-
-    def __init__(self, id_val=0, mode=0, result=""):
-        self.id = id_val
-        self.resultMode = mode
-        self.result = result
-
-    def pack(self):
-        return struct.pack(self.FMT, self.id, self.resultMode, self._encode_str(self.result, MAX_RESULT_MSG))
-
-    @classmethod
-    def unpack(cls, data):
-        if len(data) < cls.SIZE: return None
-        t = struct.unpack(cls.FMT, data[:cls.SIZE])
-        return cls(t[0], t[1], cls._decode_str(t[2]))
-
-# -------------------------------------------------------
-# 3. Router Info Structures
-# -------------------------------------------------------
-class AsRouterInfoReqT(BasePacket):
-    # char userid[16], char password[16], int equipNo, char equipIds[50][40]
-    BASE_FMT = f"!{USER_ID_LEN}s{PASSWORD_LEN}sI"
-    BASE_SIZE = struct.calcsize(BASE_FMT)
-    
-    def __init__(self):
-        self.userid = ""
-        self.password = ""
-        self.equipNo = 0
-        self.equipIds = [] # List of strings
-
-    def pack(self):
-        packed = struct.pack(self.BASE_FMT, 
-                             self._encode_str(self.userid, USER_ID_LEN),
-                             self._encode_str(self.password, PASSWORD_LEN),
-                             self.equipNo)
-        # Equip IDs array (Fixed 50)
-        for i in range(50):
-            eid = self.equipIds[i] if i < len(self.equipIds) else ""
-            packed += self._encode_str(eid, EQUIP_ID_LEN)
-        return packed
-
-    @classmethod
-    def unpack(cls, data):
-        if len(data) < cls.BASE_SIZE: return None
-        obj = cls()
-        t = struct.unpack(cls.BASE_FMT, data[:cls.BASE_SIZE])
-        obj.userid, obj.password = cls._decode_str(t[0]), cls._decode_str(t[1])
-        obj.equipNo = t[2]
-        
-        offset = cls.BASE_SIZE
-        for _ in range(50):
-            if offset + EQUIP_ID_LEN > len(data): break
-            eid_bytes = data[offset : offset + EQUIP_ID_LEN]
-            obj.equipIds.append(cls._decode_str(eid_bytes))
-            offset += EQUIP_ID_LEN
-        return obj
-
-class AsRouterInfoT(BasePacket):
-    # int resultMode, char equipId[40], char ip[16], int port
-    FMT = f"!I{EQUIP_ID_LEN}s{IP_ADDRESS_LEN}sI"
-    SIZE = struct.calcsize(FMT)
-    
-    def __init__(self):
-        self.resultMode = 0
-        self.equipId = ""
-        self.ipaddress = ""
-        self.portNo = 0
-        
-    @classmethod
-    def unpack(cls, data):
-        t = struct.unpack(cls.FMT, data)
-        obj = cls()
-        obj.resultMode = t[0]
-        obj.equipId = cls._decode_str(t[1])
-        obj.ipaddress = cls._decode_str(t[2])
-        obj.portNo = t[3]
-        return obj
-    
-# -------------------------------------------------------
-# AS_MMC_ACK_T Structure
-# -------------------------------------------------------
-class AsMmcAckT(BasePacket):
-    """
-    typedef struct {
-        int id;
-        int resultMode; // 1: Success, 0: Fail
-    } AS_MMC_ACK_T;
-    """
-    FMT = "!II" # int(4) + int(4)
-    SIZE = struct.calcsize(FMT)
-
-    def __init__(self):
-        self.id = 0
-        self.resultMode = 0
-
-    def pack(self):
-        return struct.pack(self.FMT, self.id, self.resultMode)
-
-    @classmethod
-    def unpack(cls, data):
-        if len(data) < cls.SIZE: return None
-        t = struct.unpack(cls.FMT, data[:cls.SIZE])
-        
-        obj = cls()
-        obj.id = t[0]
-        obj.resultMode = t[1]
-        return obj
+@dataclass
+class AsRouterConfig:
+    """AS_ROUTER_CONFIG_T"""
+    mode:      int = 0           # 0: raw, 1: parsed, 2: both
+    equip_id:  str = ""
+    msg_id_no: int = 0
+    msg_ids:   list[str] = field(default_factory=list)  # max 100 × EVENT_ID_LEN

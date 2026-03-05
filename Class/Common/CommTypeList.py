@@ -1,136 +1,89 @@
-import sys
-import os
+"""
+CommTypeList.py - C++ CommTypeList.h 변환
+공통 컨테이너(list/map/set/vector) 타입 정의
+"""
 
-# 프로젝트 경로 설정
-current_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.abspath(os.path.join(current_dir, '../..'))
-if project_root not in sys.path:
-    sys.path.append(project_root)
+from __future__ import annotations
+from typing import Any
 
-from Class.Util.FrBaseList import FrStringVector
+from Common.CommType import (
+    AsMmcGenCommand, AsPortStatusInfo, AsProcessStatus,
+    AsLogStatus, AsCmdOpenPort, AsProcControl,
+    AsSubProcInfo, AsDataHandlerInfo,
+)
 
-# ==========================================================================
-# [Note]
-# C++의 DELETE_ITERATOR 매크로는 Python의 Garbage Collection에 의해
-# 자동으로 메모리가 해제되므로 구현할 필요가 없습니다.
-# ==========================================================================
+# ──────────────────────────────────────────────
+# 단순 타입 별칭 (C++ typedef 대응)
+# ──────────────────────────────────────────────
+StringList          = list[str]
+MmcParameterList    = list[Any]       # list[AS_MMC_PARAMETER_T*]
+PortStatusInfoList  = list[AsPortStatusInfo]
+ProcessInfoList     = list[AsProcessStatus]
+ConnectionMgrVector = list[Any]       # list[ConnectionMgr*]
+DataHandlerInfoMap  = dict[str, AsDataHandlerInfo]
+IntStringMap        = dict[int, str]
+SubProcInfoMap      = dict[str, AsSubProcInfo]
 
-# -------------------------------------------------------
-# List Containers (std::list, std::vector 대응)
-# -------------------------------------------------------
-
-class StringList(list):
-    """typedef list<string> stringList"""
-    pass
-
-class MmcParameterList(list):
-    """typedef list<AS_MMC_PARAMETER_T *>"""
-    pass
+# ──────────────────────────────────────────────
+# 소멸자에서 요소 delete 가 필요했던 C++ 클래스
+# → Python GC가 처리하므로 list/dict 그대로 사용
+# ──────────────────────────────────────────────
 
 class MmcGenCommandList(list):
-    """
-    class MmcGenCommandList : public list<AS_MMC_GEN_COMMAND_T*>
-    C++에서는 소멸자에서 delete를 수행하지만 Python은 불필요
-    """
-    pass
-
-class PortStatusInfoList(list):
-    """typedef list<AS_PORT_STATUS_INFO_T*>"""
+    """list[AsMmcGenCommand] — C++ MmcGenCommandList 대응"""
     pass
 
 class SocketConnectionList(list):
-    """class SocketConnectionList : public list<AsSocket*>"""
+    """list[AsSocket] — C++ SocketConnectionList 대응"""
     pass
-
-class CmdOpenPortList(list):
-    """class CmdOpenPortList : public list<AS_CMD_OPEN_PORT_T>"""
-    pass
-
-class LogStatusVector(list):
-    """class LogStatusVector : public vector<AS_LOG_STATUS_T*>"""
-    pass
-
-class ProcessInfoList(list):
-    """class ProcessInfoList : public list<AS_PROCESS_STATUS_T>"""
-    pass
-
-class ConnectionMgrVector(list):
-    """typedef vector<ConnectionMgr*>"""
-    pass
-
-# -------------------------------------------------------
-# Map Containers (std::map 대응)
-# -------------------------------------------------------
 
 class ProcPidInfoMap(dict):
-    """class ProcPidInfoMap : public map<string, int>"""
+    """dict[str, int] — C++ ProcPidInfoMap 대응 (ProcessId → Pid)"""
     pass
 
 class ProcControlMap(dict):
-    """class ProcControlMap : public map<string, AS_PROC_CONTROL_T>"""
+    """dict[str, AsProcControl] — C++ ProcControlMap 대응"""
+    pass
+
+class PidSet(set):
+    """set[int] — C++ PidSet 대응"""
+    pass
+
+class CmdOpenPortList(list):
+    """list[AsCmdOpenPort] — C++ CmdOpenPortList 대응"""
     pass
 
 class ConnectorIdPortInfoMap(dict):
-    """
-    class ConnectorIdPortInfoMap : public map<string, CmdOpenPortList*>
-    Key: ConnectorId, Value: CmdOpenPortList
-    """
-    pass
-
-class LogStatusMap(dict):
-    """class LogStatusMap : public map<string, AS_LOG_STATUS_T*>"""
-    pass
-
-class SubSectionValueMap(dict):
-    """
-    class SubSectionValueMap : public map<string, frStringVector>
-    AsEnvrion에서 사용됨
-    """
-    pass
-
-class SectionValueMap(dict):
-    """
-    class SectionValueMap : public map<string, SubSectionValueMap>
-    AsEnvrion에서 사용됨
-    """
-    pass
-
-class DataHandlerInfoMap(dict):
-    """typedef map<string, AS_DATA_HANDLER_INFO_T*>"""
-    pass
-
-class TimerKeyMap(dict):
-    """typedef map<string, StringIntKey*>"""
-    pass
-
-class IntStringMap(dict):
-    """typedef map<int, string>"""
-    pass
-
-class SubProcInfoMap(dict):
-    """typedef map<string, AS_SUB_PROC_INFO_T*>"""
-    pass
-
-# -------------------------------------------------------
-# Set Containers (std::set 대응)
-# -------------------------------------------------------
-
-class PidSet(set):
-    """class PidSet : public set<int>"""
+    """dict[str, CmdOpenPortList] — ConnectorId → Port 목록"""
     pass
 
 class StringSet(set):
-    """class StringSet : public set<string>"""
+    """set[str] — C++ StringSet 대응"""
     pass
 
-# -------------------------------------------------------
-# Simple Wrapper Classes
-# -------------------------------------------------------
+class LogStatusMap(dict):
+    """dict[str, AsLogStatus] — C++ LogStatusMap 대응"""
+    pass
 
+class LogStatusVector(list):
+    """list[AsLogStatus] — C++ LogStatusVector 대응"""
+    pass
+
+class SubSectionValueMap(dict):
+    """dict[str, list[str]] — C++ SubSectionValueMap 대응"""
+    pass
+
+class SectionValueMap(dict):
+    """dict[str, SubSectionValueMap] — C++ SectionValueMap 대응"""
+    pass
+
+# ──────────────────────────────────────────────
+# StringIntKey (C++ 클래스)
+# ──────────────────────────────────────────────
 class StringIntKey:
-    """
-    class StringIntKey { string m_Id; int m_Key; }
-    """
-    def __init__(self):
-        self.m_Id = ""
-        self.m_Key = 0
+    """C++ StringIntKey 클래스 대응"""
+    def __init__(self, id_: str = "", key: int = 0):
+        self.m_id  = id_
+        self.m_key = key
+
+TimerKeyMap = dict[str, StringIntKey]   # dict[str, StringIntKey*]

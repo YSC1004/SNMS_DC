@@ -12,7 +12,7 @@ project_root = os.path.abspath(os.path.join(current_dir, '../..'))
 if project_root not in sys.path:
     sys.path.append(project_root)
 
-from Class.Event.FrThreadWorld import FrThreadWorld
+from Class.Event.fr_thread_world import FrThreadWorld
 from Class.ProcParser.RuleType import RAW_MSG_CHANGE_FLAG
 from Class.Event.FrLogger import FrLogger
 

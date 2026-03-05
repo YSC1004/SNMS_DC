@@ -14,7 +14,7 @@ from Class.Common.AsUtil import AsUtil
 # 여기서는 의존성을 줄이기 위해 native socket을 직접 사용해도 됩니다.
 # C++ 로직을 따르기 위해 import 합니다.
 try:
-    from Class.Event.FrSocketSensor import FrSocketSensor
+    from Class.Event.fr_socket_sensor import FrSocketSensor
 except ImportError:
     FrSocketSensor = None
 

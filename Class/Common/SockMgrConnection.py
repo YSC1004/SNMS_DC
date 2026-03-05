@@ -9,7 +9,7 @@ if project_root not in sys.path:
 
 from Class.Common.AsSocket import AsSocket
 from Class.Common.CommType import *
-from Class.Event.FrSockFdManager import FrSockFdManager
+from Class.Event.fr_sock_fd_manager import FrSockFdManager
 from Class.Common.AsWorld import AsWorld
 
 # -------------------------------------------------------
