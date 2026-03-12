@@ -1,211 +1,201 @@
-import sys
-import os
+# -*- coding: utf-8 -*-
+"""
+ConnectionMgr.h / ConnectionMgr.C  →  ConnectionMgr.py
+Python 3.11.10 변환
+
+변환 설계:
+  ConnectionMgr → ConnectionMgr  (AsSocket 상속)
+
+C++ → Python 주요 변환 포인트:
+  SocketConnectionList (list<AsSocket*>) → list[AsSocket]
+  frStringList (list<string>)            → list[str]
+  sighold/sigrelse(SIGCLD/SIGINT)        → threading.Lock() 으로 대체
+  SocketRemoveLock/UnLock() virtual      → _socket_remove_lock/unlock() (no-op, override 가능)
+  AsWorld::RegisterConnectionMgr(this)   → AsWorld.register_connection_mgr(self)
+  frSockFdManager::SocketCheck()         → FrSockFdManager.socket_check()
+  delete (*itr)                          → GC 위임 (list 에서 제거)
+
+변경 이력:
+  2014.07.08  초기 작성 (C++ 원본)
+  Python 변환
+"""
+
+import logging
+import signal
 import threading
+from typing import Optional, TYPE_CHECKING
 
-# -------------------------------------------------------
-# 1. 프로젝트 경로 설정
-# -------------------------------------------------------
-current_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.abspath(os.path.join(current_dir, '../..'))
-if project_root not in sys.path:
-    sys.path.append(project_root)
+from Common.AsSocket import AsSocket
+from Common.CommType import AsCmdLogControlT, AsCmdOpenPortT, FrSocketInfo
+from Common.CommTypeList import SocketConnectionList
 
-# -------------------------------------------------------
-# 2. 모듈 Import
-# -------------------------------------------------------
-from Class.Event.fr_sock_fd_manager import FrSockFdManager, FrSocketInfo, \
-    SOCK_INFO_WRITERABLE_STATUS_OK, SOCK_INFO_WRITERABLE_STATUS_NOK
+if TYPE_CHECKING:
+    from Event.fr_sock_fd_manager import FrSockFdManager
 
-# [주의] AsWorld는 여기서 import 하지 않고 __init__ 내부에서 import 합니다.
+logger = logging.getLogger(__name__)
 
-# -------------------------------------------------------
-# ConnectionMgr Class
-# 연결된 모든 소켓 세션(AsSocket) 관리자
-# -------------------------------------------------------
-class ConnectionMgr(FrSockFdManager):
-    def __init__(self):
-        """
-        C++: ConnectionMgr()
-        """
+# SOCK_INFO_WRITERABLE_STATUS 상수 (CommType.py 에 정의되어 있지 않을 경우 여기서 정의)
+SOCK_INFO_WRITERABLE_STATUS_OK  = 1
+SOCK_INFO_WRITERABLE_STATUS_NOK = 0
+
+
+class ConnectionMgr(AsSocket):
+    """
+    C++ ConnectionMgr 대응.
+    AsSocket 연결 목록을 관리하며 세션 조회, 명령 전송, 소켓 정보 수집을 담당.
+    """
+
+    def __init__(self) -> None:
         super().__init__()
-        
-        # 연결된 소켓 객체 리스트 (List of AsSocket)
-        self.m_SocketConnectionList = []
-        
-        # 세션 이름 리스트 (List of str)
-        self.m_CurrentSessionId = []
-        
-        # 동시성 제어용 락
-        self.m_Lock = threading.Lock()
-        
-        # [수정] 순환 참조 방지를 위해 함수 내부에서 Import 후 등록
-        # ConnectionMgr가 생성되면 자동으로 Global AsWorld 리스트에 등록됨
-        from Class.Common.AsWorld import AsWorld
+        self._socket_connection_list: SocketConnectionList = []
+        self._current_session_id: list[str] = []
+        self._lock = threading.Lock()  # sighold/sigrelse 대체
+
+        from Common.AsWorld import AsWorld
         AsWorld.register_connection_mgr(self)
 
-    def __del__(self):
+    def __del__(self) -> None:
+        from Common.AsWorld import AsWorld
+        AsWorld.deregister_connection_mgr(self)
+        self._socket_connection_list.clear()
+
+    # ── 소켓 추가 / 제거 ──────────────────────
+
+    def add(self, socket: AsSocket) -> None:
+        """C++ Add(AsSocket*) 대응."""
+        self._socket_connection_list.append(socket)
+
+    def remove(self, socket: AsSocket) -> None:
         """
-        C++: ~ConnectionMgr()
+        C++ Remove(AsSocket*) 대응.
+        시그널 블록(Lock) → 세션명 제거 → 소켓 제거 → 언락.
         """
-        # [수정] 소멸 시 AsWorld 목록에서 제거
+        with self._lock:
+            self._socket_remove_lock()
+            session = socket.get_session_name()
+            self._current_session_id = [s for s in self._current_session_id if s != session]
+            if socket in self._socket_connection_list:
+                self._socket_connection_list.remove(socket)
+            self._socket_remove_unlock()
+
+    def _socket_remove_lock(self) -> None:
+        """C++ SocketRemoveLock() virtual no-op 대응. 하위 클래스에서 override 가능."""
+
+    def _socket_remove_unlock(self) -> None:
+        """C++ SocketRemoveUnLock() virtual no-op 대응. 하위 클래스에서 override 가능."""
+
+    # ── 세션 이름 관리 ────────────────────────
+
+    def add_session_name(self, session_name: str) -> bool:
+        """
+        C++ AddSessionName() 대응.
+        중복 등록 시 에러 로그 후 False 반환.
+        """
+        if session_name in self._current_session_id:
+            logger.error("Already Register SessionName : %s", session_name)
+            return False
+        self._current_session_id.append(session_name)
+        return True
+
+    def remove_session_name(self, session_name: str) -> bool:
+        """C++ RemoveSessionName() 대응. 없으면 False 반환."""
         try:
-            from Class.Common.AsWorld import AsWorld
-            AsWorld.deregister_connection_mgr(self)
-        except ImportError:
-            pass
-        
-        self.socket_remove_lock()
-        
-        # 관리 중인 소켓 모두 닫기
-        for socket in self.m_SocketConnectionList:
-            if hasattr(socket, 'close'):
-                socket.close()
-        
-        self.m_SocketConnectionList.clear()
-        self.socket_remove_unlock()
+            self._current_session_id.remove(session_name)
+            return True
+        except ValueError:
+            return False
 
-    # ---------------------------------------------------
-    # List Management
-    # ---------------------------------------------------
-    def add(self, socket_obj):
-        """
-        C++: void Add(AsSocket* Socket)
-        """
-        with self.m_Lock:
-            self.m_SocketConnectionList.append(socket_obj)
-
-    def remove(self, socket_obj):
-        """
-        C++: void Remove(AsSocket* Socket)
-        소켓 객체를 리스트에서 제거하고 닫음
-        """
-        self.socket_remove_lock()
-        
-        try:
-            session_name = socket_obj.get_session_name()
-            if session_name in self.m_CurrentSessionId:
-                self.m_CurrentSessionId.remove(session_name)
-            
-            if socket_obj in self.m_SocketConnectionList:
-                self.m_SocketConnectionList.remove(socket_obj)
-                
-            # 소켓 닫기 (C++ delete Socket 대응)
-            if hasattr(socket_obj, 'close'):
-                socket_obj.close()
-                
-        except Exception as e:
-            print(f"[ConnectionMgr] Remove Error: {e}")
-            
-        self.socket_remove_unlock()
-
-    def find_session(self, session_name):
-        """
-        C++: AsSocket* FindSession(const string& SessionName)
-        """
-        with self.m_Lock:
-            for socket in self.m_SocketConnectionList:
-                if socket.get_session_name() == session_name:
-                    return socket
+    def find_session(self, session_name: str) -> Optional[AsSocket]:
+        """C++ FindSession() 대응. 없으면 None 반환."""
+        for sock in self._socket_connection_list:
+            if session_name == sock.get_session_name():
+                return sock
         return None
 
-    def is_valid_connection(self, socket_obj):
-        with self.m_Lock:
-            return socket_obj in self.m_SocketConnectionList
+    # ── 명령 전송 ─────────────────────────────
 
-    # ---------------------------------------------------
-    # Session Name Management
-    # ---------------------------------------------------
-    def add_session_name(self, session_name):
-        with self.m_Lock:
-            if session_name in self.m_CurrentSessionId:
-                print(f"[ConnectionMgr] Already Register SessionName : {session_name}")
-                return False
-            self.m_CurrentSessionId.append(session_name)
-            return True
-
-    def remove_session_name(self, session_name):
-        with self.m_Lock:
-            if session_name in self.m_CurrentSessionId:
-                self.m_CurrentSessionId.remove(session_name)
-                return True
-            return False
-
-    # ---------------------------------------------------
-    # Lock Helper (C++ 스타일)
-    # ---------------------------------------------------
-    def socket_remove_lock(self):
-        self.m_Lock.acquire()
-
-    def socket_remove_unlock(self):
-        self.m_Lock.release()
-
-    # ---------------------------------------------------
-    # Command & Info
-    # ---------------------------------------------------
-    def cmd_open_port_info(self, session_name, port_info):
+    def send_cmd_log_status_change(
+        self,
+        log_ctl: AsCmdLogControlT,
+        session_name: str = "",
+    ) -> bool:
         """
-        C++: bool CmdOpenPortInfo(...)
-        특정 세션에 포트 정보 전송 명령
-        """
-        socket = self.find_session(session_name)
-        if socket:
-            # AsSocket.cmd_open_port_info 호출 (가상함수)
-            socket.cmd_open_port_info(port_info)
-            return True
-        return False
-
-    def send_all_cmd_open_port_info(self, port_info):
-        """
-        모든 세션에 포트 정보 전송
-        """
-        with self.m_Lock:
-            for socket in self.m_SocketConnectionList:
-                socket.cmd_open_port_info(port_info)
-
-    def send_cmd_log_status_change(self, log_ctl, session_name=""):
-        """
-        특정 세션 또는 전체 세션에 로그 변경 명령 전송
+        C++ SendCmdLogStatusChange() 대응.
+        session_name 이 빈 문자열이면 전체 전송, 아니면 해당 세션만 전송.
         """
         if not session_name:
-            # 전체 전송
-            with self.m_Lock:
-                for socket in self.m_SocketConnectionList:
-                    if hasattr(socket, 'send_cmd_log_status_change'):
-                        socket.send_cmd_log_status_change(log_ctl)
+            for sock in self._socket_connection_list:
+                sock.send_cmd_log_status_change(log_ctl)
             return True
-        else:
-            # 특정 세션 전송
-            socket = self.find_session(session_name)
-            if socket and hasattr(socket, 'send_cmd_log_status_change'):
-                socket.send_cmd_log_status_change(log_ctl)
-                return True
+
+        sock = self.find_session(session_name)
+        if sock is None:
             return False
+        sock.send_cmd_log_status_change(log_ctl)
+        return True
 
-    def get_con_sock_infos(self, info_vector, is_writable_check, sec, micro_sec):
+    def cmd_open_port_info(
+        self, session_name: str, port_info: AsCmdOpenPortT
+    ) -> bool:
+        """C++ CmdOpenPortInfo() 대응."""
+        sock = self.find_session(session_name)
+        if sock is None:
+            return False
+        sock.cmd_open_port_info(port_info)
+        return True
+
+    def send_all_cmd_open_port_info(self, port_info: AsCmdOpenPortT) -> None:
+        """C++ SendAllCmdOpenPortInfo() 대응. 전체 소켓에 전송."""
+        for sock in self._socket_connection_list:
+            sock.cmd_open_port_info(port_info)
+
+    # ── 유효성 검사 ───────────────────────────
+
+    def is_valid_connection(self, socket: AsSocket) -> bool:
+        """C++ IsValidConnection() 대응."""
+        return socket in self._socket_connection_list
+
+    # ── 소켓 정보 수집 ────────────────────────
+
+    def get_con_sock_infos(
+        self,
+        info_vector: list[FrSocketInfo],
+        is_writerable_check: bool = False,
+        sec: int = 0,
+        micro_sec: int = 100000,
+    ) -> None:
         """
-        C++: void GetConSockInfos(...)
-        현재 관리 중인 모든 소켓의 정보를 수집하여 벡터(리스트)에 담음
+        C++ GetConSockInfos() 대응.
+        자신 + 연결 소켓 목록의 FrSocketInfo 를 info_vector 에 추가.
+        is_writerable_check=True 이면 쓰기 가능 여부도 함께 설정.
         """
-        self.socket_remove_lock()
+        from Event.fr_sock_fd_manager import FrSockFdManager
 
-        # 1. 자기 자신(ConnectionMgr)의 정보 (만약 소켓 기능을 겸한다면)
-        # info = FrSocketInfo()
-        # self.get_socket_info(info)
-        # info_vector.append(info)
+        self._socket_remove_lock()
+        try:
+            info = FrSocketInfo()
+            self.get_socket_info(info)
+            if is_writerable_check:
+                info.writerable_status = (
+                    SOCK_INFO_WRITERABLE_STATUS_OK
+                    if FrSockFdManager.socket_check(info, sec, micro_sec)
+                    else SOCK_INFO_WRITERABLE_STATUS_NOK
+                )
+            info_vector.append(info)
 
-        # 2. 관리 중인 자식 소켓들의 정보 수집
-        for socket in self.m_SocketConnectionList:
-            if hasattr(socket, 'get_socket_info'):
-                info = socket.get_socket_info()
-                
-                if is_writable_check:
-                    # FrSockFdManager.socket_check 사용 (상속받았으므로 self.socket_check 가능)
-                    is_writable = self.socket_check(info, sec, micro_sec)
-                    info.writerable_status = SOCK_INFO_WRITERABLE_STATUS_OK if is_writable else SOCK_INFO_WRITERABLE_STATUS_NOK
-                
+            for sock in self._socket_connection_list:
+                info = FrSocketInfo()
+                sock.get_socket_info(info)
+                if is_writerable_check:
+                    info.writerable_status = (
+                        SOCK_INFO_WRITERABLE_STATUS_OK
+                        if FrSockFdManager.socket_check(info, sec, micro_sec)
+                        else SOCK_INFO_WRITERABLE_STATUS_NOK
+                    )
                 info_vector.append(info)
+        finally:
+            self._socket_remove_unlock()
 
-        self.socket_remove_unlock()
-
-    def get_connection_list(self):
-        return self.m_SocketConnectionList
+    def get_connection_list(self) -> SocketConnectionList:
+        """C++ GetConnectionList() 대응."""
+        return self._socket_connection_list

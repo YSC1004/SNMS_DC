@@ -1,157 +1,196 @@
-import sys
-import os
+"""
+2014.07.08  초기 작성
+Python 변환: AsEnvrion.h/.C → AsEnvrion.py
 
-# 프로젝트 경로 설정
-current_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.abspath(os.path.join(current_dir, '../..'))
-if project_root not in sys.path:
-    sys.path.append(project_root)
+역할: INI 스타일 설정 파일 파서
+  형식:
+    [SectionName]
+    SubSection = Value
+    SubSection = Value2   ← MultiSubsectionMode=True 일 때 중복 허용
+"""
 
-from Class.Util.FrBaseList import FrStringVector
-from Class.Common.AsUtil import AsUtil
+import logging
+from typing import List, Optional
 
-# -------------------------------------------------------
-# AsEnvrion Class
-# 설정 파일 파서 (INI 스타일: [Section] Key=Value)
-# 중복 키 지원 (MultiSubsectionMode)
-# -------------------------------------------------------
+from Common.CommTypeList import SectionValueMap, SubSectionValueMap
+
+logger = logging.getLogger(__name__)
+
+
 class AsEnvrion:
+    """
+    C++: class AsEnvrion : public frObject
+
+    INI 스타일 설정 파일을 읽어 SectionValueMap 구조로 관리.
+      - [Section] 단위로 구분
+      - SubSection = Value 형태
+      - '#' 으로 시작하는 줄은 주석
+      - MultiSubsectionMode=True 이면 동일 SubSection 키에 값 복수 허용
+    """
+
     def __init__(self):
-        self.m_IsMultiSubsecion = False
-        self.m_Delim = "="
-        
-        # 구조: { "Section": { "SubSection": ["Value1", "Value2", ...] } }
-        self.m_SectionValueMap = {}
+        self.m_SectionValueMap:  SectionValueMap = SectionValueMap()
+        self.m_IsMultiSubsecion: bool = False
+        self.m_Delim:            str  = "="
 
-    def __del__(self):
+    # ──────────────────────────────────────────
+    # Public API
+    # ──────────────────────────────────────────
+
+    def SetDelim(self, pDelim: str) -> None:
+        """구분자 변경 (기본값 '=')"""
+        self.m_Delim = pDelim
+
+    def InitConfig(self, FileName: str, MultiSubsectionMode: bool = False) -> bool:
+        """
+        설정 파일을 읽어 m_SectionValueMap 에 저장.
+
+        Args:
+            FileName:           설정 파일 경로
+            MultiSubsectionMode: True 이면 동일 SubSection 키에 값 복수 허용
+
+        Returns:
+            True: 성공, False: 실패
+        """
+        self.m_IsMultiSubsecion = MultiSubsectionMode
         self.m_SectionValueMap.clear()
 
-    def set_delim(self, delim):
-        self.m_Delim = delim
-
-    def init_config(self, file_name, multi_subsection_mode=False):
-        """
-        C++: bool InitConfig(string FileName, bool MultiSubsectionMode)
-        파일을 읽어 파싱하여 맵에 저장
-        """
-        self.m_IsMultiSubsecion = multi_subsection_mode
-        self.m_SectionValueMap.clear()
-
-        if not os.path.exists(file_name):
-            print(f"[AsEnvrion] Can't open config file({file_name})")
-            return False
-
-        current_section = ""
-        
         try:
-            with open(file_name, 'r', encoding='utf-8') as f:
-                for line_no, line in enumerate(f, 1):
-                    line = line.strip()
-                    
-                    # 빈 줄이나 주석(#) 무시
-                    if not line or line.startswith('#'):
-                        continue
-
-                    # 섹션 시작: [SECTION]
-                    if line.startswith('[') and line.endswith(']'):
-                        current_section = line[1:-1].strip()
-                        
-                        if current_section not in self.m_SectionValueMap:
-                            self.m_SectionValueMap[current_section] = {}
-                        else:
-                            # 중복 섹션 경고 (C++ 로직)
-                            print(f"[AsEnvrion] (Line : {line_no}) Duplicate Section : [{current_section}]")
-                            return False
-                            
-                    # 키-값 쌍: Key=Value
-                    else:
-                        if not current_section:
-                            continue
-
-                        # 구분자 찾기
-                        if self.m_Delim not in line:
-                            print(f"[AsEnvrion] (Line : {line_no}) Config Usage Error : Section({current_section}), {line}")
-                            continue
-
-                        # 파싱 (첫 번째 구분자 기준 분리)
-                        key, value = line.split(self.m_Delim, 1)
-                        key = key.strip()
-                        value = value.strip()
-
-                        if not key: continue
-
-                        section_map = self.m_SectionValueMap[current_section]
-
-                        # 값 저장
-                        if not self.m_IsMultiSubsecion:
-                            # 덮어쓰기 모드 (단, C++ 코드는 벡터에 넣으므로 리스트로 관리)
-                            section_map[key] = [value]
-                        else:
-                            # 중복 허용 모드 (리스트에 추가)
-                            if key not in section_map:
-                                section_map[key] = [value]
-                            else:
-                                section_map[key].append(value)
-            return True
-
-        except IOError as e:
-            print(f"[AsEnvrion] File Read Error: {e}")
+            fp = open(FileName, "r", encoding="utf-8", errors="replace")
+        except OSError as e:
+            logger.error("Can't open config file(%s): %s", FileName, e)
             return False
 
-    def get_env_value(self, section, sub_section):
-        """
-        C++: string GetEnvValue(string Section, string SubSection)
-        단일 값 반환 (첫 번째 값)
-        """
-        if section in self.m_SectionValueMap:
-            if sub_section in self.m_SectionValueMap[section]:
-                values = self.m_SectionValueMap[section][sub_section]
-                if values:
-                    return values[0]
-        return ""
+        current_section: str = ""
+        line_cnt: int = 0
 
-    def get_env_value_by_type(self, process_type, sub_section):
-        """
-        C++: string GetEnvValue(int ProcessType, string SubSection)
-        프로세스 타입 Enum을 문자열로 변환하여 조회
-        """
-        section = AsUtil.get_process_type_string(process_type)
-        return self.get_env_value(section, sub_section)
+        with fp:
+            for raw in fp:
+                line_cnt += 1
+                line = raw.rstrip("\n\r").strip()
 
-    def get_env_values(self, section, sub_section, out_vector):
-        """
-        C++: bool GetEnvValue(..., frStringVector& EnvValues)
-        다중 값을 벡터(리스트)에 담아 반환
-        """
-        if section in self.m_SectionValueMap:
-            if sub_section in self.m_SectionValueMap[section]:
-                values = self.m_SectionValueMap[section][sub_section]
-                
-                # FrStringVector.Copy 메서드 사용 (리스트 복사)
-                # out_vector가 FrStringVector 인스턴스여야 함
-                if hasattr(out_vector, 'Copy'):
-                    out_vector.Copy(values)
+                if not line:
+                    continue
+                if line.startswith("#"):
+                    continue
+
+                # ── Section 헤더: [SectionName]
+                if line.startswith("["):
+                    section_name = line.strip("[]").strip()
+                    if section_name in self.m_SectionValueMap:
+                        logger.error(
+                            "(Line:%d) Duplicate Section: [%s]",
+                            line_cnt, section_name,
+                        )
+                        return False
+                    self.m_SectionValueMap[section_name] = SubSectionValueMap()
+                    current_section = section_name
+                    continue
+
+                # ── Key=Value 행
+                if not current_section:
+                    continue
+
+                if self.m_Delim not in line:
+                    logger.error(
+                        "(Line:%d) Config Usage Error: Section(%s), %s",
+                        line_cnt, current_section, line,
+                    )
+                    continue
+
+                delim_pos  = line.index(self.m_Delim)
+                sub_section = line[:delim_pos].strip()
+                value       = line[delim_pos + len(self.m_Delim):].strip()
+
+                if not sub_section:
+                    continue
+
+                sub_map = self.m_SectionValueMap.get(current_section)
+                if sub_map is None:
+                    continue
+
+                if not self.m_IsMultiSubsecion:
+                    # 단일 값 모드: 덮어쓰기
+                    sub_map[sub_section] = [value]
                 else:
-                    out_vector.extend(values)
-                    
-                return len(values) > 0
-        return False
+                    # 다중 값 모드: 기존 키에 append
+                    if sub_section in sub_map:
+                        sub_map[sub_section].append(value)
+                    else:
+                        sub_map[sub_section] = [value]
 
-    def print_config(self, target_section=""):
-        """
-        C++: void Print(string Section)
-        설정 내용 출력
-        """
-        for section, sub_map in self.m_SectionValueMap.items():
-            if not target_section or target_section == section:
-                print(f"Section : [{section}]")
-                for key, values in sub_map.items():
-                    for val in values:
-                        print(f"\tSubSection : [{key}], Value : [{val}]")
-                print("")
+        return True
 
-    def get_value_list(self):
+    def IsSection(self, Section: str) -> bool:
+        """섹션 존재 여부 확인"""
+        return Section in self.m_SectionValueMap
+
+    def GetEnvValue(self,
+                    Section: str,
+                    SubSection: str,
+                    ProcessType: Optional[int] = None) -> str:
+        """
+        단일 값 반환.
+
+        오버로드 대응:
+          - GetEnvValue(Section, SubSection)          → str
+          - GetEnvValue(ProcessType(int), SubSection) → str
+            (ProcessType 을 첫 인자 int로 받을 때 Section 자동 변환)
+
+        Returns:
+            값 문자열, 없으면 ""
+        """
+        # C++ 오버로드: GetEnvValue(int ProcessType, string SubSection)
+        if ProcessType is not None:
+            from Common.AsUtil import AsUtil
+            Section = AsUtil.GetProcessTypeString(ProcessType)
+
+        sub_map = self.m_SectionValueMap.get(Section)
+        if sub_map is None:
+            return ""
+
+        values = sub_map.get(SubSection)
+        if not values:
+            return ""
+
+        return values[0]
+
+    def GetEnvValueList(self, Section: str, SubSection: str) -> List[str]:
+        """
+        복수 값 반환 (MultiSubsectionMode 용).
+
+        C++ 원본: GetEnvValue(Section, SubSection, frStringVector& EnvValues)
+        Python 에서는 반환값으로 처리.
+
+        Returns:
+            값 리스트, 없으면 []
+        """
+        sub_map = self.m_SectionValueMap.get(Section)
+        if sub_map is None:
+            return []
+
+        values = sub_map.get(SubSection)
+        return list(values) if values else []
+
+    def GetEnvValueByProcessType(self, ProcessType: int, SubSection: str) -> str:
+        """
+        C++ GetEnvValue(int ProcessType, string SubSection) 명시적 대응.
+        ProcessType → 문자열 섹션명 변환 후 조회.
+        """
+        from Common.AsUtil import AsUtil
+        return self.GetEnvValue(AsUtil.GetProcessTypeString(ProcessType), SubSection)
+
+    def Print(self, Section: str = "") -> None:
+        """설정 내용 출력 (디버그용)"""
+        for sec_name, sub_map in self.m_SectionValueMap.items():
+            if Section and Section != sec_name:
+                continue
+            print(f"Section : [{sec_name}]")
+            for sub_key, values in sub_map.items():
+                for v in values:
+                    print(f"\tSubSection : [{sub_key}], Value : [{v}]")
+            print()
+
+    def GetValueList(self) -> SectionValueMap:
+        """내부 SectionValueMap 참조 반환"""
         return self.m_SectionValueMap
-
-    def is_section(self, section):
-        return section in self.m_SectionValueMap

@@ -1,40 +1,42 @@
-import sys
-import os
+# -*- coding: utf-8 -*-
+"""
+ProcConnectionMgrTimer.h / ProcConnectionMgrTimer.C  →  ProcConnectionMgrTimer.py
+Python 3.11.10 변환
 
-# 프로젝트 경로 설정
-current_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.abspath(os.path.join(current_dir, '../..'))
-if project_root not in sys.path:
-    sys.path.append(project_root)
+변환 설계:
+  ProcConnectionMgrTimer → ProcConnectionMgrTimer  (FrTimerSensor 상속)
 
-from Class.Event.fr_timer_sensor import FrTimerSensor
+C++ → Python 주요 변환 포인트:
+  ProcConnectionMgr*  → TYPE_CHECKING 전용 임포트 (순환 참조 방지)
+  ReceiveTimeOut() 빈 구현 → receive_time_out() pass 유지
 
-# -------------------------------------------------------
-# ProcConnectionMgrTimer Class
-# ProcConnectionMgr를 위한 타이머 (현재는 Stub 상태)
-# -------------------------------------------------------
+변경 이력:
+  2014.07.08  초기 작성 (C++ 원본)
+  Python 변환
+"""
+
+import logging
+from typing import TYPE_CHECKING
+
+from Event.fr_timer_sensor import FrTimerSensor
+
+if TYPE_CHECKING:
+    from Common.ProcConnectionMgr import ProcConnectionMgr
+
+logger = logging.getLogger(__name__)
+
+
 class ProcConnectionMgrTimer(FrTimerSensor):
-    def __init__(self, mgr):
-        """
-        C++: ProcConnectionMgrTimer(ProcConnectionMgr* Mgr)
-        """
+    """
+    C++ ProcConnectionMgrTimer 대응.
+    ProcConnectionMgr 에 연결된 타이머. ReceiveTimeOut() 은 현재 빈 구현.
+    하위 클래스 또는 향후 확장에서 override 하여 사용.
+    """
+
+    def __init__(self, mgr: 'ProcConnectionMgr') -> None:
         super().__init__()
-        
-        # 매니저 객체 참조 저장
-        self.m_ProcConnectionMgr = mgr
+        self._proc_connection_mgr = mgr
 
-    def __del__(self):
-        """
-        C++: ~ProcConnectionMgrTimer()
-        """
-        super().__del__()
-
-    def receive_time_out(self, reason, extra_reason):
-        """
-        C++: void ReceiveTimeOut(int Reason, void* ExtraReason)
-        
-        [참고] 제공된 C++ 원본 소스에 구현 내용이 없으므로 
-        Python에서도 pass 처리합니다. 
-        추후 프로세스 정리(Kill) 후 대기 로직 등이 필요할 때 이곳에 구현합니다.
-        """
+    def receive_time_out(self, reason: int, extra_reason: object = None) -> None:
+        """C++ ReceiveTimeOut() 빈 구현 대응 — no-op."""
         pass

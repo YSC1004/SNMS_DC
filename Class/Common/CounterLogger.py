@@ -1,112 +1,114 @@
-import sys
-import os
+# -*- coding: utf-8 -*-
+"""
+CounterLogger.h / CounterLogger.C  →  CounterLogger.py
+Python 3.11.10 변환
 
-# 프로젝트 경로 설정
-current_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.abspath(os.path.join(current_dir, '../..'))
-if project_root not in sys.path:
-    sys.path.append(project_root)
+변환 설계:
+  CounterLogger → CounterLogger  (FrTimerSensor 상속)
 
-from Class.Event.fr_timer_sensor import FrTimerSensor
-from Class.Util.fr_time import FrTime
+C++ → Python 주요 변환 포인트:
+  frTimerSensor                      → FrTimerSensor
+  SetTimer(interval, 56789)          → set_timer(interval, 56789)
+  frTime().GetDay() / GetTimeString() → datetime.now()
+  frSTD_OUT(...)                      → logger.info(...)
+  unsigned int m_GapCount/TotalCount → int (Python int 는 unsigned 무제한)
 
-# -------------------------------------------------------
-# CounterLogger Class
-# 일정 주기로 횟수를 집계하여 출력하는 로거
-# -------------------------------------------------------
+변경 이력:
+  2014.07.08  초기 작성 (C++ 원본)
+  Python 변환
+"""
+
+import logging
+from datetime import datetime
+
+from Event.fr_timer_sensor import FrTimerSensor
+
+logger = logging.getLogger(__name__)
+
+_TIMER_REASON = 56789
+
+
 class CounterLogger(FrTimerSensor):
-    # Timer Reason ID
-    COUNTER_LOG_TIMER = 56789
+    """
+    C++ CounterLogger 대응.
+    주기적으로 카운트 현황을 출력하는 타이머 기반 로거.
 
-    def __init__(self):
-        """
-        C++: CounterLogger()
-        """
+    사용 예:
+        cl = CounterLogger()
+        cl.set_log_prefix("MyEvent")
+        cl.set_log_interval(60)
+        cl.start()
+        ...
+        cl.increase_count()
+    """
+
+    def __init__(self) -> None:
         super().__init__()
-        
-        self.m_Interval = 30
-        self.m_PrefixString = ""
-        self.m_GapCount = 0
-        self.m_TotalCount = 0
-        
-        # 현재 날짜 저장 (일자 변경 감지용)
-        cur_time = FrTime()
-        self.m_CurDay = cur_time.get_day()
-        
+        self._interval:      int = 30
+        self._cur_day:       int = datetime.now().day
+        self._gap_count:     int = 0
+        self._total_count:   int = 0
+        self._prefix_string: str = ""
         self.reset_count()
 
-    def __del__(self):
-        """
-        C++: ~CounterLogger()
-        """
-        super().__del__()
+    # ── 설정 ──────────────────────────────────
 
-    def start(self):
-        """
-        C++: void Start()
-        타이머 시작
-        """
-        self.set_timer(self.m_Interval, self.COUNTER_LOG_TIMER)
+    def set_log_interval(self, interval: int = 30) -> None:
+        """C++ SetLogInterval(int Interval=30) 대응."""
+        self._interval = interval
 
-    def set_log_interval(self, interval):
-        """
-        C++: void SetLogInterval(int Interval)
-        """
-        self.m_Interval = interval
+    def set_log_prefix(self, prefix: str) -> None:
+        """C++ SetLogPrefix(string Prefix) 대응."""
+        self._prefix_string = prefix
 
-    def set_log_prefix(self, prefix):
-        """
-        C++: void SetLogPrefix(string Prefix)
-        """
-        self.m_PrefixString = prefix
+    # ── 시작 ──────────────────────────────────
 
-    def print_stats(self):
-        """
-        C++: void Print()
-        통계 출력 및 카운터 리셋 로직
-        """
-        cur_time = FrTime()
-        time_str = cur_time.get_time_string()
-        
-        # 로그 출력
-        # [Time - Prefix : During 30 sec : 10 ea, Today : 100 ea]
-        print(f"[{time_str} - {self.m_PrefixString} : During {self.m_Interval} sec : {self.m_GapCount} ea, Today : {self.m_TotalCount} ea]")
-        
-        # 구간 카운트 초기화
-        self.m_GapCount = 0
+    def start(self) -> None:
+        """C++ Start() 대응. 타이머를 시작한다."""
+        self.set_timer(self._interval, _TIMER_REASON)
 
-        # 날짜 변경 체크 (일일 카운트 초기화)
-        if self.m_CurDay != cur_time.get_day():
-            self.m_CurDay = cur_time.get_day()
-            self.m_TotalCount = 0
+    # ── 카운트 조작 ───────────────────────────
 
-    def receive_time_out(self, reason, extra_reason):
-        """
-        C++: void ReceiveTimeOut(int Reason, void* ExtraReason)
-        타이머 만료 시 호출
-        """
-        if reason == self.COUNTER_LOG_TIMER:
-            self.print_stats()
-            # 타이머 재설정 (반복)
-            self.set_timer(self.m_Interval, self.COUNTER_LOG_TIMER)
+    def increase_count(self) -> None:
+        """C++ IncreaseCount() 대응."""
+        self._gap_count   += 1
+        self._total_count += 1
 
-    def increase_count(self):
-        """
-        C++: void IncreaseCount()
-        외부에서 이벤트 발생 시 호출
-        """
-        self.m_GapCount += 1
-        self.m_TotalCount += 1
+    def reset_count(self) -> None:
+        """C++ ResetCount() 대응."""
+        self._gap_count   = 0
+        self._total_count = 0
 
-    def reset_count(self):
-        """
-        C++: void ResetCount()
-        """
-        self.m_GapCount = 0
-        self.m_TotalCount = 0
+    def get_total_count(self) -> int:
+        """C++ GetTotalCount() 대응."""
+        return self._total_count
 
-    def get_total_count(self):
+    # ── 출력 ──────────────────────────────────
+
+    def print(self) -> None:
         """
-        C++: int GetTotalCount()
+        C++ Print() 대응.
+        구간 카운트 출력 후 gap_count 초기화.
+        날짜가 바뀌면 total_count 도 초기화.
         """
-        return self.m_TotalCount
+        now = datetime.now()
+        logger.info(
+            "[%s - %s : During %d sec : %d ea, Today : %d ea]",
+            now.strftime("%Y-%m-%d %H:%M:%S"),
+            self._prefix_string,
+            self._interval,
+            self._gap_count,
+            self._total_count,
+        )
+        self._gap_count = 0
+
+        if self._cur_day != now.day:
+            self._cur_day     = now.day
+            self._total_count = 0
+
+    # ── 타이머 콜백 ───────────────────────────
+
+    def receive_time_out(self, reason: int, extra_reason: object = None) -> None:
+        """C++ ReceiveTimeOut() 대응. 출력 후 타이머 재등록."""
+        self.print()
+        self.set_timer(self._interval, _TIMER_REASON)

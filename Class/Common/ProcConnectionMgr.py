@@ -1,193 +1,198 @@
-import sys
+# -*- coding: utf-8 -*-
+"""
+ProcConnectionMgr.h / ProcConnectionMgr.C  →  ProcConnectionMgr.py
+Python 3.11.10 변환
+
+변환 설계:
+  ProcConnectionMgr → ProcConnectionMgr  (ConnectionMgr 상속, 추상 클래스)
+
+C++ → Python 주요 변환 포인트:
+  fork() / execv()                   → subprocess.Popen()
+  ProcPidInfoMap (map<string,int>)   → dict[str, int]
+  frStringVector (vector<string>)    → list[str]
+  ProcessInfoList (list<AS_PROCESS_STATUS_T>) → list[AsProcessStatusT]
+  frTime()                           → datetime.now()
+  SetGErrMsg(...)                    → logger.error(...)
+  frSignalEventSrc::SignalsRelease() → FrSignalEventSrc.signals_release()
+  ProcessDead() 순수 가상            → @abstractmethod process_dead()
+  PROCESS_WAIT_TIME = 5              → 모듈 상수
+  ORDER_KILL                         → CommType 상수 참조
+
+변경 이력:
+  2014.07.08  초기 작성 (C++ 원본)
+  Python 변환
+"""
+
+import logging
 import os
-import time
 import subprocess
-import signal
+from abc import abstractmethod
+from datetime import datetime
+from typing import Optional, TYPE_CHECKING
 
-# 프로젝트 경로 설정
-current_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.abspath(os.path.join(current_dir, '../..'))
-if project_root not in sys.path:
-    sys.path.append(project_root)
+from Common.ConnectionMgr import ConnectionMgr
+from Common.ProcClearTimer import ProcClearTimer
+from Common.ChildProcessManager import ChildProcessManager
+from Common.CommType import AsProcessStatusT
+from Common.AsSocket import AsSocket
 
-from Class.Event.fr_timer_sensor import FrTimerSensor
-from Class.Util.fr_time import FrTime
-from Class.Common.CommType import AsProcessStatusT
+if TYPE_CHECKING:
+    pass
 
-# -------------------------------------------------------
-# ProcConnectionMgr Class
-# 자식 프로세스 관리 (생성, 종료, PID 매핑)
-# -------------------------------------------------------
-class ProcConnectionMgr:
-    PROCESS_WAIT_TIME = 5
+logger = logging.getLogger(__name__)
 
-    def __init__(self):
-        # { "ProcName": PID }
-        self.m_ProcPidInfo = {}
-        
-        # 프로세스 정리용 타이머 (FrTimerSensor 상속 클래스 필요)
-        # 여기서는 간단히 FrTimerSensor 사용 (콜백 구현 필요 시 상속)
-        self.m_ProcClearTimer = FrTimerSensor()
+PROCESS_WAIT_TIME = 5   # C++ #define PROCESS_WAIT_TIME 5
 
-    def __del__(self):
-        # 타이머 해제 등
-        if self.m_ProcClearTimer:
-            self.m_ProcClearTimer.unregister_sensor()
 
-    # ---------------------------------------------------
-    # Process Map Management
-    # ---------------------------------------------------
-    def remove_pid(self, proc_name):
-        """
-        C++: bool RemovePid(string ProcName)
-        """
-        if proc_name in self.m_ProcPidInfo:
-            del self.m_ProcPidInfo[proc_name]
-            return True
-        else:
-            print(f"[ProcConnectionMgr] Can't Find Process Pid : {proc_name}")
-            return False
+class ProcConnectionMgr(ConnectionMgr):
+    """
+    C++ ProcConnectionMgr 대응 추상 클래스.
+    자식 프로세스 기동/종료/상태 관리 및 ConnectionMgr 소켓 관리를 통합.
+    하위 클래스에서 process_dead() 를 반드시 구현해야 한다.
+    """
 
-    def get_proc_name(self, pid):
-        """
-        C++: string GetProcName(int Pid)
-        """
-        for name, p_id in self.m_ProcPidInfo.items():
-            if p_id == pid:
+    def __init__(self) -> None:
+        super().__init__()
+        self._proc_pid_info:  dict[str, int] = {}   # ProcPidInfoMap
+        self._proc_clear_timer = ProcClearTimer()
+
+    # ── PID 맵 조회 / 제거 ───────────────────
+
+    def get_proc_name(self, pid: int) -> str:
+        """C++ GetProcName(int Pid) 대응. 없으면 "" 반환."""
+        for name, p in self._proc_pid_info.items():
+            if p == pid:
                 return name
-        # print(f"[ProcConnectionMgr] Can't Find Process Name Pid({pid})")
+        logger.debug("Can't Find Process Name Pid(%d)", pid)
         return ""
 
-    def get_proc_pid(self, proc_name):
-        """
-        C++: int GetProcPid(string ProcName)
-        """
-        return self.m_ProcPidInfo.get(proc_name, -1)
-
-    # ---------------------------------------------------
-    # Process Control
-    # ---------------------------------------------------
-    def start_proc(self, name, args):
-        """
-        C++: int StartProc(string Name, frStringVector Args)
-        """
-        try:
-            # args는 리스트 형태여야 함
-            # Python 스크립트 실행 시 인터프리터 경로 추가 필요할 수 있음
-            proc = subprocess.Popen(args)
-            pid = proc.pid
-            
-            self.m_ProcPidInfo[name] = pid
-            print(f"[ProcConnectionMgr] Started Process: {name} (PID: {pid})")
-            return pid
-            
-        except OSError as e:
-            print(f"[ProcConnectionMgr] Process Start Error({name}) : {e}")
-            return -1
-
-    def stop_process_by_name(self, name):
-        """
-        C++: bool StopProcess(string Name)
-        """
-        pid = self.get_proc_pid(name)
+    def get_proc_pid(self, proc_name: str) -> int:
+        """C++ GetProcPid(string ProcName) 대응. 없으면 -1 반환."""
+        pid = self._proc_pid_info.get(proc_name, -1)
         if pid == -1:
-            print(f"[ProcConnectionMgr] Can't Find Process Name : {name}")
-            return True # 이미 없으므로 성공 간주
-            
-        return self.kill_proc(pid)
+            logger.debug("Can't Find Process Pid : %s", proc_name)
+        return pid
 
-    def stop_process_by_pid(self, pid):
-        """
-        C++: bool StopProcess(int Pid)
-        """
-        # 맵에 있는지 확인 (없어도 Kill은 시도할 수 있음)
-        for name, p_id in self.m_ProcPidInfo.items():
-            if p_id == pid:
-                return self.kill_proc(pid)
-        return False
-
-    def kill_proc(self, pid):
-        """
-        ChildProcessManager::KillProc 대체
-        """
-        try:
-            os.kill(pid, signal.SIGTERM)
-            return True
-        except OSError as e:
-            print(f"[ProcConnectionMgr] Kill Error (PID:{pid}): {e}")
+    def remove_pid(self, proc_name: str) -> bool:
+        """C++ RemovePid(string ProcName) 대응. 없으면 에러 로그 후 False 반환."""
+        if proc_name not in self._proc_pid_info:
+            logger.error("Can't Find Process Pid : %s", proc_name)
             return False
-
-    # ---------------------------------------------------
-    # Process Info
-    # ---------------------------------------------------
-    def get_process_info_by_pid(self, pid, process_status):
-        """
-        C++: bool GetProcessInfo(int Pid, AS_PROCESS_STATUS_T* Process)
-        """
-        process_status.Pid = pid
-        
-        # 시작 시간은 현재 시간으로 설정 (C++ 로직 동일)
-        # 실제 프로세스 시작 시간을 얻으려면 psutil 등을 써야 함
-        cur_time = FrTime()
-        process_status.StartTime = cur_time.get_time_string()
-        
+        del self._proc_pid_info[proc_name]
         return True
 
-    def get_process_info_by_name(self, proc_name, process_status):
+    # ── 프로세스 기동 / 종료 ─────────────────
+
+    def start_proc(self, name: str, args: list[str]) -> int:
         """
-        C++: bool GetProcessInfo(string ProcName, AS_PROCESS_STATUS_T* Process)
+        C++ StartProc(string Name, frStringVector Args) 대응.
+        fork/execv 대신 subprocess.Popen 사용.
+        args[0] = 실행 파일 경로, args[1:] = 인자.
+        성공 시 PID 반환, 실패 시 -1 반환.
         """
+        if not args:
+            logger.error("start_proc: empty args (name=%s)", name)
+            return -1
+
+        try:
+            proc = subprocess.Popen(args)
+        except OSError as e:
+            logger.error("Process Fork/Exec Error(Name:%s) : %s", name, e)
+            return -1
+
+        pid = proc.pid
+        if name in self._proc_pid_info:
+            logger.error(
+                "Process Info Insert Error : Name(%s), pid(%d)", name, pid
+            )
+        else:
+            self._proc_pid_info[name] = pid
+
+        return pid
+
+    def stop_process_by_name(self, name: str) -> bool:
+        """C++ StopProcess(string Name) 대응."""
+        pid = self._proc_pid_info.get(name, -1)
+        if pid == -1:
+            logger.error("Can't Find Process Name : %s", name)
+            return True   # C++ 원본도 못 찾으면 true 반환
+        return ChildProcessManager.kill_proc(pid)
+
+    def stop_process_by_pid(self, pid: int) -> bool:
+        """C++ StopProcess(int Pid) 대응."""
+        for p in self._proc_pid_info.values():
+            if p == pid:
+                return ChildProcessManager.kill_proc(pid)
+        return False
+
+    # ── 프로세스 상태 조회 ────────────────────
+
+    @staticmethod
+    def get_process_info_by_pid(
+        pid: int, process: AsProcessStatusT
+    ) -> bool:
+        """
+        C++ static GetProcessInfo(int Pid, AS_PROCESS_STATUS_T*) 대응.
+        PID 와 현재 시각을 process 에 채워 넣는다.
+        """
+        now = datetime.now()
+        process.pid = pid
+        process.start_time = now.strftime("%Y/%m/%d %H:%M:%S")
+        return True
+
+    def get_process_info_by_name(
+        self, proc_name: str, process: AsProcessStatusT
+    ) -> bool:
+        """C++ GetProcessInfo(string ProcName, AS_PROCESS_STATUS_T*) 대응."""
         pid = self.get_proc_pid(proc_name)
         if pid == -1:
             return False
-            
-        return self.get_process_info_by_pid(pid, process_status)
+        return ProcConnectionMgr.get_process_info_by_pid(pid, process)
 
-    def get_process_info_list(self, proc_info_list):
-        """
-        C++: void GetProcessInfo(ProcessInfoList& ProcInfoList)
-        """
-        for name, pid in self.m_ProcPidInfo.items():
-            status = AsProcessStatusT() # CommType.py의 클래스
-            status.ProcessId = name
-            self.get_process_info_by_pid(pid, status)
+    def get_process_info_list(
+        self, proc_info_list: list[AsProcessStatusT]
+    ) -> None:
+        """C++ GetProcessInfo(ProcessInfoList&) 대응. 전체 프로세스 상태를 리스트에 추가."""
+        for name, pid in self._proc_pid_info.items():
+            status = AsProcessStatusT()
+            status.process_id = name
+            ProcConnectionMgr.get_process_info_by_pid(pid, status)
             proc_info_list.append(status)
 
-    # ---------------------------------------------------
-    # Event Handlers
-    # ---------------------------------------------------
-    def child_process_dead(self, socket, status):
-        """
-        C++: void ChildProcessDead(AsSocket* Socket, int Status)
-        소켓 연결이 끊기거나 프로세스가 죽었을 때 호출됨
-        """
-        name = socket.get_session_name()
-        pid = self.get_proc_pid(name)
-        
-        self.remove_pid(name)
-        # self.remove(socket) # ConnectionMgr 상속 시 구현
-        
-        print(f"[ProcConnectionMgr] {name}({pid}) Process Dead")
+    # ── 이벤트 처리 ───────────────────────────
 
-        # 타이머 설정 (재시작 딜레이 등)
-        # Reason ID로 pid를 넘기는 것은 Python에서는 별도 처리 필요 (Timer 클래스 확장 등)
-        # 여기서는 단순히 타이머만 설정
-        self.m_ProcClearTimer.set_timer(self.PROCESS_WAIT_TIME, pid)
-        
+    def various_ack_check_time_out(self, socket: AsSocket) -> None:
+        """C++ VariousAckCheckTimeOut(AsSocket*) 대응."""
+        logger.error(
+            "Process Ack Check TimeOut : %s", socket.get_session_name()
+        )
+        self.stop_process_by_name(socket.get_session_name())
+
+    def child_process_dead(self, socket: AsSocket, status: int = -1) -> None:
+        """
+        C++ ChildProcessDead(AsSocket*, int Status) 대응.
+        PID 맵 제거 → 소켓 제거 → ClearTimer 등록 → ProcessDead() 호출.
+        """
+        from Common.CommType import ORDER_KILL
+
+        name = socket.get_session_name()
+        pid  = self.get_proc_pid(name)
+
+        self.remove_pid(name)
+        self.remove(socket)
+
+        logger.debug(
+            "%s(%d) Process Dead(%s)",
+            name, pid,
+            "NORMAL" if status == ORDER_KILL else "ABNORMAL",
+        )
+
+        self._proc_clear_timer.set_timer(PROCESS_WAIT_TIME, pid)
         self.process_dead(name, pid, status)
 
-    # ---------------------------------------------------
-    # Virtual Functions (Override Targets)
-    # ---------------------------------------------------
-    def process_dead(self, name, pid, status):
-        """
-        C++: virtual void ProcessDead(...)
-        """
-        print(f"[ProcConnectionMgr] ProcessDead Virtual Call: {name}")
+    # ── 순수 가상함수 ─────────────────────────
 
-    def remove(self, socket):
-        """
-        C++: ConnectionMgr::Remove(Socket)
-        부모 클래스(ConnectionMgr)에 있을 것으로 추정
-        """
-        pass
+    @abstractmethod
+    def process_dead(self, name: str, pid: int, status: int = -1) -> None:
+        """C++ ProcessDead() 순수 가상함수 대응. 하위 클래스에서 구현."""
+        ...

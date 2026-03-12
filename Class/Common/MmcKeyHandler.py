@@ -1,144 +1,148 @@
-import sys
-import os
+# -*- coding: utf-8 -*-
+"""
+MmcKeyHandler.h / MmcKeyHandler.C  →  MmcKeyHandler.py
+Python 3.11.10 변환
 
-# 프로젝트 경로 설정
-current_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.abspath(os.path.join(current_dir, '../..'))
-if project_root not in sys.path:
-    sys.path.append(project_root)
+변환 설계:
+  MmcKeyNode     → MmcKeyNode     (dataclass)
+  MmcKeyNodeList → list[MmcKeyNode] (Python list 로 대체, 별도 클래스 불필요)
+  MmcKeyHandler  → MmcKeyHandler
 
-# 로거 임포트 (없으면 print 사용)
-try:
-    from Class.Event.FrLogger import FrLogger
-    logger = FrLogger.get_instance()
-    def fr_debug(msg): logger.write(f"[DEBUG] {msg}")
-except ImportError:
-    def fr_debug(msg): print(f"[DEBUG] {msg}")
+C++ → Python 주요 변환 포인트:
+  list<MmcKeyNode*> + 수동 delete  → list[MmcKeyNode] (GC 위임)
+  정렬 삽입 (name 사전순)          → bisect.insort / sorted key 활용
+  SEP_MARK ":"                     → 모듈 상수 SEP_MARK
+  Make() 오버로드 2종              → make() + make_append() 로 분리
+  _Arrange() 파싱 로직             → str.split(',') + str.split(':') 활용
 
-# -------------------------------------------------------
-# MmcKeyNode Class
-# 단일 키-값 쌍을 저장하는 노드
-# -------------------------------------------------------
+변경 이력:
+  2014.07.08  초기 작성 (C++ 원본)
+  Python 변환
+"""
+
+import logging
+import bisect
+from dataclasses import dataclass
+
+logger = logging.getLogger(__name__)
+
+SEP_MARK = ":"
+
+
+# ──────────────────────────────────────────────
+# MmcKeyNode
+# ──────────────────────────────────────────────
+@dataclass
 class MmcKeyNode:
-    def __init__(self, name, value):
-        """
-        C++: MmcKeyNode(char *name, char *value)
-        """
-        self.m_Name = name
-        self.m_Value = value
+    """C++ MmcKeyNode 대응."""
+    name:  str
+    value: str
 
-# -------------------------------------------------------
-# MmcKeyHandler Class
-# 키-값 쌍 목록을 관리하고 정렬/포맷팅 수행
-# -------------------------------------------------------
+    # bisect.insort 가 name 기준 정렬에 사용할 비교 연산자
+    def __lt__(self, other: 'MmcKeyNode') -> bool:
+        return self.name < other.name
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, MmcKeyNode):
+            return NotImplemented
+        return self.name == other.name
+
+
+# ──────────────────────────────────────────────
+# MmcKeyHandler
+# ──────────────────────────────────────────────
 class MmcKeyHandler:
-    SEP_MARK = ":"
+    """
+    C++ MmcKeyHandler 대응.
 
-    def __init__(self):
-        """
-        C++: MmcKeyHandler()
-        """
-        self.m_List = [] # List of MmcKeyNode
+    name/value 쌍을 name 사전순으로 정렬 관리하며,
+    "(name:value),(name:value),..." 형태의 키 문자열을 생성한다.
 
-    def __del__(self):
+    사용 예:
+        h = MmcKeyHandler()
+        h.add("z_key", "1")
+        h.add("a_key", "2")
+        print(h.get_key())          # (a_key:2),(z_key:1)
+
+        key = MmcKeyHandler.make("host", "127.0.0.1")
+        key = MmcKeyHandler.make_append(key, "port", "8080")
+    """
+
+    def __init__(self) -> None:
+        self._list: list[MmcKeyNode] = []
+
+    def __del__(self) -> None:
         self.clear()
 
-    def clear(self):
-        """
-        C++: void Clear()
-        """
-        self.m_List.clear()
+    # ── public ────────────────────────────────
 
-    def add(self, name, value):
-        """
-        C++: void Add(char *name, char *value)
-        키(name)를 기준으로 알파벳 오름차순 정렬하여 삽입
-        """
-        fr_debug(f"(name:{name}),(value:{value})")
-        
-        new_node = MmcKeyNode(name, value)
-        
-        # 리스트가 비어있으면 바로 추가
-        if not self.m_List:
-            self.m_List.append(new_node)
-            return
+    def clear(self) -> None:
+        """C++ Clear() 대응. 리스트 초기화."""
+        self._list.clear()
 
-        # 삽입 정렬 (Insertion Sort logic)
-        inserted = False
-        for i, node in enumerate(self.m_List):
-            if node.m_Name > name:
-                self.m_List.insert(i, new_node)
-                inserted = True
-                break
-        
-        # 가장 큰 값이면 맨 뒤에 추가
-        if not inserted:
-            self.m_List.append(new_node)
-
-    def get_key(self, source=None):
+    def add(self, name: str, value: str) -> None:
         """
-        C++: string GetKey(char *source)
-        source가 있으면 파싱하여 리스트를 재구성하고,
-        리스트의 내용을 (Key:Val),(Key:Val) 형태의 문자열로 반환
+        C++ Add(char*, char*) 대응.
+        name 사전순을 유지하면서 삽입 (bisect 활용).
+        """
+        logger.debug("(name:%s),(value:%s)", name, value)
+        bisect.insort(self._list, MmcKeyNode(name, value))
+
+    def get_key(self, source: str | None = None) -> str:
+        """
+        C++ GetKey(char* source) 대응.
+        source 가 주어지면 파싱 후 재구성, 없으면 현재 리스트로 키 생성.
+        반환 형식: (name:value),(name:value),...
         """
         if source:
             self.clear()
             self._arrange(source)
-        
-        result_parts = []
-        for node in self.m_List:
-            # 포맷: (Name:Value)
-            item = f"({node.m_Name}{self.SEP_MARK}{node.m_Value})"
-            result_parts.append(item)
-            
-        # 쉼표로 연결
-        return ",".join(result_parts)
 
-    def _arrange(self, source):
-        """
-        C++: void _Arrange(char *source)
-        입력 문자열을 파싱하여 노드 추가
-        예상 포맷: (Key1:Val1),(Key2:Val2)
-        """
-        if not source:
-            return
-
-        fr_debug(f"(src:{source})")
-        
-        # C++ 로직은 쉼표(,)를 기준으로 먼저 자르고 내부를 파싱함
-        # Python split을 사용하면 훨씬 간단함
-        parts = source.split(',')
-        
-        for part in parts:
-            part = part.strip()
-            if not part: continue
-            
-            # part 예시: (Name:Value)
-            # SEP_MARK(:) 위치 찾기
-            sep_pos = part.find(self.SEP_MARK)
-            
-            if sep_pos != -1:
-                # 괄호와 구분자 사이의 문자열 추출
-                # C++: substr(1, pos-1) -> 맨 앞 '(' 제외, ':' 전까지
-                name = part[1:sep_pos]
-                
-                # C++: substr(pos+1, length-pos-2) -> ':' 후부터, 맨 뒤 ')' 제외
-                # Python 슬라이싱: [start : end]
-                value = part[sep_pos+1 : -1]
-                
-                self.add(name, value)
+        parts = [f"({n.name}{SEP_MARK}{n.value})" for n in self._list]
+        return ",".join(parts)
 
     @staticmethod
-    def make(name, value, source=None):
+    def make(name: str, value: str) -> str:
         """
-        C++: string Make(char *name, char *value)
-        C++: string Make(char *source, char *name, char *value) (Overloaded)
-        
-        단일 생성 또는 기존 문자열에 추가
+        C++ Make(char* name, char* value) 대응.
+        단일 키 문자열 생성: "(name:value)"
         """
-        new_item = f"({name}{MmcKeyHandler.SEP_MARK}{value})"
-        
-        if source and len(source) > 0:
-            return f"{source},{new_item}"
-        else:
-            return new_item
+        return f"({name}{SEP_MARK}{value})"
+
+    @staticmethod
+    def make_append(source: str | None, name: str, value: str) -> str:
+        """
+        C++ Make(char* source, char* name, char* value) 대응.
+        source 가 있으면 뒤에 추가: "source,(name:value)"
+        없으면 make(name, value) 와 동일.
+        """
+        if source:
+            return f"{source},({name}{SEP_MARK}{value})"
+        return MmcKeyHandler.make(name, value)
+
+    # ── protected ─────────────────────────────
+
+    def _arrange(self, source: str) -> None:
+        """
+        C++ _Arrange(char*) 대응.
+        "(name:value),(name:value),..." 형식 문자열을 파싱하여 add().
+
+        파싱 규칙:
+          - 최상위 콤마(,)로 토큰 분리
+          - 각 토큰은 "(name:value)" 형식
+          - 괄호와 SEP_MARK(':') 기준으로 name/value 추출
+        """
+        logger.debug("(src:%s)", source)
+        for token in source.split(","):
+            token = token.strip()
+            if not token:
+                continue
+            # "(name:value)" → "name:value"
+            inner = token.strip("()")
+            sep_pos = inner.find(SEP_MARK)
+            if sep_pos == -1:
+                logger.warning("_arrange: SEP_MARK not found in token '%s'", token)
+                continue
+            name  = inner[:sep_pos]
+            value = inner[sep_pos + 1:]
+            self.add(name, value)

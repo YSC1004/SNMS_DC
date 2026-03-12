@@ -1,142 +1,216 @@
-import sys
-import os
+# -*- coding: utf-8 -*-
+"""
+SockMgrConnection.h / SockMgrConnection.C  →  SockMgrConnection.py
+Python 3.11.10 변환
 
-# 프로젝트 경로 설정
-current_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.abspath(os.path.join(current_dir, '../..'))
-if project_root not in sys.path:
-    sys.path.append(project_root)
+변환 설계:
+  SockMgrConnection → SockMgrConnection  (AsSocket 상속)
 
-from Class.Common.AsSocket import AsSocket
-from Class.Common.CommType import *
-from Class.Event.fr_sock_fd_manager import FrSockFdManager
-from Class.Common.AsWorld import AsWorld
+C++ → Python 주요 변환 포인트:
+  PACKET_T* / Msg 캐스팅               → PacketT dataclass + 타입별 분기
+  pthread_mutex_lock/unlock             → AsWorld.m_connection_mgr_vector_lock
+  memset / memcpy                       → dataclass 초기화 / 직접 대입
+  frSockFdManager::ShutDownSock()       → FrSockFdManager.shut_down_sock()
+  frSockFdManager::SocketCheck()        → FrSockFdManager.socket_check()
+  frSockFdManager::GetSockInfos()       → FrSockFdManager.get_sock_infos()
+  FR_SOCKET_INFO_T                      → SocketInfo  (fr_sock_fd_manager)
+  FR_SOCKET_CHECK_REQ_T                 → FrSocketCheckReqT (로컬 dataclass)
+  AS_SOCKET_INFO_LIST_T                 → AsSocketInfoListT  (로컬 dataclass)
+  분절 전송 (INFO_NO_SEG/START/ING/END) → 그대로 유지
 
-# -------------------------------------------------------
-# Helper Structs for SockMgr
-# -------------------------------------------------------
-class AsSocketStatusReqT(BasePacket):
-    FMT = "!III"
-    SIZE = struct.calcsize(FMT)
+변경 이력:
+  2014.07.08  초기 작성 (C++ 원본)
+  Python 변환
+"""
 
-    def __init__(self):
-        self.IsWriterableCheck = 0
-        self.CheckSec = 0
-        self.CheckMiscroSec = 0
+import logging
+from dataclasses import dataclass, field as dc_field
+from typing import TYPE_CHECKING
+
+# ── Event 레이어 ──────────────────────────────────────────────────────────────
+from Event.fr_sock_fd_manager import FrSockFdManager, SocketInfo
+from Event.fr_object import get_g_err_msg
+
+# ── Common 레이어 ─────────────────────────────────────────────────────────────
+from Common.AsSocket import AsSocket
+from Common.AsWorld import AsWorld
+from Common.CommType import (
+    PacketT,
+    AS_SOCKET_STATUS_REQ_T as AsSocketStatusReqT,
+    AS_GUI_INIT_INFO_T,
+    AS_SOCKET_STATUS_REQ, FR_SOCKET_STATUS_REQ,
+    FR_SOCKET_SHUTDOWN_REQ, FR_SOCKET_CHECK_REQ,
+    AS_SOCKET_STATUS_RES,  FR_SOCKET_STATUS_RES,
+    FR_SOCKET_SHUTDOWN_RES, FR_SOCKET_CHECK_RES,
+    INIT_INFO_START, INIT_INFO_END,
+    INFO_NO_SEG, INFO_START, INFO_ING, INFO_END,
+    MAX_SOCKET_INFO_CNT,
+)
+
+if TYPE_CHECKING:
+    from Common.SockMgrConnMgr import SockMgrConnMgr
+
+logger = logging.getLogger(__name__)
+
+
+# ── 로컬 dataclass (CommType 에 미정의) ──────────────────────────────────────
+
+@dataclass
+class FrSocketCheckReqT:
+    """C++ FR_SOCKET_CHECK_REQ_T 대응."""
+    info:            SocketInfo = dc_field(default_factory=SocketInfo)
+    check_sec:       int        = 0
+    check_micro_sec: int        = 0
 
     @classmethod
-    def unpack(cls, data):
-        if len(data) < cls.SIZE: return None
-        t = struct.unpack(cls.FMT, data[:cls.SIZE])
-        obj = cls()
-        obj.IsWriterableCheck, obj.CheckSec, obj.CheckMiscroSec = t
-        return obj
+    def from_bytes(cls, data: bytes) -> 'FrSocketCheckReqT':
+        """TODO: struct.unpack 으로 실제 바이너리 파싱 구현."""
+        return cls()
 
-class AsSocketInfoListT(BasePacket):
-    # int Size, int Status, char GroupName[40] (SOCK_INFO_LISTENER_NAME_MAX_LEN=40 가정)
-    # List of FR_SOCKET_INFO_T[25]
-    # 구조체 패킹 로직이 복잡하므로, 여기서는 직렬화 로직을 직접 구현해야 함
-    pass
 
-# -------------------------------------------------------
-# SockMgrConnection Class
-# 소켓 관리자 클라이언트(GUI) 연결 처리
-# -------------------------------------------------------
+@dataclass
+class AsSocketInfoListT:
+    """C++ AS_SOCKET_INFO_LIST_T 대응."""
+    group_name: str  = ""
+    status:     int  = 0
+    size:       int  = 0
+    info_list:  list = dc_field(default_factory=list)
+
+    def to_bytes(self) -> bytes:
+        """TODO: struct.pack 으로 실제 바이너리 직렬화 구현."""
+        return b""
+
+
+# ── SockMgrConnection ─────────────────────────────────────────────────────────
+
 class SockMgrConnection(AsSocket):
-    def __init__(self, conn_mgr):
-        """
-        C++: SockMgrConnection(SockMgrConnMgr* ConnMgr)
-        """
+    """
+    C++ SockMgrConnection 대응.
+    SockMgrConnMgr 에 소속된 GUI 소켓 연결.
+    소켓 상태 조회 / 셧다운 / 체크 요청을 처리한다.
+    """
+
+    def __init__(self, conn_mgr: 'SockMgrConnMgr') -> None:
         super().__init__()
-        self.m_SockMgrConnMgr = conn_mgr
+        self._sock_mgr_conn_mgr = conn_mgr
 
-    def __del__(self):
-        """
-        C++: ~SockMgrConnection()
-        """
-        super().__del__()
+    # ── AsSocket 콜백 ─────────────────────────
 
-    # ---------------------------------------------------
-    # Virtual Overrides
-    # ---------------------------------------------------
-    def receive_packet(self, packet, session_identify):
-        """
-        C++: void ReceivePacket(...)
-        """
+    def receive_packet(self, packet: PacketT, session_identify: int) -> None:
+        """C++ ReceivePacket() 대응."""
         self.gui_req_process(packet)
 
-    def close_socket(self, err):
-        """
-        C++: void CloseSocket(int Errno)
-        """
-        print(f"[SockMgrConnection] Connection Broken ({self.m_PeerIp}, {self.get_session_name()})")
-        if self.m_SockMgrConnMgr:
-            # Manager에서 자신을 제거 (Remove는 Socket을 닫고 delete함)
-            self.m_SockMgrConnMgr.remove(self)
+    def close_socket(self, errno_val: int) -> None:
+        """C++ CloseSocket() 대응. 연결 해제 시 ConnMgr 에서 제거."""
+        logger.debug(
+            "SockMgr Connection Broken(%s,%s)",
+            self.get_peer_ip(), self.get_session_name(),
+        )
+        self._sock_mgr_conn_mgr.remove(self)
 
-    # ---------------------------------------------------
-    # Request Processing
-    # ---------------------------------------------------
-    def gui_req_process(self, packet):
-        print(f"[SockMgrConnection] Recv Request SockMgr GUI : {packet.msg_id}")
+    # ── GUI 요청 처리 ─────────────────────────
 
-        if packet.msg_id in [AS_SOCKET_STATUS_REQ, FR_SOCKET_STATUS_REQ]:
-            req = AsSocketStatusReqT.unpack(packet.msg_body)
-            if req:
-                self.recv_socket_status_req(packet.msg_id, req)
+    def gui_req_process(self, packet: PacketT) -> None:
+        """C++ GuiReqProcess() 대응. MsgId 기준 분기 처리."""
+        logger.debug("Recv Request SockMgr GUI : %d", packet.msg_id)
+
+        if packet.msg_id in (AS_SOCKET_STATUS_REQ, FR_SOCKET_STATUS_REQ):
+            req = AsSocketStatusReqT()   # TODO: from_bytes(packet.msg) 구현 후 교체
+            self._recv_socket_status_req(packet.msg_id, req)
 
         elif packet.msg_id == FR_SOCKET_SHUTDOWN_REQ:
-            # 구조체 파싱 필요 (FR_SOCKET_INFO_T)
-            # 여기서는 생략 (구현 필요 시 FrSockFdManager 참조)
-            # if FrSockFdManager.shut_down_sock(info): ...
-            pass
+            info = SocketInfo()          # TODO: from_bytes(packet.msg) 구현 후 교체
+            if FrSockFdManager.shut_down_sock(info):
+                self.send_ack(FR_SOCKET_SHUTDOWN_RES, 1)
+            else:
+                self.send_ack(FR_SOCKET_SHUTDOWN_RES, 1, 0, get_g_err_msg())
 
         elif packet.msg_id == FR_SOCKET_CHECK_REQ:
-            # 구조체 파싱 및 체크
-            pass
+            req = FrSocketCheckReqT.from_bytes(packet.msg)
+            if FrSockFdManager.socket_check(req.info, req.check_sec, req.check_micro_sec):
+                self.send_ack(FR_SOCKET_CHECK_RES, 1)
+            else:
+                self.send_ack(FR_SOCKET_CHECK_RES, 1, 0, get_g_err_msg())
 
         else:
-            print(f"[SockMgrConnection] Unknown Request : {packet.msg_id}")
+            logger.debug("Unknown SockMgr Gui Request : %d", packet.msg_id)
 
-    def recv_socket_status_req(self, req_type, status_req):
-        info_vector = [] # List of FrSocketInfo
+    # ── 소켓 상태 조회 ────────────────────────
 
+    def _recv_socket_status_req(
+        self, req_type: int, status_req: AsSocketStatusReqT
+    ) -> None:
+        """C++ RecvSocketStatusReq() 대응."""
         if req_type == AS_SOCKET_STATUS_REQ:
-            # AsWorld의 ConnectionMgrVector를 순회하며 정보 수집
-            with AsWorld.m_ConnectionMgrVectorLock:
-                for mgr in AsWorld.m_ConnectionMgrVector:
-                    mgr.get_con_sock_infos(info_vector, 
-                                           bool(status_req.IsWriterableCheck), 
-                                           status_req.CheckSec, 
-                                           status_req.CheckMiscroSec)
-            
-            self.send_socket_status_info(AS_SOCKET_STATUS_RES, info_vector)
+            info_vector: list[SocketInfo] = []
+            with AsWorld.m_connection_mgr_vector_lock:
+                mgr_vector = AsWorld.get_connection_mgr_vector()
+                if mgr_vector:
+                    for mgr in mgr_vector:
+                        mgr.get_con_sock_infos(
+                            info_vector,
+                            bool(status_req.IsWriterableCheck),
+                            status_req.CheckSec,
+                            status_req.CheckMiscroSec,
+                        )
+                self._send_socket_status_info(AS_SOCKET_STATUS_RES, info_vector)
 
         elif req_type == FR_SOCKET_STATUS_REQ:
-            # FrSockFdManager를 통해 전체 소켓 정보 수집
-            mgr = FrSockFdManager()
-            info_vector = mgr.get_sock_infos(bool(status_req.IsWriterableCheck),
-                                             status_req.CheckSec, 
-                                             status_req.CheckMiscroSec)
-            
-            self.send_socket_status_info(FR_SOCKET_STATUS_RES, info_vector)
+            info_vector = FrSockFdManager.get_sock_infos(
+                bool(status_req.IsWriterableCheck),
+                status_req.CheckSec,
+                status_req.CheckMiscroSec,
+            )
+            self._send_socket_status_info(FR_SOCKET_STATUS_RES, info_vector)
 
-    def send_socket_status_info(self, res_type, info_vector, group_name=""):
-        # 1. 시작 알림
-        # AS_GUI_INIT_INFO_T (int Count)
-        init_info_pack = struct.pack("!I", len(info_vector))
-        self.packet_send(PacketT(INIT_INFO_START, len(init_info_pack), init_info_pack))
+        else:
+            logger.error("Unknown Socket Status ReqType : %d", req_type)
 
-        # 2. 데이터 분할 전송 (Pagination)
-        # Python에서는 복잡한 memcpy 대신 JSON이나 Pickle을 쓰면 좋지만,
-        # C++ 호환을 위해 바이트 패킹을 해야 한다면 반복문으로 처리해야 함.
-        
-        # (여기서는 로직 흐름만 구현하고, 실제 바이너리 패킹은 생략하거나 간소화함)
-        # INFO_NO_SEG, INFO_START, INFO_ING, INFO_END 등 플래그 처리 필요
-        
-        # 예시: 간단히 전송했다고 가정
-        print(f"[SockMgrConnection] Sending {len(info_vector)} socket infos...")
+    # ── 소켓 정보 분절 전송 ───────────────────
 
-        # 3. 종료 알림
-        self.packet_send(PacketT(INIT_INFO_END, len(init_info_pack), init_info_pack))
-        return True
+    def _send_socket_status_info(
+        self,
+        res_type:   int,
+        info_vector: list[SocketInfo],
+        group_name: str = "",
+    ) -> bool:
+        """
+        C++ SendSocketStatusInfo() 대응.
+        MAX_SOCKET_INFO_CNT 기준으로 분절(segmentation) 전송.
+        """
+        init_info = AS_GUI_INIT_INFO_T(Count=len(info_vector))
+        self.send_packet(INIT_INFO_START, init_info)
+
+        info_list = AsSocketInfoListT()
+        if group_name:
+            info_list.group_name = group_name
+
+        total = len(info_vector)
+
+        if total <= MAX_SOCKET_INFO_CNT:
+            info_list.status    = INFO_NO_SEG
+            info_list.info_list = list(info_vector)
+            info_list.size      = total
+            self.send_packet(res_type, info_list.to_bytes())
+
+        else:
+            info_list.status = INFO_START
+            buf: list[SocketInfo] = []
+
+            for info in info_vector:
+                buf.append(info)
+                if len(buf) == MAX_SOCKET_INFO_CNT:
+                    info_list.info_list = buf
+                    info_list.size      = len(buf)
+                    if not self.send_packet(res_type, info_list.to_bytes()):
+                        return False
+                    buf              = []
+                    info_list.status = INFO_ING
+
+            # 마지막 잔여분
+            info_list.info_list = buf
+            info_list.size      = len(buf)
+            info_list.status    = INFO_END
+            self.send_packet(res_type, info_list.to_bytes())
+
+        return self.send_packet(INIT_INFO_END, init_info)

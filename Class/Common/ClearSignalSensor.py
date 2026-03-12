@@ -1,54 +1,55 @@
-import sys
-import os
+# -*- coding: utf-8 -*-
+"""
+ClearSignalSensor.h / ClearSignalSensor.C  →  ClearSignalSensor.py
+Python 3.11.10 변환
+
+변환 설계:
+  ClearSignalSensor → ClearSignalSensor  (FrSignalSensor 상속)
+
+C++ → Python 주요 변환 포인트:
+  frSignalSensor(SIGINT)           → FrSignalSensor.__init__(signal.SIGINT)
+  frSignalEventSrc::SignalsHold()  → FrSignalEventSrc.signals_hold()
+  frWorld::m_MainWorldPtr->Exit(0) → FrWorld.m_MainWorldPtr.exit(0)
+  ChildProcessHandler*             → 지연 임포트 (순환 참조 방지)
+
+변경 이력:
+  2014.07.08  초기 작성 (C++ 원본)
+  Python 변환
+"""
+
+import logging
 import signal
+from typing import TYPE_CHECKING
 
-# 프로젝트 경로 설정
-current_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.abspath(os.path.join(current_dir, '../..'))
-if project_root not in sys.path:
-    sys.path.append(project_root)
+from Event.fr_signal_sensor import FrSignalSensor
+from Event.fr_signal_event_src import FrSignalEventSrc
+from Event.fr_world import FrWorld
 
-from Class.Event.fr_signal_sensor import FrSignalSensor
-from Class.Event.fr_world import FrWorld
+if TYPE_CHECKING:
+    from Common.ChildProcessHandler import ChildProcessHandler
 
-# -------------------------------------------------------
-# ClearSignalSensor Class
-# SIGINT(Ctrl+C) 발생 시 자식 프로세스 정리 및 프로그램 종료
-# -------------------------------------------------------
+logger = logging.getLogger(__name__)
+
+
 class ClearSignalSensor(FrSignalSensor):
-    def __init__(self, child_proc_handler):
-        """
-        C++: ClearSignalSensor(ChildProcessHandler* ChildProcHandler) : frSignalSensor(SIGINT)
-        """
-        # 부모 생성자 호출 (SIGINT 감시 등록)
+    """
+    C++ ClearSignalSensor 대응.
+    SIGINT 수신 시 모든 자식 프로세스를 종료하고 메인 월드를 exit 한다.
+    """
+
+    def __init__(self, child_proc_handler: 'ChildProcessHandler') -> None:
+        """C++ ClearSignalSensor(ChildProcessHandler*) : frSignalSensor(SIGINT) 대응."""
         super().__init__(signal.SIGINT)
-        
-        self.m_ChildProcHandler = child_proc_handler
+        self._child_proc_handler = child_proc_handler
 
-    def __del__(self):
-        super().__del__()
-
-    def subject_changed(self):
+    def subject_changed(self) -> int:
         """
-        C++: int SubjectChanged()
-        시그널 발생 시 호출되는 콜백
+        C++ SubjectChanged() 대응.
+        SIGINT 수신 → 시그널 홀드 → 자식 프로세스 전체 종료 → 메인 월드 exit.
         """
-        # C++: frSignalEventSrc::SignalsHold(); (Python에서는 자동 처리되거나 생략 가능)
+        FrSignalEventSrc.signals_hold()
 
-        print("[ClearSignalSensor] Recv SIGINT.....................")
-
-        # 1. 자식 프로세스 정리
-        if self.m_ChildProcHandler:
-            if hasattr(self.m_ChildProcHandler, 'process_all_kill'):
-                self.m_ChildProcHandler.process_all_kill()
-            else:
-                print("[ClearSignalSensor] Error: Handler has no 'process_all_kill' method")
-
-        # 2. 메인 월드 종료
-        if FrWorld.m_MainWorldPtr:
-            FrWorld.m_MainWorldPtr.exit(0)
-        else:
-            # 월드가 없으면 강제 종료
-            sys.exit(0)
-            
+        logger.debug("Recv SIGINT.....................")
+        self._child_proc_handler.process_all_kill()
+        FrWorld.m_MainWorldPtr.exit(0)
         return 1

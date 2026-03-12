@@ -1,47 +1,51 @@
-import sys
-import os
+# -*- coding: utf-8 -*-
+"""
+ChildSignalSensor.h / ChildSignalSensor.C  →  ChildSignalSensor.py
+Python 3.11.10 변환
+
+변환 설계:
+  ChildSignalSensor → ChildSignalSensor  (FrSignalSensor 상속)
+
+C++ → Python 주요 변환 포인트:
+  frSignalSensor(SIGCHLD)      → FrSignalSensor.__init__(signal.SIGCHLD)
+  m_ChildProcHandler->WaitProc → self._child_proc_handler.wait_proc()
+  ChildProcessHandler*         → TYPE_CHECKING 전용 임포트 (순환 참조 방지)
+
+비고:
+  C++ ChildProcessHandler 에서 ChildSignalSensor 생성이 주석 처리되어 있음.
+  현재는 미사용 상태이나 향후 활성화를 위해 변환 유지.
+
+변경 이력:
+  2014.07.08  초기 작성 (C++ 원본)
+  Python 변환
+"""
+
+import logging
 import signal
+from typing import TYPE_CHECKING
 
-# 프로젝트 경로 설정
-current_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.abspath(os.path.join(current_dir, '../..'))
-if project_root not in sys.path:
-    sys.path.append(project_root)
+from Event.fr_signal_sensor import FrSignalSensor
 
-from Class.Event.fr_signal_sensor import FrSignalSensor
+if TYPE_CHECKING:
+    from Common.ChildProcessHandler import ChildProcessHandler
 
-# -------------------------------------------------------
-# ChildSignalSensor Class
-# SIGCHLD 시그널을 감지하여 자식 프로세스 종료 처리 위임
-# -------------------------------------------------------
+logger = logging.getLogger(__name__)
+
+
 class ChildSignalSensor(FrSignalSensor):
-    def __init__(self, child_proc_handler):
-        """
-        C++: ChildSignalSensor(ChildProcessHandler* ChildProcHandler) : frSignalSensor(SIGCHLD)
-        """
-        # 부모 생성자 호출 (SIGCHLD 감시 등록)
+    """
+    C++ ChildSignalSensor 대응.
+    SIGCHLD 수신 시 child_proc_handler.wait_proc() 을 호출한다.
+
+    비고: ChildProcessHandler 생성자에서 현재 주석 처리되어 있음.
+    """
+
+    def __init__(self, child_proc_handler: 'ChildProcessHandler') -> None:
+        """C++ ChildSignalSensor(ChildProcessHandler*) : frSignalSensor(SIGCHLD) 대응."""
         super().__init__(signal.SIGCHLD)
-        
-        self.m_ChildProcHandler = child_proc_handler
+        self._child_proc_handler = child_proc_handler
 
-    def __del__(self):
-        """
-        C++: ~ChildSignalSensor()
-        """
-        super().__del__()
-
-    def subject_changed(self):
-        """
-        C++: int SubjectChanged()
-        SIGCHLD 발생 시 호출됨 -> 핸들러에게 Wait 처리를 위임
-        """
-        # print("[ChildSignalSensor] Recv SIGCHLD")
-        
-        if self.m_ChildProcHandler:
-            # Duck Typing: wait_proc 메서드 호출
-            if hasattr(self.m_ChildProcHandler, 'wait_proc'):
-                self.m_ChildProcHandler.wait_proc()
-            else:
-                print("[ChildSignalSensor] Error: Handler has no 'wait_proc' method")
-        
+    def subject_changed(self) -> int:
+        """C++ SubjectChanged() 대응. SIGCHLD 수신 → wait_proc() 호출."""
+        self._child_proc_handler.wait_proc()
         return 1

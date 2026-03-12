@@ -1,47 +1,46 @@
-import sys
+# -*- coding: utf-8 -*-
+"""
+ProcClearTimer.h / ProcClearTimer.C  →  ProcClearTimer.py
+Python 3.11.10 변환
+
+변환 설계:
+  ProcClearTimer → ProcClearTimer  (FrTimerSensor 상속)
+
+C++ → Python 주요 변환 포인트:
+  waitpid(Reason, &status, WNOHANG) → os.waitpid(reason, os.WNOHANG)
+  Reason (int) 은 PID 로 사용됨    → reason 파라미터를 pid 로 처리
+
+변경 이력:
+  2014.07.08  초기 작성 (C++ 원본)
+  Python 변환
+"""
+
+import logging
 import os
 
-# 프로젝트 경로 설정
-current_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.abspath(os.path.join(current_dir, '../..'))
-if project_root not in sys.path:
-    sys.path.append(project_root)
+from Event.fr_timer_sensor import FrTimerSensor
 
-from Class.Event.fr_timer_sensor import FrTimerSensor
+logger = logging.getLogger(__name__)
 
-# -------------------------------------------------------
-# ProcClearTimer Class
-# 지정된 PID에 대해 waitpid를 호출하여 좀비 프로세스 정리
-# -------------------------------------------------------
+
 class ProcClearTimer(FrTimerSensor):
-    def __init__(self):
-        """
-        C++: ProcClearTimer()
-        """
+    """
+    C++ ProcClearTimer 대응.
+    타이머 만료 시 reason 값을 PID 로 사용하여 WNOHANG waitpid 를 수행한다.
+    좀비 프로세스 회수 용도.
+    """
+
+    def __init__(self) -> None:
         super().__init__()
 
-    def __del__(self):
+    def receive_time_out(self, reason: int, extra_reason: object = None) -> None:
         """
-        C++: ~ProcClearTimer()
+        C++ ReceiveTimeOut(int Reason, void* ExtraReason) 대응.
+        reason 을 PID 로 간주하여 WNOHANG waitpid 호출.
         """
-        super().__del__()
-
-    def receive_time_out(self, reason, extra_reason):
-        """
-        C++: void ReceiveTimeOut(int Reason, void* ExtraReason)
-        Reason 인자로 넘어온 값을 PID로 간주하고 waitpid 실행
-        """
-        target_pid = reason
-        
         try:
-            # os.WNOHANG: 프로세스가 아직 종료되지 않았으면 블로킹되지 않고 0 리턴
-            pid, status = os.waitpid(target_pid, os.WNOHANG)
-            
-            # C++: frDEBUG(("WaitPid(%d) Result : %d", Reason, ret));
-            print(f"[ProcClearTimer] WaitPid({target_pid}) Result : {pid}")
-            
+            ret, _ = os.waitpid(reason, os.WNOHANG)
         except ChildProcessError:
-            # 이미 회수되었거나 내 자식 프로세스가 아님
-            print(f"[ProcClearTimer] WaitPid({target_pid}) : No child process found")
-        except OSError as e:
-            print(f"[ProcClearTimer] WaitPid({target_pid}) Error : {e}")
+            ret = -1
+
+        logger.debug("WaitPid(%d) Result : %d", reason, ret)
