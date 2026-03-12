@@ -1,389 +1,397 @@
-import sys
-import os
-import threading
+"""
+SubProcConnMgr.py
+C++ SubProcConnMgr.h/.C → Python 변환
+
+자식 프로세스(SubProc) 연결 관리자.
+  - DB에서 SubProc 정보 로드 (Init)
+  - 설정 상태 START인 프로세스 원격 실행 (ExecuteSubProc)
+  - 프로세스 기동 타임아웃 감시 (ReceiveTimeOut / AsWorld.SetTimer)
+  - SubProcConnection Accept/Remove 관리
+  - InfoChange (CRUD) 처리
+"""
+
 import copy
-import time
+import logging
+import subprocess
+from typing import Optional, Dict
 
-# -------------------------------------------------------
-# Project Path Setup
-# -------------------------------------------------------
-current_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.abspath(os.path.join(current_dir, '../..'))
-if project_root not in sys.path:
-    sys.path.append(project_root)
+from Common.ConnectionMgr import ConnectionMgr          # add/remove/find_session
+from Common.CommTypeList import (
+    AS_SUB_PROC_INFO_T,
+    AS_PROC_CONTROL_T,
+    AS_PROCESS_STATUS_T,
+)
+from Common.CommType import (
+    ASCII_SUB_PROCESS,
+    START, STOP, WAIT_NO, WAIT_START, WAIT_STOP,
+    CREATE_DATA, UPDATE_DATA, DELETE_DATA,
+    ARG_NAME, ARG_SVR_IP, ARG_SVR_PORT,
+    ARG_LOG_CYCLE, ARG_LOG_HOUR,
+)
+from ProcNaServer.AsciiServerType import (
+    WAIT_DATA_HANDLER_START_TIME,
+    WAIT_DATA_HANDLER_START_TIMEOUT,
+)
 
-# Try importing parent class based on availability
-from Class.Common.SockMgrConnMgr import SockMgrConnMgr
-from Class.ProcNaServer.SubProcConnection import SubProcConnection
-from Class.Common.CommType import *
-from Class.Common.AsUtil import AsUtil
+logger = logging.getLogger(__name__)
 
-class SubProcConnMgr(SockMgrConnMgr):
+# SubProcInfoMap : ProcIdStr(str) → AS_SUB_PROC_INFO_T
+SubProcInfoMap = Dict[str, AS_SUB_PROC_INFO_T]
+
+
+class SubProcConnMgr(ConnectionMgr):
     """
-    Manages connections and lifecycle (Start/Stop/Kill) of Sub-Processes.
-    Inherits from SockMgrConnMgr for socket management.
+    C++ SubProcConnMgr (ConnectionMgr 상속) 대응.
+
+    타이머:
+      AsWorld.SetTimer / CancelTimer (asyncio.Task 기반) 사용.
+      _timer_key_map : ProcIdStr → timer_key(int)
     """
 
-    # Constants
-    WAIT_DATA_HANDLER_START_TIME = 10
-    WAIT_DATA_HANDLER_START_TIMEOUT = 1002
-
-    def __init__(self):
-        """
-        C++: SubProcConnMgr::SubProcConnMgr()
-        """
+    def __init__(self) -> None:
         super().__init__()
-        
-        # Key: ProcIdStr (str), Value: AsSubProcInfoT
-        self.m_SubProcInfoMap = {}
-        
-        # Key: ProcIdStr (str), Value: threading.Timer
-        self.m_SubProcExecuteTimerMap = {}
+        self._sub_proc_info_map: SubProcInfoMap   = {}
+        # ProcIdStr → AsWorld.SetTimer 반환 key
+        self._timer_key_map: Dict[str, int]       = {}
 
-    def __del__(self):
-        """
-        C++: SubProcConnMgr::~SubProcConnMgr()
-        """
-        self.m_SubProcInfoMap.clear()
-        
-        # Cancel all running timers
-        for timer in self.m_SubProcExecuteTimerMap.values():
-            timer.cancel()
-        self.m_SubProcExecuteTimerMap.clear()
-        
-        super().__del__()
+    # =========================================================================
+    # AcceptSocket
+    # =========================================================================
 
-    def accept_socket(self):
+    def AcceptSocket(self) -> None:
         """
-        C++: void AcceptSocket()
+        C++: AcceptSocket()
+        새 SubProc 소켓 접속을 수락하여 SubProcConnection 생성.
         """
-        sub_proc_conn = SubProcConnection(self)
+        from ProcNaServer.SubProcConnection import SubProcConnection
 
-        if not self.accept(sub_proc_conn):
-            print(f"[SubProcConnMgr] SubProc Socket Accept Error : {self.get_obj_err_msg()}")
-            sub_proc_conn.close()
+        conn = SubProcConnection(self)
+        if not self.Accept(conn):
+            logger.debug("SubProc Socket Accept Error : %s", self.GetObjErrMsg())
             return
 
-        self.add(sub_proc_conn)
-        print("[SubProcConnMgr] SubProc Connection")
+        self.add(conn)          # ConnectionMgr.add()
+        logger.debug("SubProc Connection")
 
-    def init(self):
+    # =========================================================================
+    # Init
+    # =========================================================================
+
+    def Init(self) -> bool:
         """
-        C++: bool Init()
-        Loads SubProc info from DB.
+        C++: Init()
+        DB에서 SubProc 정보 로드.
         """
-        self.m_SubProcInfoMap.clear()
-        
-        from AsciiServerWorld import AsciiServerWorld
-        db_mgr = AsciiServerWorld._instance.m_DbManager
-        
-        if db_mgr:
-            if not db_mgr.get_sub_proc_info(self.m_SubProcInfoMap):
-                print(f"[SubProcConnMgr] [CORE_ERROR] Get SubProc Info Error : {db_mgr.get_error_msg()}")
-                return False
+        from ProcNaServer.AsciiServerWorld import DBPTR
+
+        self._sub_proc_info_map.clear()
+        if not DBPTR().GetSubProcInfo(self._sub_proc_info_map):
+            logger.error("Get SubProc Info Error : %s", DBPTR().GetErrorMsg())
+            return False
         return True
 
-    def execute_sub_proc_all(self):
+    # =========================================================================
+    # ExecuteSubProc
+    # =========================================================================
+
+    def ExecuteSubProc(self, info: Optional[AS_SUB_PROC_INFO_T] = None,
+                       wait_time: int = WAIT_DATA_HANDLER_START_TIME) -> bool:
         """
-        C++: void ExecuteSubProc()
-        Iterates through all configured sub-processes and starts them if SettingStatus is START.
+        C++ 오버로드 2종 통합:
+          ExecuteSubProc()                         → 전체 SubProc 기동
+          ExecuteSubProc(AS_SUB_PROC_INFO_T*, int) → 단일 SubProc 기동
         """
-        if not self.init():
-            return
+        if info is None:
+            return self._execute_all()
+        return self._execute_one(info, wait_time)
 
-        wait_time = 50
-
-        # Iterate over copy keys to allow modification if needed
-        for info in self.m_SubProcInfoMap.values():
-            print(f"[SubProcConnMgr] SubProcId : {info.ProcIdStr}")
-
-            if info.SettingStatus == START:
-                self.execute_sub_proc(info, self.WAIT_DATA_HANDLER_START_TIME + wait_time)
-                wait_time += 2
-
-    def execute_sub_proc(self, info, wait_time=0):
-        """
-        C++: bool ExecuteSubProc(AS_SUB_PROC_INFO_T* Info, int WaitTime)
-        Constructs the command line and executes the sub-process via system call.
-        """
-        if info.RequestStatus == WAIT_NO:
-            
-            # 1. Kill existing instance first
-            self.kill_sub_proc(info.ProcIdStr)
-
-            # 2. Prepare Log Cycle Argument
-            log_cycle_buf = ""
-            if info.LogCycle == 1:
-                # Constants ARG_LOG_CYCLE, ARG_LOG_HOUR assumed to be defined globally
-                log_cycle_buf = f"{ARG_LOG_CYCLE} {ARG_LOG_HOUR}"
-
-            # 3. Construct Command
-            # Format: ~/NAA/Bin/RunCommand CLIENT Ip RunCmdPort User ~StartDir/Bin/BinaryName ...
-            
-            from AsciiServerWorld import AsciiServerWorld
-            world = AsciiServerWorld._instance
-            
-            user_name = world.get_user_name()
-            start_dir = AsUtil.get_start_dir()
-            server_ip = world.get_server_ip()
-            listen_port = world.get_listen_port(ASCII_SUB_PROCESS)
-            run_cmd_port = getattr(world, 'm_RunCmdPort', "10000") # Default or member
-
-            # Python f-string equivalent of C++ sprintf
-            cmd_exec = (
-                f"~/NAA/Bin/RunCommand CLIENT {info.IpAddress} {run_cmd_port} {user_name} "
-                f"'~{user_name}{start_dir}/Bin/{info.BinaryName} "
-                f"{ARG_NAME} {info.ProcIdStr} "
-                f"{ARG_SVR_IP} {server_ip} "
-                f"{ARG_SVR_PORT} {listen_port} {log_cycle_buf} {info.Args}'"
-            )
-
-            print(f"[SubProcConnMgr] SubProc Execute: {cmd_exec}")
-            
-            # 4. Execute Command
-            os.system(cmd_exec)
-            
-            # 5. Update Status & Set Timer
-            info.RequestStatus = WAIT_START
-
-            # Timer Setup
-            timer = threading.Timer(wait_time / 1000.0 if wait_time > 1000 else wait_time, 
-                                    self.receive_time_out, 
-                                    args=[self.WAIT_DATA_HANDLER_START_TIMEOUT, info.ProcIdStr])
-            timer.start()
-            
-            self.m_SubProcExecuteTimerMap[info.ProcIdStr] = timer
-            
-            world.send_info_change(info)
-            return True
-
-        else:
-            status_str = "Start" if info.RequestStatus == WAIT_START else "Stop"
-            msg = f"Already Rerquest SubProc: {info.ProcIdStr}({status_str})"
-            print(f"[SubProcConnMgr] {msg}")
-            
-            from AsciiServerWorld import AsciiServerWorld
-            AsciiServerWorld._instance.send_ascii_error(1, msg)
+    def _execute_all(self) -> bool:
+        """C++: ExecuteSubProc() – 전체 순회 기동."""
+        if not self.Init():
             return False
 
-    def stop_sub_proc(self, info):
-        """
-        C++: bool StopSubProc(AS_SUB_PROC_INFO_T* Info)
-        """
-        con = self.find_session(info.ProcIdStr)
-        
+        wait_offset = 50
+        for proc_id, info in self._sub_proc_info_map.items():
+            logger.debug("SubProcId : %s", info.ProcIdStr)
+            if info.SettingStatus == START:
+                self._execute_one(info, WAIT_DATA_HANDLER_START_TIME + wait_offset)
+                wait_offset += 2
+        return True
+
+    def _execute_one(self, info: AS_SUB_PROC_INFO_T,
+                     wait_time: int = WAIT_DATA_HANDLER_START_TIME) -> bool:
+        """C++: ExecuteSubProc(AS_SUB_PROC_INFO_T*, int) – 단일 기동."""
+        from ProcNaServer.AsciiServerWorld import MAINPTR
+
+        if info.RequestStatus != WAIT_NO:
+            req_str = "Start" if info.RequestStatus == WAIT_START else "Stop"
+            logger.info("Already Request SubProc: %s(%s)", info.ProcIdStr, req_str)
+            MAINPTR().SendAsciiError(
+                1, "Already Request SubProc: %s(%s)", info.ProcIdStr, req_str)
+            return False
+
+        # 기존 프로세스 Kill
+        self.KillSubProc(info.ProcIdStr)
+
+        # 로그 사이클 인자 (C++: logCycleBuf)
+        log_cycle_buf = ""
+        if info.LogCycle == 1:
+            log_cycle_buf = f"{ARG_LOG_CYCLE} {ARG_LOG_HOUR}"
+
+        # 실행 명령 조립
+        # C++: ~/NAA/Bin/RunCommand CLIENT <ip> <port> '~<user><startdir>/Bin/<bin> ...'
+        inner_cmd = (
+            f"~{MAINPTR().GetUserName()}"
+            f"{MAINPTR().GetStartDir()}/Bin/{info.BinaryName} "
+            f"{ARG_NAME} {info.ProcIdStr} "
+            f"{ARG_SVR_IP} {MAINPTR().GetServerIp()} "
+            f"{ARG_SVR_PORT} {MAINPTR().GetListenPort(ASCII_SUB_PROCESS)} "
+            f"{log_cycle_buf} {info.Args}"
+        ).strip()
+
+        exec_cmd = (
+            f"~/NAA/Bin/RunCommand CLIENT "
+            f"{info.IpAddress} {MAINPTR().m_RunCmdPort} "
+            f"'{inner_cmd}'"
+        )
+        logger.debug("SubProc Execute: %s", exec_cmd)
+        subprocess.Popen(exec_cmd, shell=True)
+
+        info.RequestStatus = WAIT_START
+
+        # ── 기동 대기 타이머 (AsWorld.SetTimer 사용) ──────────────────────
+        # 기존 타이머가 있으면 취소
+        old_key = self._timer_key_map.pop(info.ProcIdStr, None)
+        if old_key is not None:
+            self.CancelTimer(old_key)           # AsWorld.CancelTimer
+
+        key = self.SetTimer(                    # AsWorld.SetTimer → asyncio.Task
+            wait_time,
+            WAIT_DATA_HANDLER_START_TIMEOUT,
+            info.ProcIdStr,                     # C++ void* ExtraReason → str
+        )
+        self._timer_key_map[info.ProcIdStr] = key
+
+        MAINPTR().SendInfoChange(info)
+        return True
+
+    # =========================================================================
+    # StopSubProc
+    # =========================================================================
+
+    def StopSubProc(self, info: AS_SUB_PROC_INFO_T) -> bool:
+        """C++: StopSubProc(AS_SUB_PROC_INFO_T*)"""
+        from ProcNaServer.AsciiServerWorld import MAINPTR
+        from ProcNaServer.SubProcConnection import SubProcConnection
+
+        con: Optional[SubProcConnection] = self.find_session(info.ProcIdStr)  # ConnectionMgr.find_session()
         if con is None:
-            msg = f"Can't find the executed SubProc({info.ProcIdStr})."
-            print(f"[SubProcConnMgr] {msg}")
-            
-            from AsciiServerWorld import AsciiServerWorld
-            AsciiServerWorld._instance.send_ascii_error(1, msg)
+            logger.debug("Can't find the executed Subproc(%s).", info.ProcIdStr)
+            MAINPTR().SendAsciiError(
+                1, "Can't find the executed SubProc(%s).", info.ProcIdStr)
             return False
 
         info.RequestStatus = WAIT_STOP
-        
-        from AsciiServerWorld import AsciiServerWorld
-        AsciiServerWorld._instance.send_info_change(info)
-        
-        con.stop_sub_proc()
+        MAINPTR().SendInfoChange(info)
+        con.StopSubProc()
         return True
 
-    def sub_proc_session_identify(self, proc_id_str):
-        """
-        C++: void SubProcSessionIdentify(string ProcIdStr)
-        Cancels the startup timer upon successful connection identification.
-        """
-        if proc_id_str in self.m_SubProcExecuteTimerMap:
-            timer = self.m_SubProcExecuteTimerMap[proc_id_str]
-            timer.cancel()
-            del self.m_SubProcExecuteTimerMap[proc_id_str]
-        else:
-            print(f"[SubProcConnMgr] [CORE_ERROR] Can't Find SubProc({proc_id_str}) in SubProcExecuteTimerMap")
+    # =========================================================================
+    # SubProcSessionIdentify
+    # =========================================================================
 
-    def get_sub_proc_info_map(self):
+    def SubProcSessionIdentify(self, proc_id_str: str) -> None:
         """
-        C++: SubProcInfoMap* GetSubProcInfoMap()
+        C++: SubProcSessionIdentify(string ProcIdStr)
+        SubProc 세션 식별 완료 → 기동 대기 타이머 취소 (AsWorld.CancelTimer).
         """
-        return self.m_SubProcInfoMap
+        key = self._timer_key_map.pop(proc_id_str, None)
+        if key is None:
+            logger.error("Can't Find SubProc(%s) in SubProcExecuteTimerMap",
+                         proc_id_str)
+            return
+        self.CancelTimer(key)                   # AsWorld.CancelTimer
+        logger.debug("SubProc(%s) start timer cancelled", proc_id_str)
 
-    def receive_proc_info(self, proc_info):
-        """
-        C++: void ReceiveProcInfo(AS_PROCESS_STATUS_T* ProcInfo)
-        """
-        from AsciiServerWorld import AsciiServerWorld
-        AsciiServerWorld._instance.update_process_info(proc_info)
+    # =========================================================================
+    # GetSubProcInfoMap
+    # =========================================================================
 
-    def recv_process_control(self, proc_ctl):
-        """
-        C++: bool RecvProcessControl(AS_PROC_CONTROL_T* ProcCtl)
-        Handles administrative Start/Stop commands.
-        """
-        info = self.find_sub_proc_info(proc_ctl.ProcessId)
-        
+    def GetSubProcInfoMap(self) -> SubProcInfoMap:
+        return self._sub_proc_info_map
+
+    # =========================================================================
+    # ReceiveProcInfo
+    # =========================================================================
+
+    def ReceiveProcInfo(self, proc_info: AS_PROCESS_STATUS_T) -> None:
+        """C++: ReceiveProcInfo(AS_PROCESS_STATUS_T*)"""
+        from ProcNaServer.AsciiServerWorld import MAINPTR
+        MAINPTR().UpdateProcessInfo(proc_info)
+
+    # =========================================================================
+    # RecvProcessControl
+    # =========================================================================
+
+    def RecvProcessControl(self, proc_ctl: AS_PROC_CONTROL_T) -> bool:
+        """C++: RecvProcessControl(AS_PROC_CONTROL_T*)"""
+        from ProcNaServer.AsciiServerWorld import MAINPTR, DBPTR
+
+        info = self.FindSubProcInfo(proc_ctl.ProcessId)
         if info is None:
-            print(f"[SubProcConnMgr] [CORE_ERROR] Can't Find SubProc : {proc_ctl.ProcessId}")
+            logger.error("Can't Find SubProc : %s", proc_ctl.ProcessId)
             return False
 
-        from AsciiServerWorld import AsciiServerWorld
-        world = AsciiServerWorld._instance
-
-        if info.RequestStatus == WAIT_NO:
-            if proc_ctl.Status == START and info.CurStatus == START:
-                msg = f"Already Started SubProc : {proc_ctl.ProcessId}"
-                print(f"[SubProcConnMgr] {msg}")
-                world.send_ascii_error(1, msg)
-                return False
-                
-            elif proc_ctl.Status == STOP and info.CurStatus == STOP:
-                msg = f"Already Stop SubProc : {proc_ctl.ProcessId}"
-                print(f"[SubProcConnMgr] {msg}")
-                world.send_ascii_error(1, msg)
-                return False
-
-            if world.m_DbManager and not world.m_DbManager.update_sub_proc_status(proc_ctl.ProcessId, proc_ctl.Status):
-                 print(f"[SubProcConnMgr] [CORE_ERROR] Update SubProc Status Error : {world.m_DbManager.get_error_msg()}")
-                 return False
-
-            info.SettingStatus = START if proc_ctl.Status == START else STOP
-
-            if proc_ctl.Status == START:
-                if self.execute_sub_proc(info):
-                    world.send_ascii_error(1, f"The SubProc({proc_ctl.ProcessId}) start successfull")
-                else:
-                    world.send_ascii_error(1, "Execute Fail") # GetGErrMsg stub
-                    
-            elif proc_ctl.Status == STOP:
-                self.stop_sub_proc(info)
-
-        else:
-            status_str = "Start" if info.RequestStatus == WAIT_START else "Stop"
-            msg = f"Already Rerquest Process: {proc_ctl.ProcessId}({status_str})"
-            print(f"[SubProcConnMgr] {msg}")
-            world.send_ascii_error(1, msg)
+        if info.RequestStatus != WAIT_NO:
+            req_str = "Start" if info.RequestStatus == WAIT_START else "Stop"
+            logger.info("Already Request Process: %s(%s)",
+                        proc_ctl.ProcessId, req_str)
+            MAINPTR().SendAsciiError(
+                1, "Already Request Process: %s(%s)",
+                proc_ctl.ProcessId, req_str)
             return False
-            
-        return False
 
-    def find_sub_proc_info(self, proc_id_str):
-        """
-        C++: AS_SUB_PROC_INFO_T* FindSubProcInfo(string ProcIdStr)
-        """
-        return self.m_SubProcInfoMap.get(proc_id_str)
+        # 이미 같은 상태이면 무시
+        if proc_ctl.Status == START and info.CurStatus == START:
+            logger.info("Already Started SubProc : %s", proc_ctl.ProcessId)
+            MAINPTR().SendAsciiError(
+                1, "Already Started SubProc : %s", proc_ctl.ProcessId)
+            return False
 
-    def receive_time_out(self, reason, extra_reason):
-        """
-        C++: void ReceiveTimeOut(int Reason, void* ExtraReason)
-        """
-        if reason == self.WAIT_DATA_HANDLER_START_TIMEOUT:
-            proc_id = extra_reason
-            print(f"[SubProcConnMgr] Recv Timeout WAIT_DATA_HANDLER_START_TIMEOUT : {proc_id}")
+        if proc_ctl.Status == STOP and info.CurStatus == STOP:
+            logger.info("Already Stop SubProc : %s", proc_ctl.ProcessId)
+            MAINPTR().SendAsciiError(
+                1, "Already Stop SubProc : %s", proc_ctl.ProcessId)
+            return False
 
-            from AsciiServerWorld import AsciiServerWorld
-            world = AsciiServerWorld._instance
-            world.send_ascii_error(1, f"SubProc({proc_id}) Start Error")
+        # DB 상태 업데이트
+        if not DBPTR().UpdateSubProcStatus(proc_ctl.ProcessId, proc_ctl.Status):
+            logger.error("Update SubProc Status Error : %s", DBPTR().GetErrorMsg())
+            return False
 
-            if proc_id in self.m_SubProcExecuteTimerMap:
-                del self.m_SubProcExecuteTimerMap[proc_id]
+        info.SettingStatus = START if proc_ctl.Status == START else STOP
+
+        if proc_ctl.Status == START:
+            if self._execute_one(info):
+                MAINPTR().SendAsciiError(
+                    1, "The SubProc(%s) start successful", proc_ctl.ProcessId)
             else:
-                print(f"[SubProcConnMgr] [CORE_ERROR] Can't Find SubProc({proc_id}) in SubProcExecuteTimerMap")
+                MAINPTR().SendAsciiError(
+                    1, "SubProc(%s) start failed", proc_ctl.ProcessId)
+        elif proc_ctl.Status == STOP:
+            self.StopSubProc(info)
 
-            info = self.find_sub_proc_info(proc_id)
+        return True
+
+    # =========================================================================
+    # FindSubProcInfo
+    # =========================================================================
+
+    def FindSubProcInfo(self, proc_id_str: str) -> Optional[AS_SUB_PROC_INFO_T]:
+        """C++: FindSubProcInfo(string ProcIdStr)"""
+        return self._sub_proc_info_map.get(proc_id_str)
+
+    # =========================================================================
+    # ReceiveTimeOut  (AsWorld 가상함수 오버라이드)
+    # =========================================================================
+
+    def ReceiveTimeOut(self, reason: int, extra_reason=None) -> None:
+        """
+        C++: ReceiveTimeOut(int Reason, void* ExtraReason)
+        AsWorld.SetTimer 콜백. WAIT_DATA_HANDLER_START_TIMEOUT 처리.
+        extra_reason = proc_id_str (str)
+        """
+        from ProcNaServer.AsciiServerWorld import MAINPTR, DBPTR
+
+        if reason == WAIT_DATA_HANDLER_START_TIMEOUT:
+            proc_id_str: str = extra_reason if isinstance(extra_reason, str) else ""
+            logger.debug("Recv Timeout WAIT_DATA_HANDLER_START_TIMEOUT : %s",
+                         proc_id_str)
+            MAINPTR().SendAsciiError(1, "SubProc(%s) Start Error", proc_id_str)
+
+            # 타이머 맵에서 제거 (타이머 만료이므로 cancel 불필요)
+            self._timer_key_map.pop(proc_id_str, None)
+
+            info = self.FindSubProcInfo(proc_id_str)
             if info is None:
-                print(f"[SubProcConnMgr] [CORE_ERROR] SubProc Info Can't Find : {proc_id}")
+                logger.error("SubProc Info Can't Find : %s", proc_id_str)
                 return
 
-            print(f"[SubProcConnMgr] SubProc {proc_id} Status is setting STOP")
+            logger.debug("SubProc %s Status is setting STOP", proc_id_str)
 
-            if world.m_DbManager and not world.m_DbManager.update_sub_proc_status(proc_id, STOP):
-                print(f"[SubProcConnMgr] [CORE_ERROR] Update SubProc Status Error : {world.m_DbManager.get_error_msg()}")
+            if not DBPTR().UpdateSubProcStatus(proc_id_str, STOP):
+                logger.error("Update SubProc Status Error : %s",
+                             DBPTR().GetErrorMsg())
                 return
 
-            info.SettingStatus = STOP
-            info.CurStatus = STOP
-            info.RequestStatus = WAIT_NO
+            info.SettingStatus  = STOP
+            info.CurStatus      = STOP
+            info.RequestStatus  = WAIT_NO
+            MAINPTR().SendInfoChange(info)
 
-            world.send_info_change(info)
+    # =========================================================================
+    # KillSubProc
+    # =========================================================================
 
-    def kill_sub_proc(self, proc_id_str):
-        """
-        C++: void KillSubProc(string ProcIdStr)
-        """
-        info = self.find_sub_proc_info(proc_id_str)
+    def KillSubProc(self, proc_id_str: str) -> None:
+        """C++: KillSubProc(string ProcIdStr) – 원격 프로세스 강제 종료."""
+        from ProcNaServer.AsciiServerWorld import MAINPTR
 
+        info = self.FindSubProcInfo(proc_id_str)
         if info is None:
-            print(f"[SubProcConnMgr] [CORE_ERROR] Can't Find SubProc : {proc_id_str}")
+            logger.error("Can't Find SubProc : %s", proc_id_str)
             return
 
-        from AsciiServerWorld import AsciiServerWorld
-        world = AsciiServerWorld._instance
-        
-        user_name = world.get_user_name()
-        start_dir = AsUtil.get_start_dir()
-        run_cmd_port = getattr(world, 'm_RunCmdPort', "10000")
-
-        # Format: ~/NAA/Bin/RunCommand CLIENT Ip RunCmdPort User ~StartDir/Bin/KillProcess ProcId
         cmd = (
-            f"~/NAA/Bin/RunCommand CLIENT {info.IpAddress} {run_cmd_port} {user_name} "
-            f"'~{user_name}{start_dir}/Bin/KillProcess {info.ProcIdStr}'"
+            f"~/NAA/Bin/RunCommand CLIENT "
+            f"{info.IpAddress} {MAINPTR().m_RunCmdPort} "
+            f"'~{MAINPTR().GetUserName()}"
+            f"{MAINPTR().GetStartDir()}/Bin/KillProcess {info.ProcIdStr}'"
         )
+        logger.debug("Kill SubProc : %s", cmd)
+        subprocess.Popen(cmd, shell=True)
 
-        print(f"[SubProcConnMgr] Kill SubProc : {cmd}")
-        os.system(cmd)
+    # =========================================================================
+    # RecvInfoChange
+    # =========================================================================
 
-    def recv_info_change(self, info, result_msg=""):
+    def RecvInfoChange(self, info: AS_SUB_PROC_INFO_T,
+                       result_msg: list) -> bool:
         """
-        C++: bool RecvInfoChange(AS_SUB_PROC_INFO_T* Info, char* ResultMsg)
+        C++: RecvInfoChange(AS_SUB_PROC_INFO_T* Info, char* ResultMsg)
+        result_msg: [str] 1-원소 리스트 (C++ char* 출력 인자 대응).
         """
-        from AsciiServerWorld import AsciiServerWorld
-        world = AsciiServerWorld._instance
+        from ProcNaServer.AsciiServerWorld import MAINPTR
 
         if info.RequestStatus == CREATE_DATA:
-            new_info = copy.deepcopy(info)
+            new_info = copy.copy(info)
             new_info.RequestStatus = WAIT_NO
-            new_info.CurStatus = STOP
+            new_info.CurStatus     = STOP
             new_info.SettingStatus = STOP
-            
-            self.m_SubProcInfoMap[new_info.ProcIdStr] = new_info
-            world.send_info_change(info)
+            self._sub_proc_info_map[new_info.ProcIdStr] = new_info
+            MAINPTR().SendInfoChange(info)
             return True
 
-        elif info.RequestStatus == UPDATE_DATA:
-            if info.OldProcIdStr not in self.m_SubProcInfoMap:
-                print(f"Can't Find SubProc : {info.OldProcIdStr}")
+        if info.RequestStatus == UPDATE_DATA:
+            if info.OldProcIdStr not in self._sub_proc_info_map:
+                result_msg[0] = f"Can't Find SubProc : {info.OldProcIdStr}"
                 return False
-            
-            # Remove old
-            del self.m_SubProcInfoMap[info.OldProcIdStr]
-            
-            # Insert new
-            new_info = copy.deepcopy(info)
-            new_info.CurStatus = STOP
+            del self._sub_proc_info_map[info.OldProcIdStr]
+            new_info = copy.copy(info)
+            new_info.CurStatus     = STOP
             new_info.SettingStatus = STOP
             new_info.RequestStatus = WAIT_NO
-            new_info.OldProcIdStr = ""
-            
-            self.m_SubProcInfoMap[new_info.ProcIdStr] = new_info
-            
-            world.send_info_change(info)
+            new_info.OldProcIdStr  = ""
+            self._sub_proc_info_map[new_info.ProcIdStr] = new_info
+            MAINPTR().SendInfoChange(info)
             return True
 
-        elif info.RequestStatus == DELETE_DATA:
-            if info.ProcIdStr not in self.m_SubProcInfoMap:
-                print(f"Can't Find SubProc : {info.ProcIdStr}")
+        if info.RequestStatus == DELETE_DATA:
+            if info.ProcIdStr not in self._sub_proc_info_map:
+                result_msg[0] = f"Can't Find SubProc : {info.ProcIdStr}"
                 return False
-            
-            del self.m_SubProcInfoMap[info.ProcIdStr]
-            
-            world.send_info_change(info)
+            del self._sub_proc_info_map[info.ProcIdStr]
+            MAINPTR().SendInfoChange(info)
             return True
-            
+
         return False
-
-    # ------------------------------------------------------------------
-    # Helper to find session
-    # ------------------------------------------------------------------
-    def find_session(self, session_name):
-        for conn in self.m_SocketConnectionList:
-            if conn.get_session_name() == session_name:
-                return conn
-        return None

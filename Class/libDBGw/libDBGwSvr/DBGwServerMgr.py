@@ -1,125 +1,156 @@
-import sys
-import os
+"""
+DBGwServerMgr.py
+C++ DBGwServerMgr.h/.C → Python 변환
+
+DB Gateway 서버의 리스닝 소켓 관리자.
+- Run()으로 지정 포트에서 Listen 시작
+- 클라이언트 Accept 시 DBGwServerSession 생성 후 AcceptSession()에 위임
+- AcceptSession()은 서브클래스에서 오버라이드하여 세션 관리 정책 구현
+"""
+
+import logging
 import socket
+import threading
+from typing import Optional, TYPE_CHECKING
 
-# -------------------------------------------------------
-# Project Path Setup
-# -------------------------------------------------------
-current_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.abspath(os.path.join(current_dir, '../../..'))
-if project_root not in sys.path:
-    sys.path.append(project_root)
+from libDBGw.libDBGwBase.DBGwBaseSocket import DBGwBaseSocket
+from libDBGw.libDBGwSvr.DBGwServerSession import DBGwServerSession
 
-# Assuming DBGwServer exists based on Makefile
-# If not available, we can inherit from object or a base Socket class
-try:
-    from Class.libDBGw.libDBGwSvr.DBGwServer import DBGwServer
-except ImportError:
-    class DBGwServer:
-        """Mock base class if DBGwServer is not yet defined"""
-        def __init__(self):
-            self.m_Socket = None
-        def create(self, family):
-            self.m_Socket = socket.socket(family, socket.SOCK_STREAM)
-            self.m_Socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            return True
-        def listen(self, port, backlog):
-            try:
-                self.m_Socket.bind(('', port))
-                self.m_Socket.listen(backlog)
-                return True
-            except Exception as e:
-                print(f"[DBGwServer] Listen Error: {e}")
-                return False
-        def accept(self, session):
-            """
-            Simulates C++ Accept(AsSocket* pSocket).
-            Accepts connection and assigns it to the session object.
-            """
-            try:
-                client_sock, addr = self.m_Socket.accept()
-                # Assuming session has a method to set the socket
-                # In C++, AsSocket::Accept usually copies the handle.
-                session.set_socket(client_sock, addr)
-                return True
-            except Exception as e:
-                print(f"[DBGwServer] Accept Error: {e}")
-                return False
+logger = logging.getLogger(__name__)
 
-from Class.libDBGw.libDBGwSvr.DBGwServerSession import DBGwServerSession
 
-class DBGwServerMgr(DBGwServer):
+class DBGwServerMgr(DBGwBaseSocket):
     """
-    C++: DBGwServerMgr
-    Manages the Gateway Server: Listen port, accept connections, create sessions.
+    DB Gateway 서버 리스닝 관리자.
+
+    클라이언트 접속을 수락하고 DBGwServerSession을 생성한다.
+    AcceptSession()을 오버라이드하여 세션 수락/거부 및 수명 관리를 결정한다.
+
+    AcceptSession() 반환값 규칙 (C++ 원본 동일):
+        True  → AcceptSocket()이 session을 delete(해제)한다.  (세션 거부 또는 직접 관리)
+        False → AcceptSocket()이 session을 해제하지 않는다.  (서브클래스가 관리)
     """
-    def __init__(self, db_kind, default_db_user, default_db_passwd, default_db_name):
-        """
-        C++: DBGwServerMgr(int DbKind, string DefaultDbUser, ...)
-        """
+
+    # Listen backlog (C++ 원본 100 유지)
+    _LISTEN_BACKLOG = 100
+
+    def __init__(self,
+                 DbKind: int,
+                 DefaultDbUser: str = "",
+                 DefaultDbPasswd: str = "",
+                 DefaultDbName: str = "") -> None:
         super().__init__()
-        
-        self.m_DbKind = db_kind
-        self.m_DbUser = default_db_user
-        self.m_DbPasswd = default_db_passwd
-        self.m_DbName = default_db_name
-        self.m_LogDir = "."
 
-    def __del__(self):
-        """
-        C++: ~DBGwServerMgr()
-        """
-        pass
+        self.m_DbKind:  int = DbKind
+        self.m_DbUser:  str = DefaultDbUser
+        self.m_DbPasswd: str = DefaultDbPasswd
+        self.m_DbName:  str = DefaultDbName
+        self.m_LogDir:  str = "."
 
-    def run(self, listen_port):
+        # Accept 루프용 스레드 (Run() 호출 시 생성)
+        self._accept_thread: Optional[threading.Thread] = None
+        self._running: bool = False
+
+    def __del__(self) -> None:
+        self._running = False
+
+    # -------------------------------------------------------------------------
+    # Public
+    # -------------------------------------------------------------------------
+
+    def Run(self, ListenPort: int) -> bool:
         """
-        C++: bool Run(int ListenPort)
-        Starts the server: Creates socket and listens.
+        소켓 생성 → Listen → Accept 루프 스레드 시작.
+
+        C++ 원본은 Listen() 후 상위 이벤트 루프에서 AcceptSocket()을 호출하지만,
+        Python에서는 별도 스레드에서 Accept 루프를 실행한다.
+
+        Returns:
+            True  : Listen 성공 및 Accept 스레드 시작
+            False : 소켓 생성 또는 Listen 실패
         """
-        if self.create(socket.AF_INET):
-            return self.listen(listen_port, 100)
-        else:
+        if not self.Create(socket.AF_INET):
+            logger.error("DBGwServerMgr: socket Create failed")
             return False
 
-    def accept_socket(self):
-        """
-        C++: void AcceptSocket()
-        Called (usually by a Reactor/Loop) when the listening socket is readable.
-        Creates a new session and accepts the connection.
-        """
-        # Create a new session instance
-        session = DBGwServerSession(self.m_DbKind, self.m_DbUser, self.m_DbPasswd, self.m_DbName)
+        if not self.Listen(ListenPort, self._LISTEN_BACKLOG):
+            logger.error("DBGwServerMgr: Listen on port %d failed", ListenPort)
+            return False
 
-        # Try to accept connection into the session
-        if self.accept(session):
-            # Hook for additional session acceptance logic
-            ret = self.accept_session(session)
-            
-            if ret is True:
-                # C++ logic: if(ret == true) { delete session; }
-                # Usually implies session was rejected or handled immediately and should be cleaned up.
-                session.close() 
-                session = None
-            else:
-                # Session is accepted and kept alive.
-                # In C++, the pointer is managed elsewhere (e.g. Reactor).
-                # In Python, we might need to store it or start its loop.
-                # For now, we assume the session manages its own lifecycle or is registered to a loop.
-                pass
-        else:
-            # Accept failed
-            session.close()
-            session = None
+        logger.info("DBGwServerMgr: Listening on port %d", ListenPort)
+        self._running = True
+        self._accept_thread = threading.Thread(
+            target=self._AcceptLoop,
+            name=f"DBGwServerMgr-Accept-{ListenPort}",
+            daemon=True
+        )
+        self._accept_thread.start()
+        return True
 
-    def accept_session(self, session):
+    def AcceptSession(self, Session: DBGwServerSession) -> bool:
         """
-        C++: bool AcceptSession(DBGwServerSession* Session)
-        Virtual method hook. Returns False by default.
+        세션 수락 후 처리 정책을 결정한다.
+        서브클래스에서 오버라이드하여 세션 목록 관리, 스레드 시작 등을 수행한다.
+
+        Returns:
+            True  → AcceptSocket()이 session 자원을 해제한다.
+            False → 서브클래스(오버라이드)가 session 수명을 직접 관리한다.
+
+        C++ 원본 기본 구현은 False를 반환한다.
         """
         return False
 
-    def set_log_dir(self, log_dir):
+    def AcceptSocket(self) -> None:
         """
-        C++: void SetLogDir(string LogDir)
+        클라이언트 연결 1개를 수락하고 DBGwServerSession을 생성한다.
+
+        - Accept 성공 시 AcceptSession()을 호출
+        - AcceptSession()이 True 반환 → session 자원 직접 해제
+        - AcceptSession()이 False 반환 → 서브클래스가 session 관리 책임
+        - Accept 실패 시 생성된 session 즉시 해제
         """
-        self.m_LogDir = log_dir
+        session = DBGwServerSession(
+            self.m_DbKind,
+            self.m_DbUser,
+            self.m_DbPasswd,
+            self.m_DbName
+        )
+        # 로깅 설정 전달
+        session.m_LogDir = self.m_LogDir
+
+        if self.Accept(session):
+            ret = self.AcceptSession(session)
+            if ret:
+                # AcceptSession이 True → 이 쪽에서 session 관리 종료
+                session = None
+            # False → 서브클래스가 session 참조를 보관하여 직접 관리
+        else:
+            logger.warning("DBGwServerMgr: Accept failed, session discarded")
+            session = None
+
+    def SetLogDir(self, LogDir: str) -> None:
+        """로그 파일 저장 디렉토리를 설정한다."""
+        self.m_LogDir = LogDir
+
+    # -------------------------------------------------------------------------
+    # Protected
+    # -------------------------------------------------------------------------
+
+    def _AcceptLoop(self) -> None:
+        """
+        Accept 루프 스레드 본체.
+        C++ 원본에서는 상위 이벤트 루프(frEventMgr 등)가 AcceptSocket()을 호출하지만,
+        Python에서는 이 스레드가 직접 루프를 돌며 AcceptSocket()을 호출한다.
+        """
+        logger.info("DBGwServerMgr: Accept loop started")
+        while self._running:
+            try:
+                self.AcceptSocket()
+            except OSError as e:
+                if self._running:
+                    logger.error("DBGwServerMgr: AcceptSocket error: %s", e)
+                break
+            except Exception as e:
+                logger.exception("DBGwServerMgr: Unexpected error in AcceptLoop: %s", e)
+                break
+        logger.info("DBGwServerMgr: Accept loop stopped")

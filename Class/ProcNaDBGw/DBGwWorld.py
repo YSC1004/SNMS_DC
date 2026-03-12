@@ -1,158 +1,128 @@
-import sys
+"""
+DBGwWorld.py
+C++ DBGwWorld.h/.C → Python 변환
+
+ProcNaDBGw 프로세스의 최상위 애플리케이션 클래스.
+AsProcWorldBase를 상속하며 두 가지 실행 모드를 지원한다.
+
+[일반 모드]  : DBGwMgr를 생성하고 지정 포트에서 Listen 시작
+[Alone 모드] : fork된 자식 프로세스에서 -sessionid로 전달받은 FD로
+               DBGwServerSession을 직접 실행 (1:1 전용 세션)
+"""
+
 import os
-import argparse
-import socket
-import time
+import sys
+import logging
+from typing import Optional, ClassVar
 
-# -------------------------------------------------------
-# Project Path Setup
-# -------------------------------------------------------
-current_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.abspath(os.path.join(current_dir, '../..'))
-if project_root not in sys.path:
-    sys.path.append(project_root)
+from Common.AsWorld import AsProcWorldBase      # 변환 완료된 Common 모듈
+from ProcNaDBGw.DBGwMgr import DBGwMgr
+from libDBGw.libDBGwBase.DBGwType import eDB_TYPE
+from libDBGw.libDBGwSvr.DBGwServerSession import DBGwServerSession
+from Util.fr_arg_parser import ArgParser
 
-# Import Dependencies
-from Class.ProcNaDBGw.DBGwMgr import DBGwMgr
-from Class.libDBGw.libDBGwSvr.DBGwServerSession import DBGwServerSession
-from Class.Sql.FrDbBaseType import eDB_TYPE
-from Class.Util.fr_util_misc import FrUtilMisc
+logger = logging.getLogger(__name__)
 
-class DBGwWorld:
+# C++ : #define MAINPTR DBGwWorld::m_WorldPtr
+# Python : 모듈 레벨 접근 함수로 제공 (또는 DBGwWorld.m_WorldPtr 직접 참조)
+def MAINPTR() -> "DBGwWorld":
+    return DBGwWorld.m_WorldPtr
+
+
+class DBGwWorld(AsProcWorldBase):
     """
-    C++: DBGwWorld
-    Application Entry Point & Manager.
-    Handles process startup, argument parsing, and mode selection (Manager vs Session).
+    DBGw 프로세스 월드 클래스 (싱글톤 패턴).
+
+    C++ IMPL_PROC(DBGwWorld, "DBGw") 매크로 대응:
+      - 프로세스 이름 "DBGw" 등록
+      - m_WorldPtr 싱글톤 포인터 유지
     """
-    instance = None
 
-    def __init__(self):
-        DBGwWorld.instance = self
-        self.log_dir = "./log" # Default log dir (Mocking BASE_MAINPTR->GetLogDir())
+    # C++ : static DBGwWorld* m_WorldPtr
+    m_WorldPtr: ClassVar[Optional["DBGwWorld"]] = None
 
-    def app_start(self):
+    # 프로세스 식별 이름 (IMPL_PROC 매크로 두 번째 인자)
+    PROC_NAME: ClassVar[str] = "DBGw"
+
+    def __init__(self) -> None:
+        super().__init__()
+        DBGwWorld.m_WorldPtr = self
+
+    def __del__(self) -> None:
+        pass
+
+    # -------------------------------------------------------------------------
+    # AsProcWorldBase override
+    # -------------------------------------------------------------------------
+
+    def AppStart(self, Argc: int, Argv: list[str]) -> bool:
         """
-        C++: bool AppStart(int Argc, char** Argv)
+        프로세스 시작 진입점.
+
+        실행 모드 판별:
+          1. -sessionid 존재 → Alone 모드 (fork된 자식 세션)
+          2. -dbgwport 존재 → 일반 서버 모드 (Listen + Accept)
+          3. 둘 다 없음    → 사용법 출력 후 False 반환
+
+        Args:
+            Argc : sys.argv 길이
+            Argv : sys.argv 리스트
+
+        Returns:
+            True  : 정상 시작
+            False : 인자 오류 또는 포트 바인딩 실패
         """
-        # Argument Parsing
-        parser = argparse.ArgumentParser(description="DBGw Process")
-        parser.add_argument("-name", help="Process Name")
-        parser.add_argument("-sessionid", type=int, help="Socket FD for Child Process")
-        parser.add_argument("-dbgwport", type=int, help="Listen Port for Parent Process")
-        parser.add_argument("-alone", action="store_true", help="Run in detached/child mode")
-        parser.add_argument("-log", help="Logging option (off to disable)")
+        logger.setLevel(logging.DEBUG)   # frLogger::Enable("DBGwWorld", 5) 대응
 
-        # Parse known args to avoid erroring on unknown flags passed by framework
-        args, unknown = parser.parse_known_args()
+        args = ArgParser(Argv)
 
-        # -------------------------------------------------------
-        # Case 1: Child Process Mode (Session)
-        # -------------------------------------------------------
-        if args.sessionid:
-            ppid = os.getppid()
-            print(f"parentPID : {ppid}, sessionid : {args.sessionid}")
+        # 사용법 출력 (C++ -name 체크 대응)
+        if args.get_value("-name"):
+            print("\n[Usage] ./procNaDBGw -alone -name DB_GW "
+                  "-dbgwport 4100 -log (off) &\n")
 
-            # Create Session Instance
-            # Using default credentials/DB type as per C++ (eDB_ORACLE_OCI2)
-            session = DBGwServerSession(
-                eDB_TYPE.eDB_ORACLE_OCI2.value, "scott", "tiger", "orcl"
-            )
+        # ── Alone 모드 ──────────────────────────────────────────────────────
+        if args.does_it_exist("-sessionid"):
+            parent_pid = os.getppid()
+            session_id = int(args.get_value("-sessionid"))
+            logger.info("parentPID : %d, sessionid : %d", parent_pid, session_id)
 
-            session.m_IsAloneMode = True
+            session = DBGwServerSession(eDB_TYPE.eDB_ORACLE_OCI2)
+            session.m_IsAloneMode   = True
             session.m_IsLoggingMode = True
 
-            # Handle Log Option
-            if args.log:
-                if args.log.lower() == "off":
-                    session.m_IsLoggingMode = False
+            # -log off 처리
+            log_val = args.get_value("-log")
+            if log_val and log_val.upper() == "OFF":
+                session.m_IsLoggingMode = False
 
-            session.m_LogDir = self.log_dir
+            # 로그 디렉토리 설정 (BASE_MAINPTR->GetLogDir() 대응)
+            from Common.AsWorld import BASE_MAINPTR  # type: ignore
+            session.m_LogDir = BASE_MAINPTR().GetLogDir()
 
-            # Reconstruct Socket from File Descriptor (FD)
-            # This is critical for the child process to take over the connection
-            try:
-                # Assuming TCP Socket
-                client_sock = socket.fromfd(args.sessionid, socket.AF_INET, socket.SOCK_STREAM)
-                session.set_socket(client_sock, None) # Address not strictly needed here
-                
-                # session.Enable() equivalent
-                print(f"[Child] Session Started on FD {args.sessionid}")
-                
-                # Start Session Loop
-                # In C++, Enable() likely registers to a reactor. 
-                # In Python, we run a loop to read/process packets.
-                self.run_session_loop(session)
-                
-            except OSError as e:
-                print(f"[Error] Invalid Session FD: {e}")
-                return False
-
+            # 전달받은 FD로 소켓 세션 활성화
+            session.SetFD(session_id)
+            session.Enable()
             return True
 
-        # -------------------------------------------------------
-        # Case 2: Parent Process Mode (Manager)
-        # -------------------------------------------------------
-        if args.dbgwport:
-            db_gw_port = args.dbgwport
-        else:
-            print("\n")
-            print(f"## [Usage] {sys.argv[0]} -dbgwport 410x")
-            print("\n")
+        # ── 일반 서버 모드 ───────────────────────────────────────────────────
+        db_gw_port_str = args.get_value("-dbgwport")
+        if not db_gw_port_str:
+            print(f"\n## [Usage] {Argv[0]} -dbgwport 410x\n")
+            logger.error("## [Usage] %s -dbgwport 410x", Argv[0])
             return False
 
-        # Create Manager
-        gw = DBGwMgr(eDB_TYPE.eDB_ORACLE_OCI2.value, "scott", "tiger", "orcl")
+        db_gw_port = int(db_gw_port_str)
 
-        if gw.run(db_gw_port):
-            gw.set_log_dir(self.log_dir)
-            pid = FrUtilMisc.get_pid()
-            print(f"DBGwMgr Run Success (pid:{pid})(port:{db_gw_port})")
-            
-            # Run Main Loop
-            # This keeps the parent process alive to accept new connections
-            self.run_manager_loop(gw)
-            
+        gw = DBGwMgr(eDB_TYPE.eDB_ORACLE_OCI2)
+
+        if gw.Run(db_gw_port):
+            gw.SetLogDir(self.GetLogDir())
+            logger.debug("DBGwMgr Run Success (pid:%d)(port:%d)",
+                         os.getpid(), db_gw_port)
         else:
-            print(f"DBGwMgr Run Error(port:{db_gw_port})")
+            logger.error("DBGwMgr Run Error(port:%d) : %s",
+                         db_gw_port, gw.GetObjErrMsg())
             return False
 
         return True
-
-    def run_session_loop(self, session):
-        """
-        Simulates the event loop for a child session process.
-        """
-        try:
-            while True:
-                # Blocking read or use select/poll
-                # For simplicity, we assume packet reading logic exists in session
-                # In a real framework, this would be handled by AsSocket/Reactor
-                data = session.client_socket.recv(4096)
-                if not data:
-                    break
-                # Process raw data -> Packet -> receive_packet()
-                # Here we just print mock info
-                # session.receive_packet(...)
-        except Exception as e:
-            print(f"Session Loop Error: {e}")
-        finally:
-            session.close_socket(0)
-
-    def run_manager_loop(self, gw):
-        """
-        Simulates the main loop for the parent process.
-        """
-        try:
-            while True:
-                gw.accept_socket()
-                # Prevent CPU spin
-                time.sleep(0.01)
-        except KeyboardInterrupt:
-            print("Server Stopping...")
-
-# -------------------------------------------------------
-# Execution Entry Point (Equivalent to main.C usually linking this)
-# -------------------------------------------------------
-if __name__ == "__main__":
-    world = DBGwWorld()
-    world.app_start()

@@ -1,137 +1,493 @@
-import sys
+"""
+DBGwUser.py
+C++ DBGwUser.h/.C → Python 변환
+"""
+
 import os
-import struct
-import time
 import socket
+import struct
 import threading
+import logging
+from typing import Optional
 
-# -------------------------------------------------------
-# Project Path Setup
-# -------------------------------------------------------
-current_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.abspath(os.path.join(current_dir, '../..'))
-if project_root not in sys.path:
-    sys.path.append(project_root)
-
-try:
-    from Class.Sql.FrDbBaseType import (
-        eDB_TYPE, 
-        eDB_CHARACTER_SET, 
-        eQUERY_DATA_TYPE, 
-        eQUERY_JOIN_POSITION
-    )
-except ImportError:
-    print("[Error] FrDbBaseType Import Failed. Check the path.")
-    
-# Import definitions from DbCommon
-from Class.Common.DbCommon import (
-    DB_CONN_REQ, DB_CONN_RES, DB_CLOSE_REQ,
-    DB_QUERY_REQ, DB_QUERY_RES, DB_BULK_QUERY_DATA,
-    DB_COMMIT_REQ, DB_COMMIT_RES, DB_ROLLBACK_REQ, DB_ROLLBACK_RES,
+# 내부 모듈 import (변환 완료된 파일들)
+from libDBGw.libDBGwBase.DBGwType import (
+    DB_CONN_REQ_T, DB_CONN_RES_T,
+    DB_CLOSE_REQ_T,
+    DB_QUERY_REQ_T, DB_QUERY_RES_T,
+    DB_BULK_QUERY_DATA_T,
+    DB_COMMIT_RES_T, DB_ROLLBACK_RES_T,
+    DB_QUERY_LONG_UPDATE_REQ_T, DB_QUERY_LONG_UPDATE_RES_T,
+    PACKET_T,
+    eDB_TYPE, eQUERY_DATA_TYPE,
+    QueryResult,
+    DB_CONN_REQ, DB_CONN_RES,
+    DB_CLOSE_REQ,
+    DB_QUERY_REQ, DB_QUERY_RES,
+    DB_BULK_QUERY_DATA,
+    DB_COMMIT_REQ, DB_COMMIT_RES,
+    DB_ROLLBACK_REQ, DB_ROLLBACK_RES,
     DB_QUERY_LONG_UPDATE_REQ, DB_QUERY_LONG_UPDATE_RES,
-    QUERY_TYPE_SELECT, QUERY_TYPE_UPDATE, QUERY_TYPE_INSERT,
-    QUERY_REQ_TYPE_BULK, QUERY_REQ_TYPE_RS,
-    DbConnReqT, DbConnResT, DbCloseReqT,
-    DbQueryReqT, DbQueryResT, DbBulkQueryDataT,
-    DbCommitResT, DbRollbackResT,
-    DbQueryLongUpdateReqT, DbQueryLongUpdateResT,
-    MAX_DATA_SIZE
+    QUERY_TYPE_SELECT, QUERY_TYPE_UPDATE,
+    QUERY_REQ_TYPE_RS, QUERY_REQ_TYPE_BULK,
+    NO_SEG, SEG_ING, SEG_END,
+    MAX_DATA_SIZE,
+    frDbParam, frDbRecord,
 )
-from Class.Common.CommType import NO_SEG, SEG_ING, SEG_END
-
-# Import DBClientSocket
-from libDBGw.libDBGwClient.DBClientSocket import DBClientSocket
 from libDBGw.libDBGwClient.DBGwRecordSet import DBGwRecordSet
-from Class.Sql.FrDbBaseType import *
+from libDBGw.libDBGwClient.DBClientSocket import DBClientSocket
 
-# Mock Framework Imports (Replace with actual implementations)
-try:
-    from Class.Util.fr_util_misc import FrUtilMisc
-    from Class.Common.AsUtil import AsUtil
-    from Class.Sql.FrDbParam import FrDbParam, FrDbRecord
+logger = logging.getLogger(__name__)
 
-except ImportError:
-    class FrUtilMisc:
-        @staticmethod
-        def get_pid(): return os.getpid()
-        @staticmethod
-        def string_upper(s): return s.upper()
-
-    class AsUtil:
-        @staticmethod
-        def get_host_name(): return socket.gethostname()
-        @staticmethod
-        def get_local_ip(): return socket.gethostbyname(socket.gethostname())
-        @staticmethod
-        def get_user_name(): return os.getlogin()
-
-    class FrDbParam:
-        def __init__(self):
-            self.records = []
-            self.col_cnt = 0
-            self.row_cnt = 0
-        def set_col(self, col): self.col_cnt = col
-        def set_row(self, row): self.row_cnt = row
-        def add_record(self, record): self.records.append(record)
-        def get_value(self): return [rec.m_Values for rec in self.records]
-
-    class FrDbRecord:
-        def __init__(self):
-            self.m_Col = 0
-            self.m_Values = []
-
-class QueryResult:
-    """
-    Helper class to hold query results.
-    """
-    def __init__(self):
-        self.m_Result = 0
-        self.m_ErrorString = ""
-        self.m_ColCnt = 0
-        self.m_RowCnt = 0
-        self.m_Buf = []
-        self.m_Param = None
-
-    def free(self):
-        self.m_Param = None
-        self.m_Buf = []
 
 class DBGwUser:
     """
-    C++: DBGwUser
-    Manages DB Gateway connection, query execution, and transactions.
+    DB Gateway 클라이언트 사용자 클래스.
+    DBGateway 서버와 소켓 통신으로 DB 쿼리를 수행한다.
     """
-    def __init__(self):
-        self.m_DBClientSocket = None
-        self.m_IsOpen = False
-        self.m_QueryId = 0
 
-        self.m_DbGwIp = ""
-        self.m_DbGwPort = 0
-        self.m_DbUser = ""
-        self.m_DbPasswd = ""
-        self.m_DbName = ""
-        
-        self.m_Error = ""
-        self.m_DBType = eDB_TYPE.eDB_ORACLE_OCI2 # Default assumption
-        
-        self.m_SqlLock = threading.Lock()
+    def __init__(self) -> None:
+        self.m_DBClientSocket: Optional[DBClientSocket] = None
+        self.m_IsOpen: bool = False
+        self.m_QueryId: int = 0
 
-    def __del__(self):
-        self.close_db()
+        self.m_DbGwIp: str = ""
+        self.m_DbGwPort: int = 0
+        self.m_DbUser: str = ""
+        self.m_DbPasswd: str = ""
+        self.m_DbName: str = ""
+        self.m_DBType: eDB_TYPE = eDB_TYPE.eDB_NONE   # DBGwType에 정의된 기본값 사용
 
-    def connect(self, db_gw_ip="", db_gw_port=0, db_user="", db_passwd="", db_name=""):
+        self.m_Error: str = ""
+        self.m_SqlLock: threading.Lock = threading.Lock()
+
+    def __del__(self) -> None:
+        self.CloseDB()
+
+    # -------------------------------------------------------------------------
+    # Public API
+    # -------------------------------------------------------------------------
+
+    def Connect(self,
+                DbGwIp: str = "",
+                DbGwPort: int = 0,
+                DbUser: str = "",
+                DbPasswd: str = "",
+                DbName: str = "") -> bool:
         """
-        C++: bool Connect(...)
-        Establishes connection to the DB Gateway Server.
+        DB Gateway 서버에 연결한다.
+        인자 없이 호출 시 저장된 접속 정보로 재접속(reconnect)을 시도한다.
         """
-        # Handle overload / default params logic
-        if not db_gw_ip:
-            # Reconnect Logic
-            if self.m_DbGwIp and self.m_DbGwPort:
-                return self.connect(self.m_DbGwIp, self.m_DbGwPort, self.m_DbUser, self.m_DbPasswd, self.m_DbName)
+        # 인자가 없으면 저장된 접속 정보로 재접속
+        if not DbGwIp:
+            if (self.m_DbGwIp and self.m_DbGwPort
+                    and self.m_DbUser and self.m_DbPasswd and self.m_DbName):
+                return self._ConnectWithInfo(
+                    self.m_DbGwIp, self.m_DbGwPort,
+                    self.m_DbUser, self.m_DbPasswd, self.m_DbName
+                )
             return False
 
+        return self._ConnectWithInfo(DbGwIp, DbGwPort, DbUser, DbPasswd, DbName)
+
+    def CloseDB(self) -> bool:
+        """DB 연결을 종료한다."""
+        if self.m_DBClientSocket:
+            with self.m_SqlLock:
+                req = DB_CLOSE_REQ_T()
+                req.m_Req = 1
+                self.m_DBClientSocket.SendPacket(
+                    DB_CLOSE_REQ,
+                    req.pack(),
+                    req.size()
+                )
+                self.m_DBClientSocket = None
+        self.m_DBClientSocket = None
+        self.m_IsOpen = False
+        return True
+
+    def ReceivePacket(self, Packet: PACKET_T) -> None:
+        """패킷 수신 콜백 (필요 시 서브클래스에서 오버라이드)."""
+        pass
+
+    def CloseSession(self, nErrorCode: int) -> None:
+        """소켓 세션 종료 시 호출된다. 1회 재접속을 시도한다."""
+        with self.m_SqlLock:
+            logger.warning(
+                "Disconnected db session :(%s:%d:%s/%s@%s)",
+                self.m_DbGwIp, self.m_DbGwPort,
+                self.m_DbUser, self.m_DbPasswd, self.m_DbName
+            )
+            if self.m_DBClientSocket:
+                self.m_DBClientSocket = None
+            self.m_IsOpen = False
+
+        logger.info("Try reconnect db (only 1 time)")
+        ret = self.Connect()
+        logger.info("Try reconnect %s", "success" if ret else "fail")
+
+    def Execute(self, Query: str, AutoCommit: bool = True) -> bool:
+        """INSERT/UPDATE/DELETE 쿼리를 실행한다."""
+        with self.m_SqlLock:
+            return self._ExecuteNoLock(Query, AutoCommit)
+
+    def ExecuteRs(self, Query: str) -> Optional["DBGwRecordSet"]:
+        """SELECT 쿼리를 실행하고 DBGwRecordSet을 반환한다."""
+        with self.m_SqlLock:
+            if self.m_DBClientSocket is None:
+                if not self.Connect():
+                    return None
+
+            req = DB_QUERY_REQ_T()
+            req.m_QueryId    = self.m_QueryId
+            self.m_QueryId  += 1
+            req.m_QueryType  = QUERY_TYPE_SELECT
+            req.m_SegFlag    = NO_SEG
+            req.m_QueryReqType = QUERY_REQ_TYPE_RS
+            req.m_Query      = Query
+
+            res = DB_QUERY_RES_T()
+
+            if self.m_DBClientSocket.SendAndWaitPacket(
+                DB_QUERY_REQ, req.pack(), req.size(),
+                DB_QUERY_RES, res
+            ) > 0:
+                rs = DBGwRecordSet(self)
+                rs.m_IsValid  = bool(res.m_Result)
+                rs.m_Query    = Query
+                rs.m_QueryId  = res.m_QueryId
+
+                if rs.m_IsValid:
+                    rs.SetCol(res.m_ColCnt)
+                else:
+                    rs.m_Error = res.m_Error
+                return rs
+
+            return None
+
+    def SqlQuery(self,
+                 Query: str,
+                 Result: QueryResult,
+                 AdditionText: str = "") -> bool:
+        """
+        SELECT 쿼리를 실행하고 결과를 QueryResult에 저장한다.
+        INSERT/UPDATE/DELETE는 Execute로 위임한다.
+        긴 쿼리(> MAX_DATA_SIZE)는 세그먼트 분할 전송을 수행한다.
+        """
+        with self.m_SqlLock:
+            if self.m_DBClientSocket is None:
+                if not self.Connect():
+                    Result.m_ErrorString = self.m_Error
+                    return False
+
+            # DML 판별 (앞 6글자)
+            head = Query[:6].upper()
+            if head in ("INSERT", "UPDATE", "DELETE"):
+                ok = self._ExecuteNoLock(Query, False)
+                if ok:
+                    Result.m_Result = 1
+                else:
+                    Result.m_Result = 0
+                    Result.m_ErrorString = self.GetError()
+                return ok
+
+            # SELECT
+            req = DB_QUERY_REQ_T()
+            req.m_QueryId      = self.m_QueryId
+            self.m_QueryId    += 1
+            req.m_QueryType    = QUERY_TYPE_SELECT
+            req.m_SegFlag      = NO_SEG
+            req.m_QueryReqType = QUERY_REQ_TYPE_BULK
+
+            query_bytes = Query.encode("utf-8")
+            cnt = 0
+
+            # 긴 쿼리 분할 전송
+            if len(query_bytes) > MAX_DATA_SIZE - 1:
+                logger.debug("### long query start")
+                offset = 0
+                q_len  = len(query_bytes)
+
+                while q_len > 0:
+                    chunk = query_bytes[offset: offset + MAX_DATA_SIZE - 1]
+                    req.m_Query = chunk.decode("utf-8", errors="replace")
+                    offset += len(chunk)
+                    q_len  -= len(chunk)
+
+                    if q_len > 0:
+                        req.m_SegFlag = SEG_ING
+                        logger.debug("### long query send : %d", cnt)
+                        self.m_DBClientSocket.SendPacket(
+                            DB_QUERY_REQ, req.pack(), req.size()
+                        )
+                        cnt += 1
+                    else:
+                        req.m_SegFlag = SEG_END
+                        # 마지막 패킷은 아래 SendAndWaitPacket으로 전송
+            else:
+                req.m_Query = Query
+
+            res = DB_QUERY_RES_T()
+
+            if cnt > 0:
+                logger.debug("### long query send last : %d", cnt)
+
+            if self.m_DBClientSocket.SendAndWaitPacket(
+                DB_QUERY_REQ, req.pack(), req.size(),
+                DB_QUERY_RES, res
+            ) > 0:
+                Result.m_Result      = res.m_Result
+                Result.m_ErrorString = res.m_Error
+                self.m_Error         = Result.m_ErrorString
+
+                if res.m_Result == 1:
+                    Result.m_ColCnt = res.m_ColCnt
+                    Result.m_RowCnt = res.m_RowCnt
+
+                    if Result.m_RowCnt:
+                        # 분할 수신
+                        data_buf = bytearray()
+                        while True:
+                            qdata = DB_BULK_QUERY_DATA_T()
+                            if self.m_DBClientSocket.WaitPacket(
+                                DB_BULK_QUERY_DATA, qdata
+                            ) < 0:
+                                return False
+
+                            data_buf.extend(
+                                qdata.m_Data[:MAX_DATA_SIZE]
+                            )
+                            if qdata.m_SegFlag != SEG_ING:
+                                break
+
+                        return self._DecodeBulkData(Result, bytes(data_buf))
+
+                    return True
+                return False
+
+        return False
+
+    def Commit(self) -> bool:
+        """트랜잭션을 커밋한다."""
+        with self.m_SqlLock:
+            if not self._EnsureConnected():
+                return False
+
+            res = DB_COMMIT_RES_T()
+            if self.m_DBClientSocket.SendAndWaitPacket(
+                DB_COMMIT_REQ, b"", 0,
+                DB_COMMIT_RES, res
+            ) > 0:
+                self.m_Error = res.m_Error
+                return bool(res.m_Result)
+        return False
+
+    def RollBack(self) -> bool:
+        """트랜잭션을 롤백한다."""
+        with self.m_SqlLock:
+            if not self._EnsureConnected():
+                return False
+
+            res = DB_ROLLBACK_RES_T()
+            if self.m_DBClientSocket.SendAndWaitPacket(
+                DB_ROLLBACK_REQ, b"", 0,
+                DB_ROLLBACK_RES, res
+            ) > 0:
+                self.m_Error = res.m_Error
+                return bool(res.m_Result)
+        return False
+
+    def Free(self, Result: QueryResult) -> None:
+        """QueryResult 메모리를 해제한다."""
+        Result.Free()
+
+    def UpdateLong(self,
+                   Table: str,
+                   Field: str,
+                   Value: str,
+                   Where: str) -> bool:
+        """
+        LONG 타입 컬럼 UPDATE를 수행한다.
+        대용량 데이터를 세그먼트 분할 전송한다.
+        """
+        with self.m_SqlLock:
+            if not self._EnsureConnected():
+                return False
+
+            # 데이터 버퍼 구성 : [where_len(4)][where][value_len(4)][value]
+            where_b = Where.encode("utf-8")
+            value_b = Value.encode("utf-8")
+            data_buf = (
+                struct.pack("!I", len(where_b)) + where_b +
+                struct.pack("!I", len(value_b)) + value_b
+            )
+            total_size = len(data_buf)
+
+            qdata = DB_QUERY_LONG_UPDATE_REQ_T()
+            qdata.Table      = Table
+            qdata.Field      = Field
+            qdata.m_DataSize = total_size
+
+            qres  = DB_QUERY_LONG_UPDATE_RES_T()
+            offset = 0
+
+            while total_size > 0:
+                chunk = data_buf[offset: offset + MAX_DATA_SIZE]
+                qdata.m_Data = chunk
+
+                if total_size > MAX_DATA_SIZE:
+                    qdata.m_SegFlag = SEG_ING
+                    self.m_DBClientSocket.SendPacket(
+                        DB_QUERY_LONG_UPDATE_REQ,
+                        qdata.pack(),
+                        qdata.size()
+                    )
+                else:
+                    qdata.m_SegFlag = SEG_END
+                    self.m_DBClientSocket.SendAndWaitPacket(
+                        DB_QUERY_LONG_UPDATE_REQ,
+                        qdata.pack(),
+                        qdata.size(),
+                        DB_QUERY_LONG_UPDATE_RES,
+                        qres
+                    )
+
+                offset     += len(chunk)
+                total_size -= len(chunk)
+
+            self.m_Error = qres.m_Error
+            return bool(qres.m_Result)
+
+    def IsExistTable(self, TableName: str) -> bool:
+        """테이블 존재 여부를 확인한다."""
+        if self.m_DBClientSocket is None:
+            if not self.Connect():
+                return False
+
+        db_type = self.GetDbType()
+        if db_type in (eDB_TYPE.eDB_ORACLE_OCI_OLD,
+                       eDB_TYPE.eDB_ORACLE_OCI2,
+                       eDB_TYPE.eDB_ORACLE_ODBC):
+            query = (f"SELECT COUNT(*) FROM TAB "
+                     f"WHERE TNAME = '{TableName}'")
+        elif db_type in (eDB_TYPE.eDB_MSSQL_ODBC,
+                         eDB_TYPE.eDB_MYSQL):
+            query = (f"SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES "
+                     f"WHERE TABLE_NAME = '{TableName}'")
+        else:
+            return False
+
+        result = QueryResult()
+        if not self.SqlQuery(query, result):
+            return False
+
+        is_table = int(result.m_Buf[0][0])
+        self.Free(result)
+        return bool(is_table)
+
+    def GetError(self) -> str:
+        return self.m_Error
+
+    def IsConnect(self) -> bool:
+        if self.m_DBClientSocket:
+            return self.m_DBClientSocket.IsConnect()
+        return False
+
+    def GetDbType(self) -> eDB_TYPE:
+        return self.m_DBType
+
+    # -------------------------------------------------------------------------
+    # Query helper : INSERT/SELECT 용 DB별 SQL 표현식 생성
+    # -------------------------------------------------------------------------
+
+    def MakeQueryInsert(self,
+                        DataType: eQUERY_DATA_TYPE,
+                        Data: str) -> str:
+        """INSERT 쿼리에 사용할 DB 종류별 날짜/SYSDATE 표현식을 반환한다."""
+        out = ""
+        if DataType == eQUERY_DATA_TYPE.eDATE_TYPE:
+            if self.m_DBType in (eDB_TYPE.eDB_ORACLE_OCI2,
+                                  eDB_TYPE.eDB_ORACLE_OCI_OLD):
+                out = f"TO_DATE('{Data}', 'YYYY/MM/DD HH24:MI:SS')"
+            elif self.m_DBType == eDB_TYPE.eDB_MYSQL:
+                out = f"STR_TO_DATE('{Data}', '%Y/%m/%d %H:%i:%s')"
+            elif self.m_DBType == eDB_TYPE.eDB_MSSQL_ODBC:
+                out = f"'{Data}'"
+
+        elif DataType == eQUERY_DATA_TYPE.eSYSDATE:
+            if self.m_DBType in (eDB_TYPE.eDB_ORACLE_OCI2,
+                                  eDB_TYPE.eDB_ORACLE_OCI_OLD):
+                out = "SYSDATE"
+            elif self.m_DBType == eDB_TYPE.eDB_MYSQL:
+                out = "sysdate()"
+            elif self.m_DBType == eDB_TYPE.eDB_MSSQL_ODBC:
+                out = "not impl"
+
+        return out if out else "undefined dbtype or datatype"
+
+    def MakeQuerySelect(self,
+                        DataType: eQUERY_DATA_TYPE,
+                        Field: str) -> str:
+        """SELECT 쿼리에 사용할 DB 종류별 날짜/SYSDATE 표현식을 반환한다."""
+        out = ""
+        if DataType == eQUERY_DATA_TYPE.eDATE_TYPE:
+            if self.m_DBType in (eDB_TYPE.eDB_ORACLE_OCI2,
+                                  eDB_TYPE.eDB_ORACLE_OCI_OLD):
+                out = f"TO_CHAR({Field}, 'YYYY/MM/DD HH24:MI:SS')"
+            elif self.m_DBType == eDB_TYPE.eDB_MYSQL:
+                out = f"DATE_FORMAT({Field}, '%Y/%m/%d %H:%i:%s')"
+            elif self.m_DBType == eDB_TYPE.eDB_MSSQL_ODBC:
+                out = Field
+
+        elif DataType == eQUERY_DATA_TYPE.eSYSDATE:
+            if self.m_DBType in (eDB_TYPE.eDB_ORACLE_OCI2,
+                                  eDB_TYPE.eDB_ORACLE_OCI_OLD):
+                out = "SYSDATE"
+            elif self.m_DBType == eDB_TYPE.eDB_MYSQL:
+                out = "sysdate()"
+            elif self.m_DBType == eDB_TYPE.eDB_MSSQL_ODBC:
+                out = "not impl"
+
+        return out if out else "undefined dbtype or datatype"
+
+    # -------------------------------------------------------------------------
+    # RecordSet 데이터 디코딩 (DBGwRecordSet에서 호출)
+    # -------------------------------------------------------------------------
+
+    def DecodeRsData(self,
+                     ColCnt: int,
+                     Param: frDbParam,
+                     DataBuf: bytes) -> frDbRecord:
+        """
+        바이너리 버퍼에서 단일 레코드를 디코딩하여 Param에 추가하고 반환한다.
+        각 컬럼 : [col_data_size(4, network order)][col_data(col_data_size)]
+        """
+        offset = 0
+        record = frDbRecord()
+        record.m_Col    = ColCnt
+        record.m_Values = []
+
+        for _ in range(ColCnt):
+            col_size = struct.unpack_from("!I", DataBuf, offset)[0]
+            offset  += 4
+            value    = DataBuf[offset: offset + col_size].decode("utf-8", errors="replace")
+            offset  += col_size
+            record.m_Values.append(value)
+
+        Param.AddRecord(record)
+        return record
+
+    # -------------------------------------------------------------------------
+    # Protected helpers
+    # -------------------------------------------------------------------------
+
+    def _ConnectWithInfo(self,
+                         DbGwIp: str,
+                         DbGwPort: int,
+                         DbUser: str,
+                         DbPasswd: str,
+                         DbName: str) -> bool:
+        """실제 접속 처리 (인자 포함)."""
         with self.m_SqlLock:
             if self.m_IsOpen:
                 self.m_Error = "Already Open"
@@ -144,502 +500,111 @@ class DBGwUser:
             self.m_IsOpen = False
             self.m_DBClientSocket = DBClientSocket(self)
 
-            # Python socket creation is implicit in connect logic usually, but mimicking structure
-            # self.m_DBClientSocket.Create() -> handled in __init__ or connect
-
-            if not self.m_DBClientSocket.connect(db_gw_ip, db_gw_port):
-                self.m_Error = f"DB GW Connect Error({self.m_DBClientSocket.get_last_error()})" # Assuming get_last_error
-                self.m_DBClientSocket = None
+            if not self.m_DBClientSocket.Create():
+                self.m_Error = "DB GW Socket Create Error"
                 return False
 
-            # Prepare Connection Request
-            req = DbConnReqT()
-            req.DbUser = db_user
-            req.DbPasswd = db_passwd
-            req.DbName = db_name
-            self.get_local_info(req)
-
-            res = DbConnResT()
-            
-            # AsSocketDisableGuard equivalent logic
-            self.m_DBClientSocket.disable()
-            
-            try:
-                ret = self.m_DBClientSocket.send_and_wait_packet(
-                    DB_CONN_REQ, req, DB_CONN_RES, res
+            if not self.m_DBClientSocket.Connect(DbGwIp, DbGwPort):
+                self.m_Error = (
+                    f"DB GW Connect Error({self.m_DBClientSocket.GetObjErrMsg()})"
                 )
-                
-                if ret > 0:
-                    self.m_Error = res.m_Error
-                    self.m_IsOpen = True if res.m_Result else False
-
-                    if self.m_IsOpen:
-                        self.m_DbGwIp = db_gw_ip
-                        self.m_DbGwPort = db_gw_port
-                        self.m_DbUser = db_user
-                        self.m_DbPasswd = db_passwd
-                        self.m_DbName = db_name
-                        return True
-                    else:
-                         return False
-                else:
-                    self.m_DBClientSocket = None
-                    return False
-            finally:
-                pass # Guard destruction logic handled if using 'with' context, or manual re-enable
-
-    def get_local_info(self, req):
-        """C++: bool GetLocalInfo(DB_CONN_REQ_T& ConReq)"""
-        req.HostName = AsUtil.get_host_name()
-        req.HostIp = AsUtil.get_local_ip()
-        req.UserId = AsUtil.get_user_name()
-        req.ProcPid = FrUtilMisc.get_pid()
-        return True
-
-    def close_db(self):
-        """C++: bool CloseDB()"""
-        if self.m_DBClientSocket:
-            with self.m_SqlLock:
-                req = DbCloseReqT()
-                req.m_Req = 1
-                self.m_DBClientSocket.send_packet(DB_CLOSE_REQ, req)
-                # self.m_DBClientSocket.close() # Usually called
                 self.m_DBClientSocket = None
-        
-        self.m_IsOpen = False
-        return True
-
-    def receive_packet(self, packet):
-        pass
-
-    def close_session(self, n_error_code):
-        """C++: void CloseSession(int nErrorCode)"""
-        with self.m_SqlLock:
-            print(f"Disconnected db session :({self.m_DbGwIp}:{self.m_DbGwPort}...)")
-            
-            self.m_DBClientSocket = None
-            self.m_IsOpen = False
-            
-            print("Try reconnect db (only 1 time)")
-            ret = self.connect()
-            print(f"Try reconnect {'success' if ret else 'fail'}")
-
-    def execute_rs(self, query):
-        """
-        C++: DBGwRecordSet* ExecuteRs(char* Query)
-        Executes a Select query and returns a RecordSet cursor.
-        """
-        with self.m_SqlLock:
-            if not self.m_DBClientSocket:
-                if not self.connect(): return None
-
-            req = DbQueryReqT()
-            req.m_QueryId = self.m_QueryId
-            self.m_QueryId += 1
-            req.m_QueryType = QUERY_TYPE_SELECT
-            req.m_SegFlag = NO_SEG
-            req.m_QueryReqType = QUERY_REQ_TYPE_RS
-            req.m_Query = query
-
-            res = DbQueryResT()
-            
-            self.m_DBClientSocket.disable()
-            
-            if self.m_DBClientSocket.send_and_wait_packet(
-                DB_QUERY_REQ, req, DB_QUERY_RES, res
-            ) > 0:
-                rs = DBGwRecordSet(self)
-                rs.m_IsValid = True if res.m_Result else False
-                rs.m_Query = query
-                rs.m_QueryId = res.m_QueryId
-                
-                if rs.m_IsValid:
-                    rs.set_col(res.m_ColCnt)
-                else:
-                    rs.m_Error = res.m_Error
-                
-                return rs
-            else:
-                return None
-
-    def sql_query(self, query, result, addition_text=""):
-        """
-        C++: bool SqlQuery(...)
-        Executes a query and fetches results (Bulk).
-        Handles Long Query Segmentation.
-        """
-        with self.m_SqlLock:
-            if not self.m_DBClientSocket:
-                if not self.connect():
-                    result.m_ErrorString = self.m_Error
-                    return False
-
-            # Check Query Type (INSERT/UPDATE/DELETE handled separately)
-            tmp_query = FrUtilMisc.string_upper(query.strip())
-            if tmp_query.startswith("INSERT") or tmp_query.startswith("UPDATE") or tmp_query.startswith("DELETE"):
-                res = self.execute_no_lock(query, False)
-                if res:
-                    result.m_Result = 1
-                else:
-                    result.m_Result = 0
-                    result.m_ErrorString = self.get_error()
-                return res
-
-            # Select Query Preparation
-            req = DbQueryReqT()
-            req.m_QueryId = self.m_QueryId
-            self.m_QueryId += 1
-            req.m_QueryType = QUERY_TYPE_SELECT
-            req.m_SegFlag = NO_SEG
-            req.m_QueryReqType = QUERY_REQ_TYPE_BULK
-
-            # Long Query Handling
-            query_len = len(query)
-            if query_len > MAX_DATA_SIZE - 1:
-                # Segmented Sending
-                offset = 0
-                cnt = 0
-                while offset < query_len:
-                    chunk_size = min(MAX_DATA_SIZE - 1, query_len - offset)
-                    req.m_Query = query[offset : offset + chunk_size]
-                    
-                    offset += chunk_size
-                    
-                    if offset < query_len:
-                        req.m_SegFlag = SEG_ING
-                        print(f"### long query send : {cnt}")
-                        self.m_DBClientSocket.send_packet(DB_QUERY_REQ, req)
-                        cnt += 1
-                    else:
-                        req.m_SegFlag = SEG_END
-                        # Last chunk is sent via SendAndWait below
-                        break
-            else:
-                req.m_Query = query
-
-            res = DbQueryResT()
-            self.m_DBClientSocket.disable()
-
-            if self.m_DBClientSocket.send_and_wait_packet(
-                DB_QUERY_REQ, req, DB_QUERY_RES, res
-            ) > 0:
-                result.m_Result = res.m_Result
-                result.m_ErrorString = res.m_Error
-                self.m_Error = res.m_Error
-                
-                if res.m_Result == 1:
-                    result.m_ColCnt = res.m_ColCnt
-                    result.m_RowCnt = res.m_RowCnt
-                    
-                    if result.m_RowCnt > 0:
-                        # Receive Bulk Data
-                        data_buf = bytearray()
-                        bulk_data = DbBulkQueryDataT()
-                        
-                        while True:
-                            # Reset struct
-                            bulk_data = DbBulkQueryDataT() 
-                            if self.m_DBClientSocket.wait_packet(DB_BULK_QUERY_DATA, bulk_data) < 0:
-                                return False
-                            
-                            # Assuming m_Data comes as bytes
-                            data_buf.extend(bulk_data.m_Data)
-                            
-                            if bulk_data.m_SegFlag != SEG_ING:
-                                break
-                        
-                        if self.decode_bulk_data(result, data_buf):
-                            return True
-                        return False
-                    return True
                 return False
-            return False
 
-    def decode_bulk_data(self, result, data_buf):
-        """
-        C++: bool DecodeBulkData(...)
-        Decodes the binary result stream into FrDbParam/FrDbRecord structures.
-        """
-        result.m_Param = FrDbParam()
-        result.m_Param.set_col(result.m_ColCnt)
-        
-        offset = 0
-        buf_len = len(data_buf)
-        
-        for _ in range(result.m_RowCnt):
-            record = FrDbRecord()
-            record.m_Col = result.m_ColCnt
-            record.m_Values = [] # List of strings/bytes
-            
-            for _ in range(result.m_ColCnt):
-                # Read Length (4 bytes)
-                if offset + 4 > buf_len: return False
-                
-                # ntohl is implicitly handled if data was packed with big-endian
-                # Here we assume standard packing
-                col_len = struct.unpack('>I', data_buf[offset:offset+4])[0]
-                offset += 4
-                
-                # Read Data
-                if offset + col_len > buf_len: return False
-                val = data_buf[offset : offset + col_len].decode('utf-8', errors='ignore') # Or bytes
-                record.m_Values.append(val)
-                offset += col_len
-                
-            result.m_Param.add_record(record)
-            
-        result.m_Param.set_row(result.m_RowCnt)
-        result.m_Buf = result.m_Param.get_value()
+            # 접속 요청 패킷 구성
+            con_req = DB_CONN_REQ_T()
+            con_req.DbUser   = DbUser
+            con_req.DbPasswd = DbPasswd
+            con_req.DbName   = DbName
+            self._GetLocalInfo(con_req)
+
+            con_res = DB_CONN_RES_T()
+
+            if self.m_DBClientSocket.SendAndWaitPacket(
+                DB_CONN_REQ, con_req.pack(), con_req.size(),
+                DB_CONN_RES, con_res
+            ) > 0:
+                self.m_Error   = con_res.m_Error
+                self.m_IsOpen  = bool(con_res.m_Result)
+
+                self.m_DbGwIp  = DbGwIp
+                self.m_DbGwPort = DbGwPort
+                self.m_DbUser   = DbUser
+                self.m_DbPasswd = DbPasswd
+                self.m_DbName   = DbName
+                return bool(con_res.m_Result)
+
+            self.m_DBClientSocket = None
+        return False
+
+    def _GetLocalInfo(self, ConReq: DB_CONN_REQ_T) -> bool:
+        """로컬 호스트/IP/유저/PID 정보를 접속 요청 구조체에 채운다."""
+        ConReq.HostName = socket.gethostname()
+        try:
+            ConReq.HostIp = socket.gethostbyname(socket.gethostname())
+        except socket.gaierror:
+            ConReq.HostIp = "127.0.0.1"
+        ConReq.UserId  = os.environ.get("USER", os.environ.get("USERNAME", ""))
+        ConReq.ProcPid = os.getpid()
         return True
 
-    def decode_rs_data(self, col_cnt, param, data_buf):
-        """
-        C++: frDbRecord* DecodeRsData(...)
-        Decodes a single row for RecordSet.
-        """
-        offset = 0
-        buf_len = len(data_buf)
-        
-        record = FrDbRecord()
-        record.m_Col = col_cnt
-        record.m_Values = []
-        
-        for _ in range(col_cnt):
-            if offset + 4 > buf_len: return None
-            col_len = struct.unpack('>I', data_buf[offset:offset+4])[0]
-            offset += 4
-            
-            if offset + col_len > buf_len: return None
-            val = data_buf[offset : offset + col_len].decode('utf-8', errors='ignore')
-            record.m_Values.append(val)
-            offset += col_len
-            
-        param.add_record(record)
-        return record
+    def _EnsureConnected(self) -> bool:
+        """소켓이 없으면 재접속을 시도한다. Lock 내부에서 호출할 것."""
+        if self.m_DBClientSocket is None:
+            return self.Connect()
+        return True
 
-    def execute_no_lock(self, query, auto_commit):
-        """
-        C++: bool ExecuteNoLock(...)
-        """
-        if not self.m_DBClientSocket:
-            if not self.connect(): return False
+    def _ExecuteNoLock(self, Query: str, AutoCommit: bool) -> bool:
+        """Lock 없이 DML 쿼리를 실행한다. (SqlQuery/Execute 내부 전용)"""
+        if self.m_DBClientSocket is None:
+            if not self.Connect():
+                return False
 
-        req = DbQueryReqT()
-        req.m_QueryId = self.m_QueryId
+        req = DB_QUERY_REQ_T()
+        req.m_QueryId   = self.m_QueryId
         self.m_QueryId += 1
-        req.m_QueryType = QUERY_TYPE_UPDATE # UPDATE/INSERT
-        req.m_SegFlag = NO_SEG
-        req.m_Commit = 1 if auto_commit else 2
-        req.m_Query = query
-        
-        res = DbQueryResT()
-        self.m_DBClientSocket.disable()
-        
-        if self.m_DBClientSocket.send_and_wait_packet(
-            DB_QUERY_REQ, req, DB_QUERY_RES, res
+        req.m_QueryType = QUERY_TYPE_UPDATE
+        req.m_SegFlag   = NO_SEG
+        req.m_Commit    = 1 if AutoCommit else 2
+        req.m_Query     = Query
+
+        res = DB_QUERY_RES_T()
+
+        if self.m_DBClientSocket.SendAndWaitPacket(
+            DB_QUERY_REQ, req.pack(), req.size(),
+            DB_QUERY_RES, res
         ) > 0:
             self.m_Error = res.m_Error
-            return True if res.m_Result else False
+            return bool(res.m_Result)
         return False
 
-    def execute(self, query, auto_commit):
-        with self.m_SqlLock:
-            return self.execute_no_lock(query, auto_commit)
-
-    def commit(self):
-        with self.m_SqlLock:
-            if not self.m_DBClientSocket:
-                if not self.connect(): return False
-            
-            res = DbCommitResT()
-            self.m_DBClientSocket.disable()
-            
-            if self.m_DBClientSocket.send_and_wait_packet(
-                DB_COMMIT_REQ, None, DB_COMMIT_RES, res
-            ) > 0:
-                self.m_Error = res.m_Error
-                return True if res.m_Result else False
-            return False
-
-    def rollback(self):
-        with self.m_SqlLock:
-            if not self.m_DBClientSocket:
-                if not self.connect(): return False
-            
-            res = DbRollbackResT()
-            self.m_DBClientSocket.disable()
-            
-            if self.m_DBClientSocket.send_and_wait_packet(
-                DB_ROLLBACK_REQ, None, DB_ROLLBACK_RES, res
-            ) > 0:
-                self.m_Error = res.m_Error
-                return True if res.m_Result else False
-            return False
-
-    def update_long(self, table, field, value, where):
+    def _DecodeBulkData(self,
+                        Result: QueryResult,
+                        DataBuf: bytes) -> bool:
         """
-        C++: bool UpdateLong(...)
-        Handles CLOB/BLOB updates by sending segmented data.
+        바이너리 버퍼에서 전체 레코드셋을 디코딩하여 QueryResult에 저장한다.
+        각 컬럼 : [col_data_size(4, network order)][col_data(col_data_size)]
         """
-        with self.m_SqlLock:
-            if not self.m_DBClientSocket:
-                if not self.connect(): return False
-            
-            req = DbQueryLongUpdateReqT()
-            req.Table = table
-            req.Field = field
-            
-            # Pack Where & Value into binary
-            # Structure: [WhereLen][Where][ValueLen][Value]
-            packed_data = bytearray()
-            
-            where_bytes = where.encode('utf-8')
-            value_bytes = value.encode('utf-8')
-            
-            packed_data.extend(struct.pack('>I', len(where_bytes)))
-            packed_data.extend(where_bytes)
-            packed_data.extend(struct.pack('>I', len(value_bytes)))
-            packed_data.extend(value_bytes)
-            
-            total_size = len(packed_data)
-            req.m_DataSize = total_size
-            
-            res = DbQueryLongUpdateResT()
-            self.m_DBClientSocket.disable()
-            
-            # Segmented Sending Loop
-            offset = 0
-            while offset < total_size:
-                # Clear m_Data logic handled by creating new req/assigning
-                # In Python we just overwrite the field
-                
-                remaining = total_size - offset
-                
-                if remaining > MAX_DATA_SIZE:
-                    req.m_SegFlag = SEG_ING
-                    req.m_Data = packed_data[offset : offset + MAX_DATA_SIZE]
-                    offset += MAX_DATA_SIZE
-                    
-                    self.m_DBClientSocket.send_packet(DB_QUERY_LONG_UPDATE_REQ, req)
-                else:
-                    req.m_SegFlag = SEG_END
-                    req.m_Data = packed_data[offset:]
-                    offset += remaining
-                    
-                    self.m_DBClientSocket.send_and_wait_packet(
-                        DB_QUERY_LONG_UPDATE_REQ, req, DB_QUERY_LONG_UPDATE_RES, res
-                    )
-            
-            self.m_Error = res.m_Error
-            return True if res.m_Result else False
+        Result.m_Param = frDbParam()
+        Result.m_Param.SetCol(Result.m_ColCnt)
 
-    def get_error(self):
-        return self.m_Error
+        offset = 0
+        for _ in range(Result.m_RowCnt):
+            record = frDbRecord()
+            record.m_Col    = Result.m_ColCnt
+            record.m_Values = []
 
-    def make_query_insert(self, data_type, data):
-        """
-        C++: string MakeQueryInsert(eQUERY_DATA_TYPE DataType, string Data)
-        """
-        out_query = ""
-        
-        # [변경] eQUERY_DATA_TYPE Enum 사용
-        if data_type == eQUERY_DATA_TYPE.eDATE_TYPE:
-            # [변경] eDB_TYPE Enum 비교
-            if self.m_DBType in (eDB_TYPE.eDB_ORACLE_OCI2, eDB_TYPE.eDB_ORACLE_OCI_OLD):
-                out_query = f"TO_DATE('{data}', 'YYYY/MM/DD HH24:MI:SS')"
-            elif self.m_DBType == eDB_TYPE.eDB_MYSQL:
-                out_query = f"STR_TO_DATE('{data}', '%Y/%m/%d %H:%i:%s')"
-            elif self.m_DBType == eDB_TYPE.eDB_MSSQL_ODBC:
-                out_query = f"'{data}'"
-        
-        elif data_type == eQUERY_DATA_TYPE.eSYSDATE:
-            if self.m_DBType in (eDB_TYPE.eDB_ORACLE_OCI2, eDB_TYPE.eDB_ORACLE_OCI_OLD):
-                out_query = "SYSDATE"
-            elif self.m_DBType == eDB_TYPE.eDB_MYSQL:
-                out_query = "sysdate()"
-            elif self.m_DBType == eDB_TYPE.eDB_MSSQL_ODBC:
-                out_query = "not impl"
+            for _ in range(Result.m_ColCnt):
+                col_size = struct.unpack_from("!I", DataBuf, offset)[0]
+                offset  += 4
+                value    = DataBuf[offset: offset + col_size].decode(
+                    "utf-8", errors="replace"
+                )
+                offset  += col_size
+                record.m_Values.append(value)
 
-        if not out_query:
-            out_query = "undefined dbtype or datatype"
-            
-        return out_query
-    
-    def make_query_select(self, data_type, field):
-        """
-        C++: string MakeQuerySelect(eQUERY_DATA_TYPE DataType, string Field)
-        """
-        out_query = ""
+            Result.m_Param.AddRecord(record)
 
-        # [변경] Enum 사용
-        if data_type == eQUERY_DATA_TYPE.eDATE_TYPE:
-            if self.m_DBType in (eDB_TYPE.eDB_ORACLE_OCI2, eDB_TYPE.eDB_ORACLE_OCI_OLD):
-                out_query = f"TO_CHAR({field}, 'YYYY/MM/DD HH24:MI:SS')"
-            elif self.m_DBType == eDB_TYPE.eDB_MYSQL:
-                out_query = f"DATE_FORMAT({field}, '%Y/%m/%d %H:%i:%s')"
-            elif self.m_DBType == eDB_TYPE.eDB_MSSQL_ODBC:
-                out_query = field
-        
-        elif data_type == eQUERY_DATA_TYPE.eSYSDATE:
-            if self.m_DBType in (eDB_TYPE.eDB_ORACLE_OCI2, eDB_TYPE.eDB_ORACLE_OCI_OLD):
-                out_query = "SYSDATE"
-            elif self.m_DBType == eDB_TYPE.eDB_MYSQL:
-                out_query = "sysdate()"
-            elif self.m_DBType == eDB_TYPE.eDB_MSSQL_ODBC:
-                out_query = "not impl"
-
-        if not out_query:
-            out_query = "undefined dbtype or datatype"
-
-        return out_query
-    
-    def is_exist_table(self, table_name):
-        """
-        C++: bool IsExistTable(string TableName)
-        """
-        if not self.m_DBClientSocket:
-            if not self.connect():
-                return False
-
-        query = ""
-        # [변경] getter를 사용하거나 직접 접근
-        db_type = self.m_DBType 
-
-        # [변경] Enum 사용
-        if db_type in (eDB_TYPE.eDB_ORACLE_OCI_OLD, eDB_TYPE.eDB_ORACLE_OCI2, eDB_TYPE.eDB_ORACLE_ODBC):
-            query = f"SELECT COUNT(*) FROM TAB WHERE TNAME = '{table_name}'"
-            
-        elif db_type in (eDB_TYPE.eDB_MSSQL_ODBC, eDB_TYPE.eDB_MYSQL):
-            query = f"SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = '{table_name}'"
-            
-        else:
-            return False
-
-        # (이하 쿼리 실행 및 결과 처리 로직은 동일)
-        result = QueryResult()
-        if not self.sql_query(query, result):
-            return False
-
-        is_table = 0
-        try:
-            if result.m_Buf and len(result.m_Buf) > 0 and len(result.m_Buf[0]) > 0:
-                is_table = int(result.m_Buf[0][0])
-        except (ValueError, IndexError, TypeError):
-            is_table = 0
-
-        self.free(result)
-        return True if is_table > 0 else False
-
-    def is_connect(self):
-        """
-        C++: bool IsConnect()
-        """
-        if self.m_DBClientSocket:
-            return self.m_DBClientSocket.is_connect() # Assuming Socket wrapper has is_connect
-        return False
-
-    def get_db_type(self):
-        """
-        C++: eDB_TYPE GetDbType()
-        """
-        return self.m_DBType
+        Result.m_Param.SetRow(Result.m_RowCnt)
+        Result.m_Buf = Result.m_Param.GetValue()
+        return True

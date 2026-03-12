@@ -1,65 +1,54 @@
-import sys
-import os
+# -*- coding: utf-8 -*-
+"""
+DBClientSocket.h / DBClientSocket.C  →  DBClientSocket.py
+Python 3.11.10 변환
 
-# -------------------------------------------------------
-# Project Path Setup
-# -------------------------------------------------------
-current_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.abspath(os.path.join(current_dir, '../..'))
-if project_root not in sys.path:
-    sys.path.append(project_root)
+변환 설계:
+  DBClientSocket → DBClientSocket  (DBGwBaseSocket 상속)
 
-# Import Parent Class
-# DBClientSocket usually inherits from DBGwBaseSocket (for byte swapping) 
-# or AsSocket (base socket). Based on Makefile dependency, likely DBGwBaseSocket.
-try:
-    from libDBGw.libDBGwBase.DBGwBaseSocket import DBGwBaseSocket
-except ImportError:
-    # Fallback for compilation/linting if dependencies aren't perfect
-    class DBGwBaseSocket:
-        def disable(self): pass
-        def close(self): pass
+C++ → Python 주요 변환 포인트:
+  Disable()                  → self.disable()  (생성자에서 호출)
+  ReceivePacket(PACKET_T*)   → receive_packet(packet, session_identify)
+  CloseSocket(int)           → close_socket(errno_val)
+  Close()                    → self.close()
+  m_DbGwUser->ReceivePacket  → self._db_gw_user.receive_packet(packet)
+  m_DbGwUser->CloseSession   → self._db_gw_user.close_session(errno_val)
+  DBGwUser*                  → TYPE_CHECKING 전용 임포트 (순환 참조 방지)
+
+변경 이력:
+  2014.07.08  초기 작성 (C++ 원본)
+  Python 변환
+"""
+
+import logging
+from typing import TYPE_CHECKING
+
+from libDBGw.libDBGwBase.DBGwBaseSocket import DBGwBaseSocket
+from Common.CommType import PacketT
+
+if TYPE_CHECKING:
+    from libDBGw.libDBGwClient.DBGwUser import DBGwUser
+
+logger = logging.getLogger(__name__)
+
 
 class DBClientSocket(DBGwBaseSocket):
     """
-    C++: DBClientSocket
-    Handles client-side socket operations.
-    Acts as a wrapper that delegates actual processing to DBGwUser.
+    C++ DBClientSocket 대응.
+    DB Gateway 클라이언트 소켓.
+    수신 패킷과 소켓 종료 이벤트를 DBGwUser 로 위임한다.
     """
-    def __init__(self, gw_user):
-        """
-        C++: DBClientSocket(DBGwUser* GwUser)
-        """
+
+    def __init__(self, gw_user: 'DBGwUser') -> None:
         super().__init__()
-        
-        # Pointer to the User/Session logic that owns this socket
-        self.m_DbGwUser = gw_user
-        
-        # Start in disabled state (as per C++ source)
+        self._db_gw_user = gw_user
         self.disable()
 
-    def __del__(self):
-        """
-        C++: ~DBClientSocket()
-        """
-        self.m_DbGwUser = None
+    def receive_packet(self, packet: PacketT, session_identify: int = -1) -> None:
+        """C++ ReceivePacket() 대응. DBGwUser 로 패킷 위임."""
+        self._db_gw_user.receive_packet(packet)
 
-    def receive_packet(self, packet, session_identify=0):
-        """
-        C++: void ReceivePacket(PACKET_T* Packet, const int SessionIdentify)
-        Delegates packet processing to the DBGwUser instance.
-        """
-        if self.m_DbGwUser:
-            self.m_DbGwUser.receive_packet(packet)
-
-    def close_socket(self, n_error_code):
-        """
-        C++: void CloseSocket(int nErrorCode)
-        Handles socket closure and notifies the user.
-        """
-        # Close the physical socket (Parent method)
+    def close_socket(self, errno_val: int) -> None:
+        """C++ CloseSocket() 대응. 소켓 닫고 DBGwUser 세션 종료 통보."""
         self.close()
-        
-        # Notify the user logic that the session is closed
-        if self.m_DbGwUser:
-            self.m_DbGwUser.close_session(n_error_code)
+        self._db_gw_user.close_session(errno_val)

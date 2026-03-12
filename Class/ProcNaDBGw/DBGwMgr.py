@@ -1,125 +1,131 @@
-import sys
+"""
+DBGwMgr.py
+C++ DBGwMgr.h/.C → Python 변환
+
+DBGwServerMgr를 상속하여 AcceptSession()을 오버라이드한다.
+클라이언트 접속 시 fork() 대신 multiprocessing.Process로 자식 프로세스를 생성하고,
+자식은 동일 실행 파일(DBGwWorld.AppStart)을 -alone/-sessionid 인자로 재실행한다.
+"""
+
 import os
+import sys
 import signal
-import socket
+import logging
+import multiprocessing
+from typing import TYPE_CHECKING
 
-# -------------------------------------------------------
-# Project Path Setup
-# -------------------------------------------------------
-current_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.abspath(os.path.join(current_dir, '../..'))
-if project_root not in sys.path:
-    sys.path.append(project_root)
+from libDBGw.libDBGwSvr.DBGwServerMgr import DBGwServerMgr
+from libDBGw.libDBGwSvr.DBGwServerSession import DBGwServerSession
 
-# Import ServerMgr
-try:
-    from Class.libDBGw.libDBGwSvr.DBGwServerMgr import DBGwServerMgr
-except ImportError:
-    # Fallback if dependencies are missing
-    class DBGwServerMgr:
-        def __init__(self, k, u, p, n): pass
+if TYPE_CHECKING:
+    pass
+
+logger = logging.getLogger(__name__)
+
 
 class DBGwMgr(DBGwServerMgr):
     """
-    C++: DBGwMgr
-    Manages the Gateway Process.
-    Uses Fork-Exec model to handle sessions in separate processes.
-    """
-    def __init__(self, db_kind, default_db_user, default_db_passwd, default_db_name):
-        """
-        C++: DBGwMgr(...) : DBGwServerMgr(...)
-        """
-        super().__init__(db_kind, default_db_user, default_db_passwd, default_db_name)
-        
-        # C++: signal(SIGCHLD, SIG_IGN);
-        # Prevent Zombie processes by ignoring SIGCHLD
-        if sys.platform != 'win32':
-            signal.signal(signal.SIGCHLD, signal.SIG_IGN)
+    DB Gateway 서버 관리자 (애플리케이션 레벨).
 
-    def __del__(self):
+    AcceptSession()에서 클라이언트 연결마다 자식 프로세스를 생성한다.
+
+    C++ fork()/execv() 패턴 → Python multiprocessing.Process + os.execv() 로 변환.
+    SIGCHLD SIG_IGN → multiprocessing 에서는 daemon=False + 좀비 방지 설정으로 대응.
+    """
+
+    def __init__(self,
+                 DbKind: int,
+                 DefaultDbUser: str = "",
+                 DefaultDbPasswd: str = "",
+                 DefaultDbName: str = "") -> None:
+        super().__init__(DbKind, DefaultDbUser, DefaultDbPasswd, DefaultDbName)
+
+        # C++ : signal(SIGCHLD, SIG_IGN) → 자식 프로세스 좀비 방지
+        # Python : multiprocessing.Process(daemon=True) 또는 signal 설정
+        try:
+            signal.signal(signal.SIGCHLD, signal.SIG_IGN)
+        except (OSError, ValueError):
+            # Windows 또는 메인 스레드 외에서 호출 시 무시
+            pass
+
+    def __del__(self) -> None:
         pass
 
-    def accept_session(self, session):
+    # -------------------------------------------------------------------------
+    # DBGwServerMgr override
+    # -------------------------------------------------------------------------
+
+    def AcceptSession(self, Session: DBGwServerSession) -> bool:
         """
-        C++: bool AcceptSession(DBGwServerSession* Session)
-        Forks a new process to handle the session.
-        The child process re-executes the script with '-alone' and '-sessionid' arguments.
+        클라이언트 세션 수락 후 자식 프로세스를 생성한다.
+
+        C++ 동작:
+          - fork() 후 자식에서 execv()로 자기 자신을 -alone -sessionid <fd> 옵션으로 재실행
+          - 부모는 true 반환 → AcceptSocket()이 session 자원 해제
+
+        Python 변환:
+          - Session 소켓 FD를 자식 프로세스에 상속 가능하도록 CloseOnExec=False 설정
+          - multiprocessing.Process로 자식 프로세스 생성
+          - 자식은 os.execv()로 동일 인터프리터+스크립트를 -alone -sessionid <fd>로 재실행
+          - 부모는 True 반환 → AcceptSocket()이 session 참조 해제
+
+        Returns:
+            True : 항상 (부모 프로세스 기준) → AcceptSocket()이 session 해제
         """
-        # Windows does not support fork().
-        if sys.platform == 'win32':
-            print("Windows does not support fork(). Single process mode suggested.")
-            return False
+        # FD를 자식에게 상속하기 위해 close-on-exec 해제
+        Session.SetCloseOnExec(False)
+        fd  = Session.GetFD()
+        pid = os.getpid()
 
-        # Get File Descriptor of the socket
-        # Note: In C++, Session->SetCloseOnExec(false) is called.
-        # In Python 3.4+, FDs are non-inheritable by default. We must allow inheritance.
+        # 실행 인자 구성 (C++ execv args 와 동일한 순서)
+        child_name = f"DBGW_CHILD_{pid}_{fd}"
+
+        # 현재 프로세스 argv 참조 (DBGwWorld.m_Argv 대응)
+        argv0 = sys.argv[0]
+
+        exec_args = [
+            sys.executable,   # python 인터프리터
+            argv0,            # 스크립트 경로
+            "-alone",
+            "-name", child_name,
+            "-sessionid", str(fd),
+        ]
+
+        # -log 옵션 전달 (원본 argParser.GetValue("-log") 대응)
         try:
-            client_socket = session.client_socket
-            fd = client_socket.fileno()
-            os.set_inheritable(fd, True) 
-        except Exception as e:
-            print(f"[DBGwMgr] Failed to get socket FD: {e}")
-            return False
+            log_idx = sys.argv.index("-log")
+            exec_args += ["-log", sys.argv[log_idx + 1]]
+        except (ValueError, IndexError):
+            pass
 
-        try:
-            pid = os.fork()
-        except OSError as e:
-            print(f"FORK FAIL : {e}")
-            return False
+        proc = multiprocessing.Process(
+            target=_child_exec,
+            args=(exec_args,),
+            name=child_name,
+            daemon=False      # 부모 종료 시 자식도 정리되지 않도록
+        )
+        proc.start()
 
-        if pid > 0:
-            # ---------------------------------------------------
-            # Parent Process
-            # ---------------------------------------------------
-            print("Create child success", flush=True)
-            
-            # C++ returns true, meaning the session object in Parent is no longer needed
-            # (It will be deleted by the caller DBGwServerMgr::AcceptSocket)
-            return True
-
+        if proc.pid and proc.pid > 0:
+            logger.info("Create child success (child_pid=%d, fd=%d)", proc.pid, fd)
         else:
-            # ---------------------------------------------------
-            # Child Process
-            # ---------------------------------------------------
-            # Prepare arguments for execv
-            # We need to execute: python [script_name] -alone -name ...
-            
-            # 1. Base executable (python interpreter)
-            python_exe = sys.executable
-            
-            # 2. Script path (argv[0])
-            script_path = sys.argv[0]
-            
-            # 3. Construct Arguments
-            # args.push_back("-alone");
-            # args.push_back("-name"); ...
-            new_args = [python_exe, script_path, "-alone"]
-            
-            new_args.append("-name")
-            new_args.append(f"DBGW_CHILD_{os.getpid()}_{fd}")
-            
-            new_args.append("-sessionid")
-            new_args.append(str(fd))
+            logger.error("Fork fail: child process creation failed (fd=%d)", fd)
 
-            # Parse "-log" from current process args (Mimicking frArgParser logic)
-            if "-log" in sys.argv:
-                try:
-                    idx = sys.argv.index("-log")
-                    if idx + 1 < len(sys.argv):
-                        log_val = sys.argv[idx + 1]
-                        new_args.append("-log")
-                        new_args.append(log_val)
-                except ValueError:
-                    pass
+        # 부모는 True 반환 → AcceptSocket()이 session 자원 해제
+        return True
 
-            try:
-                # C++: execv(args[0].c_str(), procArgs);
-                # In Python, we re-execute the interpreter with the script
-                os.execv(python_exe, new_args)
-                
-            except OSError as e:
-                print(f"Execl fail({script_path}) : {e}", flush=True)
-                sys.exit(0)
-            
-            # Should not reach here
-            return True
+
+# ---------------------------------------------------------------------------
+# 자식 프로세스 진입점 (fork 후 execv 대응)
+# ---------------------------------------------------------------------------
+
+def _child_exec(exec_args: list) -> None:
+    """
+    자식 프로세스에서 os.execv()로 자기 자신을 재실행한다.
+    C++ 의 execv(args[0], procArgs) 에 해당한다.
+    """
+    try:
+        os.execv(exec_args[0], exec_args)
+    except OSError as e:
+        logger.error("execv fail(%s) : %s", exec_args[0], e)
+        sys.exit(0)

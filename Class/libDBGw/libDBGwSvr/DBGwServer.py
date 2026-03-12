@@ -1,555 +1,527 @@
-import sys
+"""
+DBGwServer.py
+C++ DBGwServer.h/.C → Python 변환
+
+클라이언트(DBGwUser)로부터 수신된 패킷을 해석하여
+실제 DB 작업(frDbSession)을 수행하고 결과를 응답 패킷으로 돌려보낸다.
+"""
+
 import os
 import struct
-import time
-import socket
+import logging
+from typing import Optional, Dict, TYPE_CHECKING
 
-# -------------------------------------------------------
-# Project Path Setup
-# -------------------------------------------------------
-current_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.abspath(os.path.join(current_dir, '../..'))
-if project_root not in sys.path:
-    sys.path.append(project_root)
-
-# Import definitions from DbCommon
-from Class.Common.DbCommon import (
-    DB_CONN_REQ, DB_CONN_RES, DB_QUERY_REQ, DB_QUERY_RES,
-    DB_CLOSE_REQ, DB_RS_MOVE_NEXT_REQ, DB_RS_CLOSE_REQ,
-    DB_COMMIT_REQ, DB_COMMIT_RES, DB_ROLLBACK_REQ, DB_ROLLBACK_RES,
+from libDBGw.libDBGwBase.DBGwType import (
+    PACKET_T,
+    DB_CONN_REQ_T, DB_CONN_RES_T,
+    DB_CLOSE_REQ_T,
+    DB_QUERY_REQ_T, DB_QUERY_RES_T,
+    DB_BULK_QUERY_DATA_T,
+    DB_RS_MOVE_NEXT_REQ_T,
+    DB_RS_CLOSE_REQ_T,
+    DB_RS_QUERY_DATA_T,
+    DB_COMMIT_RES_T,
+    DB_ROLLBACK_RES_T,
+    DB_QUERY_LONG_UPDATE_REQ_T, DB_QUERY_LONG_UPDATE_RES_T,
+    QueryResult,
+    DB_CONN_REQ, DB_CONN_RES,
+    DB_CLOSE_REQ,
+    DB_QUERY_REQ, DB_QUERY_RES,
+    DB_BULK_QUERY_DATA,
+    DB_RS_MOVE_NEXT_REQ,
+    DB_RS_CLOSE_REQ,
+    DB_RS_QUERY_DATA,
+    DB_COMMIT_REQ, DB_COMMIT_RES,
+    DB_ROLLBACK_REQ, DB_ROLLBACK_RES,
     DB_QUERY_LONG_UPDATE_REQ, DB_QUERY_LONG_UPDATE_RES,
-    DB_BULK_QUERY_DATA, DB_RS_QUERY_DATA,
     QUERY_TYPE_SELECT, QUERY_TYPE_UPDATE, QUERY_TYPE_INSERT,
     QUERY_REQ_TYPE_BULK, QUERY_REQ_TYPE_RS,
-    MAX_ERROR_SIZE, MAX_DATA_SIZE, DEF_BUF_SIZE
+    NO_SEG, SEG_ING, SEG_END,
+    MAX_DATA_SIZE, MAX_ERROR_SIZE, DEF_BUF_SIZE,
+    frDbParam, frDbRecord, frDbRecordSet,
 )
 
-# Import CommType for SegFlag
-from Class.Common.CommType import NO_SEG, SEG_ING, SEG_END
+# frDbSession: 실제 DB 연결/쿼리 담당 (기존 변환된 Sql 모듈)
+from Sql.fr_db_session import frDbSession
 
-# Mock Imports for External Frameworks (fr)
-# These should be replaced with actual implementations (e.g., pymysql wrappers)
-try:
-    from Class.Sql.fr_db_session import FrDbSession, QueryResult
-    from Class.Util.fr_util_misc import FrUtilMisc
-    from Class.Event.FrLogger import FrLogger
-except ImportError:
-    # Placeholder classes for compilation
-    class FrDbSession:
-        @staticmethod
-        def get_instance(): return FrDbSession()
-        def connect(self, u, p, n, ip, port): return True
-        def get_error(self): return "DB Error"
-        def sql_query(self, query, result): pass
-        def execute_rs(self, query): return None
-        def execute(self, query, commit): return True
-        def free(self, result): pass
-        def commit(self): return True
-        def rollback(self): return True
-        def update_long(self, t, f, v, w): return True
+if TYPE_CHECKING:
+    from libDBGw.libDBGwSvr.DBGwServerSession import DBGwServerSession
 
-    class QueryResult:
-        def __init__(self):
-            self.m_Result = 0
-            self.m_RowCnt = 0
-            self.m_ColCnt = 0
-            self.m_ErrorString = ""
-            self.m_Buf = [] # List of Lists
-            self.m_Param = None # Metadata
+logger = logging.getLogger(__name__)
 
-    class FrUtilMisc:
-        @staticmethod
-        def get_pid(): return os.getpid()
-        @staticmethod
-        def string_replace(s, old, new): return s.replace(old, new)
-    
-    class FrLogger:
-        @staticmethod
-        def open(path): print(f"[Log Open] {path}")
 
-class FrDbRecordSetMap:
+# ---------------------------------------------------------------------------
+# frDbRecordSetMap : C++ map<int, frDbRecordSet*> 래퍼
+# ---------------------------------------------------------------------------
+
+class frDbRecordSetMap:
     """
-    C++: frDbRecordSetMap
-    Manages active RecordSets (Cursors) for RS-type queries.
+    QueryId → frDbRecordSet 매핑 딕셔너리.
+    C++ map<int, frDbRecordSet*> + Clear/Remove 인터페이스를 유지한다.
     """
-    def __init__(self):
-        self.m_Map = {} # Dict[int, FrDbRecordSet]
 
-    def __del__(self):
-        self.clear()
+    def __init__(self) -> None:
+        self._map: Dict[int, frDbRecordSet] = {}
 
-    def clear(self):
-        # In Python, clearing the dict allows GC to collect the objects
-        # If RecordSets need explicit close, iterate and close them here.
-        self.m_Map.clear()
+    def __del__(self) -> None:
+        self.Clear()
 
-    def insert(self, query_id, r_set):
-        self.m_Map[query_id] = r_set
+    def Clear(self) -> None:
+        """보유한 모든 RecordSet을 해제한다."""
+        self._map.clear()
 
-    def find(self, query_id):
-        return self.m_Map.get(query_id)
-
-    def remove(self, query_id):
-        if query_id in self.m_Map:
-            del self.m_Map[query_id]
+    def Remove(self, Id: int) -> bool:
+        """Id에 해당하는 RecordSet을 제거한다. 없으면 False 반환."""
+        if Id in self._map:
+            del self._map[Id]
             return True
         return False
 
+    def insert(self, key: int, value: frDbRecordSet) -> None:
+        self._map[key] = value
+
+    def find(self, key: int) -> Optional[frDbRecordSet]:
+        return self._map.get(key, None)
+
+
+# ---------------------------------------------------------------------------
+# DBGwServer
+# ---------------------------------------------------------------------------
+
 class DBGwServer:
     """
-    C++: DBGwServer
-    Core Database Gateway Server logic.
-    Handles DB connections, query execution, result packing, and segmentation.
+    DB Gateway 서버 핵심 로직.
+
+    - ReceivePacket()으로 클라이언트 패킷을 수신
+    - frDbSession을 통해 실제 DB 작업 수행
+    - DBGwServerSession.SendPacket()으로 응답 반환
     """
-    def __init__(self, session, db_kind, default_db_user, default_db_passwd, default_db_name):
-        self.m_DbType = db_kind
-        self.m_DBServerSession = session
-        self.m_DbSession = None # FrDbSession instance
 
-        self.m_DbUser = default_db_user
-        self.m_DbPasswd = default_db_passwd
-        self.m_DbName = default_db_name
-        self.m_LogFile = ""
-        
-        self.m_DbRecordSetMap = FrDbRecordSetMap()
+    # DB 연결 기본 IP/Port (C++ 원본 하드코딩 값 유지, 환경 변수로 오버라이드 가능)
+    _DEFAULT_DB_IP   = os.environ.get("DBGW_DB_IP",   "192.168.1.4")
+    _DEFAULT_DB_PORT = int(os.environ.get("DBGW_DB_PORT", "3306"))
 
-    def __del__(self):
-        """
-        C++: ~DBGwServer()
-        """
-        if self.m_DbSession:
-            # self.m_DbSession.close() # Explicit close if needed
-            self.m_DbSession = None
+    def __init__(self,
+                 Session: "DBGwServerSession",
+                 DbKind: int,
+                 DefaultDbUser: str = "",
+                 DefaultDbPasswd: str = "",
+                 DefaultDbName: str = "") -> None:
 
-    def receive_packet(self, packet):
-        """
-        C++: void ReceivePacket(PACKET_T* Packet)
-        Dispatcher for incoming packets.
-        """
-        msg_id = packet.msgId
-        msg = packet.msg
+        self.m_DbType: int                      = DbKind
+        self.m_DBServerSession: "DBGwServerSession" = Session
+        self.m_DbSession: Optional[frDbSession] = None
 
-        if msg_id == DB_CONN_REQ:
-            self.db_conn_req(msg)
-        elif msg_id == DB_QUERY_REQ:
-            self.db_query_req(msg)
-        elif msg_id == DB_CLOSE_REQ:
-            self.db_close_req(msg)
-        elif msg_id == DB_RS_MOVE_NEXT_REQ:
-            self.db_rs_move_next_req(msg)
-        elif msg_id == DB_RS_CLOSE_REQ:
-            self.db_rs_close_req(msg)
-        elif msg_id == DB_COMMIT_REQ:
-            self.db_commit_req()
-        elif msg_id == DB_ROLLBACK_REQ:
-            self.db_rollback_req()
-        elif msg_id == DB_QUERY_LONG_UPDATE_REQ:
-            self.db_query_long_update_req(msg)
+        self.m_DbUser:   str = DefaultDbUser
+        self.m_DbPasswd: str = DefaultDbPasswd
+        self.m_DbName:   str = DefaultDbName
+        self.m_DbIp:     str = ""
+        self.m_DbPort:   str = ""
+        self.m_LogFile:  str = ""
+
+        self.m_DbRecordSetMap = frDbRecordSetMap()
+
+    def __del__(self) -> None:
+        self.m_DbSession = None
+
+    # -------------------------------------------------------------------------
+    # Public
+    # -------------------------------------------------------------------------
+
+    def ReceivePacket(self, Packet: PACKET_T) -> None:
+        """수신 패킷 MsgId에 따라 적절한 핸들러로 분기한다."""
+        msg_id = Packet.MsgId
+        msg    = Packet.Msg
+
+        dispatch = {
+            DB_CONN_REQ:              lambda: self._DbConnReq(DB_CONN_REQ_T.unpack(msg)),
+            DB_QUERY_REQ:             lambda: self._DbQueryReq(DB_QUERY_REQ_T.unpack(msg)),
+            DB_CLOSE_REQ:             lambda: self._DbCloseReq(DB_CLOSE_REQ_T.unpack(msg)),
+            DB_RS_MOVE_NEXT_REQ:      lambda: self._DbRsMoveNextReq(DB_RS_MOVE_NEXT_REQ_T.unpack(msg)),
+            DB_RS_CLOSE_REQ:          lambda: self._DbRsCloseReq(DB_RS_CLOSE_REQ_T.unpack(msg)),
+            DB_COMMIT_REQ:            lambda: self._DbCommitReq(),
+            DB_ROLLBACK_REQ:          lambda: self._DbRollBackReq(),
+            DB_QUERY_LONG_UPDATE_REQ: lambda: self._DbQueryLongUpdateReq(DB_QUERY_LONG_UPDATE_REQ_T.unpack(msg)),
+        }
+
+        handler = dispatch.get(msg_id)
+        if handler:
+            handler()
         else:
-            pass
+            logger.warning("Unknown MsgId: %d", msg_id)
 
-    def db_conn_req(self, req):
-        """
-        C++: void DbConnReq(DB_CONN_REQ_T* Req)
-        Handles DB Connection Request.
-        """
-        # Logging Setup
+    def CloseSession(self, nErrorCode: int) -> None:
+        """세션 종료 처리 (현재 구현 없음 - C++ 원본과 동일)."""
+        pass
+
+    def GetLogFile(self) -> str:
+        return self.m_LogFile
+
+    # -------------------------------------------------------------------------
+    # Protected handlers
+    # -------------------------------------------------------------------------
+
+    def _DbConnReq(self, Req: DB_CONN_REQ_T) -> None:
+        """DB 접속 요청 처리."""
+        # 로깅 모드: 클라이언트 접속 정보로 로그 파일 생성
         if self.m_DBServerSession.m_IsLoggingMode:
-            host_ip = req.HostIp.replace(".", "_")
-            log_file = f"{self.m_DBServerSession.m_LogDir}/DBGW_{FrUtilMisc.get_pid()}_{req.HostName}_{host_ip}_{req.ProcPid}.log"
-            
-            FrLogger.open(log_file)
+            host_ip_safe = Req.HostIp.replace(".", "_")
+            log_file = (
+                f"{self.m_DBServerSession.m_LogDir}/"
+                f"DBGW_{os.getpid()}_{Req.HostName}_{host_ip_safe}_{Req.ProcPid}.log"
+            )
+            # 로그 파일 핸들러 추가 (frLogger::Open 대응)
+            fh = logging.FileHandler(log_file)
+            fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+            logging.getLogger().addHandler(fh)
             self.m_LogFile = log_file
-            print(f"PID : {FrUtilMisc.get_pid()}[{self.m_LogFile}]")
-            
+            logger.info("PID : %d[%s]", os.getpid(), self.m_LogFile)
             self.m_DBServerSession.m_IsLoggingMode = False
 
-        print(f"Request connect db({req.DbUser}/{req.DbPasswd}@{req.DbName})")
+        logger.debug("Request connect db(%s/%s@%s)",
+                     Req.DbUser, Req.DbPasswd, Req.DbName)
 
-        # Get DB Session Instance
-        # Assuming FrDbSession singleton/factory pattern matches C++
-        self.m_DbSession = FrDbSession.get_instance()
+        self.m_DbSession = frDbSession.GetInstance()
 
-        from Class.Common.DbCommon import DbConnResT
-        res = DbConnResT()
-        result = False
-        
-        # Connection Logic
-        # C++ logic checks if Req fields are empty to use Default values, else use Req values
-        
-        target_user = req.DbUser if req.DbUser else self.m_DbUser
-        target_passwd = req.DbPasswd if req.DbPasswd else self.m_DbPasswd
-        target_name = req.DbName if req.DbName else self.m_DbName
-        
-        # Hardcoded IP/Port in C++ snippet (192.168.1.4:3306), applying here
-        if target_user and target_passwd and target_name:
-             result = self.m_DbSession.connect(target_user, target_passwd, target_name, "192.168.1.4", 3306)
-             if not result:
-                 res.m_Error = self.m_DbSession.get_error()[:MAX_ERROR_SIZE]
+        res = DB_CONN_RES_T()
+        result: bool
+
+        # 접속 정보 판별: 요청에 없으면 기본값 사용
+        use_default = (
+            not Req.DbPasswd and not Req.DbUser and not Req.DbName
+            and self.m_DbUser and self.m_DbPasswd and self.m_DbName
+        )
+        use_req = Req.DbUser and Req.DbPasswd and Req.DbName
+
+        if use_default:
+            result = self.m_DbSession.Connect(
+                self.m_DbUser, self.m_DbUser, self.m_DbName,
+                self._DEFAULT_DB_IP, self._DEFAULT_DB_PORT
+            )
+            if not result:
+                res.m_Error = self.m_DbSession.GetError()[:MAX_ERROR_SIZE - 1]
+
+        elif use_req:
+            result = self.m_DbSession.Connect(
+                Req.DbUser, Req.DbPasswd, Req.DbName,
+                self._DEFAULT_DB_IP, self._DEFAULT_DB_PORT
+            )
+            if not result:
+                res.m_Error = self.m_DbSession.GetError()[:MAX_ERROR_SIZE - 1]
+
         else:
-            res.m_Error = f"invalid connect info.({req.DbUser}{req.DbPasswd}@{req.DbName})"
-            print(res.m_Error)
+            result = False
+            res.m_Error = (
+                f"invalid connect info."
+                f"({Req.DbUser}{Req.DbPasswd}@{Req.DbName})"
+            )[:MAX_ERROR_SIZE - 1]
+            logger.error(res.m_Error)
 
         res.m_Result = 1 if result else 0
-        
-        self.m_DBServerSession.send_packet(DB_CONN_RES, res)
+        self.m_DBServerSession.SendPacket(DB_CONN_RES, res.pack(), res.size())
 
-    def db_query_req(self, req):
-        """
-        C++: void DbQueryReq(DB_QUERY_REQ_T* Req)
-        Handles SQL Query Request (Select, Insert, Update).
-        Supports segmented (Long) queries.
-        """
-        from Class.Common.DbCommon import DbQueryResT
-        res = DbQueryResT()
+    def _DbQueryReq(self, Req: DB_QUERY_REQ_T) -> None:
+        """쿼리 요청 처리. 세그먼트 분할 쿼리 조립 후 타입별 핸들러에 위임한다."""
+        res = DB_QUERY_RES_T()
         res.m_Result = 0
-        
         ret = True
         long_query = ""
 
-        # 1. Handle Segmented Query Assembly
-        if req.m_SegFlag == SEG_ING:
-            cnt = 0
-            long_query = req.m_Query
-            cnt += 1
-            print(f"### Start Long query : {cnt} [{time.ctime()}]")
-            
+        # 분할 전송 쿼리 조립
+        if Req.m_SegFlag == SEG_ING:
+            long_query = Req.m_Query
+            logger.debug("### Start Long query")
+
             while True:
-                # Wait for next packet (Blocking)
-                # Assuming session has wait_packet method
-                tmp_req = self.m_DBServerSession.wait_packet(DB_QUERY_REQ) 
-                
-                if tmp_req:
-                    cnt += 1
-                    print(f"### Wait Long query ok : {cnt} [{time.ctime()}]")
+                tmp_req = DB_QUERY_REQ_T()
+                if self.m_DBServerSession.WaitPacket(DB_QUERY_REQ, tmp_req) > 0:
                     long_query += tmp_req.m_Query
-                    
                     if tmp_req.m_SegFlag == SEG_END:
-                        print(f"### Wait Long query end : {cnt} [{time.ctime()}]")
+                        logger.debug("### Long query assembled")
                         break
                 else:
-                    print("### Wait Long query error")
+                    logger.error("### Long query receive error")
                     ret = False
                     break
-        
-        # 2. Execute Query
-        if ret:
-            current_query = long_query if long_query else req.m_Query
-            print(f"query : [{time.ctime()}][{current_query}]")
 
-            if req.m_QueryType == QUERY_TYPE_SELECT:
-                if req.m_QueryReqType == QUERY_REQ_TYPE_BULK:
-                    self.db_query_req_select_bulk(req, current_query)
-                    return
-                elif req.m_QueryReqType == QUERY_REQ_TYPE_RS:
-                    self.db_query_req_select_rs(req, current_query)
-                    return
-                else:
-                    res.m_Error = "Unknown DbQueryReq Type"
-            
-            elif req.m_QueryType in (QUERY_TYPE_UPDATE, QUERY_TYPE_INSERT):
-                self.db_query_req_insert(req, current_query)
-                return
-            else:
-                 res.m_Error = "Unknown DbQueryReq Type"
-        else:
+        if not ret:
             res.m_Error = "Segment Query isn't terminated well"
-            
-        self.m_DBServerSession.send_packet(DB_QUERY_RES, res)
+            self.m_DBServerSession.SendPacket(DB_QUERY_RES, res.pack(), res.size())
+            return
 
-    def db_query_req_select_bulk(self, req, query_str):
-        """
-        C++: void DbQueryReqSelectBulk(...)
-        Executes Select query and sends ALL results in bulk chunks.
-        """
-        from Class.Sql.fr_db_session import QueryResult
+        effective_query = long_query if long_query else Req.m_Query
+        logger.debug("query : [%s]", effective_query)
+
+        if Req.m_QueryType == QUERY_TYPE_SELECT:
+            if Req.m_QueryReqType == QUERY_REQ_TYPE_BULK:
+                self._DbQueryReqSelectBulk(Req, long_query)
+            elif Req.m_QueryReqType == QUERY_REQ_TYPE_RS:
+                self._DbQueryReqSelectRs(Req, long_query)
+            else:
+                res.m_Error = "Unknown DbQueryReq Type"
+                self.m_DBServerSession.SendPacket(DB_QUERY_RES, res.pack(), res.size())
+
+        elif Req.m_QueryType in (QUERY_TYPE_UPDATE, QUERY_TYPE_INSERT):
+            self._DbQueryReqInsert(Req, long_query)
+        else:
+            res.m_Error = "Unknown DbQueryReq Type"
+            self.m_DBServerSession.SendPacket(DB_QUERY_RES, res.pack(), res.size())
+
+    def _DbQueryReqSelectBulk(self,
+                               Req: DB_QUERY_REQ_T,
+                               LongQuery: str = "") -> None:
+        """SELECT BULK 쿼리: 전체 결과를 한 번에 전송한다."""
         result = QueryResult()
-        
-        start_time = time.time()
-        self.m_DbSession.sql_query(query_str, result)
-        elapsed = time.time() - start_time
-        
-        print(f"query end form DB : elapse[{elapsed:.2f} sec] rowcnt[{result.m_RowCnt}]")
-        
-        from Class.Common.DbCommon import DbQueryResT
-        res = DbQueryResT()
-        res.m_Result = result.m_Result
-        res.m_QueryId = req.m_QueryId
-        res.m_ColCnt = result.m_ColCnt
-        res.m_RowCnt = result.m_RowCnt
-        
-        print(f"query end form DB : result = [{res.m_Result}], rowcnt[{result.m_RowCnt}]")
+        effective = LongQuery if LongQuery else Req.m_Query
+        self.m_DbSession.SqlQuery(effective, result)
+
+        res = DB_QUERY_RES_T()
+        res.m_Result  = result.m_Result
+        res.m_QueryId = Req.m_QueryId
+        res.m_ColCnt  = result.m_ColCnt
+        res.m_RowCnt  = result.m_RowCnt
+
+        logger.debug("query result: result=%d, rowcnt=%d",
+                     res.m_Result, result.m_RowCnt)
 
         if res.m_Result == 0:
-            res.m_Error = result.m_ErrorString[:MAX_ERROR_SIZE]
+            res.m_Error = result.m_ErrorString[:MAX_ERROR_SIZE - 1]
 
-        if res.m_Result > 0 and res.m_RowCnt > 0:
-            # Send Data (Header + Body)
-            self.encode_bulk_data_send(req.m_QueryId, res, result)
+        if res.m_Result > 0 and res.m_RowCnt:
+            self._EncodeBulkDataSend(Req.m_QueryId, res, result)
         else:
-            # Send Header Only (Error or Empty)
-            self.m_DBServerSession.send_packet(DB_QUERY_RES, res)
+            self.m_DBServerSession.SendPacket(DB_QUERY_RES, res.pack(), res.size())
 
-        self.m_DbSession.free(result)
+        self.m_DbSession.Free(result)
 
-    def db_query_req_select_rs(self, req, query_str):
-        """
-        C++: void DbQueryReqSelectRs(...)
-        Executes Select query and stores RecordSet for creating a cursor.
-        """
-        r_set = self.m_DbSession.execute_rs(query_str)
-        
-        from Class.Common.DbCommon import DbQueryResT
-        res = DbQueryResT()
-        res.m_Result = 1 if r_set and r_set.is_valid() else 0
-        res.m_QueryId = req.m_QueryId
-        
-        if r_set and r_set.is_valid():
-            res.m_ColCnt = r_set.get_col()
-            self.m_DbRecordSetMap.insert(req.m_QueryId, r_set)
+    def _DbQueryReqSelectRs(self,
+                             Req: DB_QUERY_REQ_T,
+                             LongQuery: str = "") -> None:
+        """SELECT RS 쿼리: RecordSet을 서버에 보관하고 MoveNext 방식으로 제공한다."""
+        effective = LongQuery if LongQuery else Req.m_Query
+        r_set: frDbRecordSet = self.m_DbSession.ExecuteRs(effective)
+
+        res = DB_QUERY_RES_T()
+        res.m_QueryId = Req.m_QueryId
+        res.m_Result  = 1 if r_set.IsValid() else 0
+
+        if r_set.IsValid():
+            res.m_ColCnt = r_set.GetCol()
+            self.m_DbRecordSetMap.insert(Req.m_QueryId, r_set)
         else:
-            if r_set:
-                res.m_Error = r_set.m_Error[:MAX_ERROR_SIZE]
-                # delete r_set (handled by GC/Framework)
-        
-        self.m_DBServerSession.send_packet(DB_QUERY_RES, res)
+            res.m_Error = r_set.m_Error[:MAX_ERROR_SIZE - 1]
 
-    def db_query_req_insert(self, req, query_str):
-        """
-        C++: void DbQueryReqInsert(...)
-        Handles Insert/Update execution.
-        """
-        from Class.Common.DbCommon import DbQueryResT
-        res = DbQueryResT()
-        
-        is_commit = True if req.m_Commit == 1 else False
-        result = self.m_DbSession.execute(query_str, is_commit)
-        
-        res.m_Result = 1 if result else 0
-        
-        if not result:
-            res.m_Error = self.m_DbSession.get_error()[:MAX_ERROR_SIZE]
-            
-        self.m_DBServerSession.send_packet(DB_QUERY_RES, res)
-        print(f"End sending query result to client : [{time.ctime()}]")
+        self.m_DBServerSession.SendPacket(DB_QUERY_RES, res.pack(), res.size())
 
-    def encode_bulk_data_send(self, query_id, query_res, result):
-        """
-        C++: void EncodeBulkDataSend(...)
-        Serializes the DB result set into a binary stream and sends it in chunks.
-        Format: [Col1Len][Col1Data][Col2Len][Col2Data]... (Row by Row)
-        Lengths are Big-Endian 4-byte integers (htonl).
-        """
-        # 1. Serialize All Data
-        data_buffer = bytearray()
-        
-        # Assuming result.m_Param.GetRecordHead() logic is abstracted in result structure
-        # In Python, we might iterate over result.m_Buf (Rows)
-        # We need metadata for column sizes? 
-        # C++ uses `rec->m_ColSize[col]`.
-        # Assuming `result.m_Buf` contains raw bytes or strings.
-        
-        for row_idx in range(result.m_RowCnt):
-            row_data = result.m_Buf[row_idx] # List of columns
-            
-            for col_idx in range(result.m_ColCnt):
-                val = row_data[col_idx]
-                
-                # Convert value to bytes if needed
-                if isinstance(val, str):
-                    val_bytes = val.encode('utf-8') # Or specific DB encoding
-                elif isinstance(val, bytes):
-                    val_bytes = val
-                else:
-                    val_bytes = str(val).encode('utf-8')
-                
-                # Size + Data
-                size = len(val_bytes)
-                # htonl (Big Endian)
-                data_buffer.extend(struct.pack('>I', size))
-                data_buffer.extend(val_bytes)
-        
-        total_size = len(data_buffer)
-        
-        # 2. Send Header (QUERY_RES) with DataSize
-        query_res.m_DataSize = total_size
-        self.m_DBServerSession.send_packet(DB_QUERY_RES, query_res)
-        
-        # 3. Send Body (BULK_QUERY_DATA) in Chunks
-        from Class.Common.DbCommon import DbBulkQueryDataT
-        
-        offset = 0
-        while offset < total_size:
-            chunk_req = DbBulkQueryDataT()
-            chunk_req.m_QueryId = query_id
-            
-            remaining = total_size - offset
-            if remaining > MAX_DATA_SIZE:
-                chunk_req.m_SegFlag = SEG_ING
-                send_size = MAX_DATA_SIZE
-            else:
-                chunk_req.m_SegFlag = SEG_END
-                send_size = remaining
-            
-            # Copy slice to m_Data (which accepts bytes/string)
-            chunk_req.m_Data = data_buffer[offset : offset + send_size]
-            
-            self.m_DBServerSession.send_packet(DB_BULK_QUERY_DATA, chunk_req)
-            
-            offset += send_size
+    def _DbQueryReqInsert(self,
+                          Req: DB_QUERY_REQ_T,
+                          LongQuery: str = "") -> None:
+        """INSERT/UPDATE/DELETE 쿼리를 실행하고 결과를 응답한다."""
+        effective  = LongQuery if LongQuery else Req.m_Query
+        auto_commit = (Req.m_Commit == 1)
+        ok = self.m_DbSession.Execute(effective, auto_commit)
 
-    def db_rs_move_next_req(self, req):
-        """
-        C++: void DbRsMoveNextReq(DB_RS_MOVE_NEXT_REQ_T* Req)
-        Fetches next row from RecordSet and sends it.
-        """
-        from Class.Common.DbCommon import DbRsQueryDataT
-        
-        r_set = self.m_DbRecordSetMap.find(req.m_QueryId)
-        
-        if not r_set:
-            res = DbRsQueryDataT()
-            res.m_Size = -1 # Error
-            res.m_Data = f"Can't find recordset : {req.m_QueryId}".encode('utf-8')
-            res.m_QueryId = req.m_QueryId
-            res.m_SegFlag = NO_SEG
-            self.m_DBServerSession.send_packet(DB_RS_QUERY_DATA, res)
+        res = DB_QUERY_RES_T()
+        res.m_Result = 1 if ok else 0
+        if not ok:
+            err = self.m_DbSession.GetError()
+            res.m_Error = err[:MAX_ERROR_SIZE - 1]
+
+        self.m_DBServerSession.SendPacket(DB_QUERY_RES, res.pack(), res.size())
+        logger.debug("End sending query result to client")
+
+    def _DbRsMoveNextReq(self, Req: DB_RS_MOVE_NEXT_REQ_T) -> None:
+        """RecordSet의 다음 레코드를 클라이언트에 전송한다."""
+        r_set = self.m_DbRecordSetMap.find(Req.m_QueryId)
+
+        if r_set is None:
+            qdata = DB_RS_QUERY_DATA_T()
+            qdata.m_Size    = -1
+            qdata.m_Data    = f"Can't find recordset : {Req.m_QueryId}"
+            qdata.m_QueryId = Req.m_QueryId
+            qdata.m_SegFlag = NO_SEG
+            self.m_DBServerSession.SendPacket(
+                DB_RS_QUERY_DATA, qdata.pack(), qdata.size()
+            )
             return
 
-        record = r_set.move_next()
-        self.encode_rs_data_send(req.m_QueryId, r_set.get_row(), record)
+        record: Optional[frDbRecord] = r_set.MoveNext()
+        self._EncodeRsDataSend(Req.m_QueryId, r_set.GetRow(), record)
 
-    def encode_rs_data_send(self, query_id, row_cnt, record):
-        """
-        C++: void EncodeRsDataSend(...)
-        Serializes a single row (Record) and sends it.
-        """
-        from Class.Common.DbCommon import DbRsQueryDataT
-        
-        if not record:
-            # End of RecordSet
-            res = DbRsQueryDataT()
-            res.m_QueryId = query_id
-            res.m_Size = -2 # EOR
-            res.m_CurRow = row_cnt
-            self.m_DBServerSession.send_packet(DB_RS_QUERY_DATA, res)
-            return
+    def _DbRsCloseReq(self, Req: DB_RS_CLOSE_REQ_T) -> None:
+        """클라이언트가 요청한 RecordSet을 서버에서 제거한다."""
+        self.m_DbRecordSetMap.Remove(Req.m_QueryId)
 
-        # Serialize Record
-        data_buffer = bytearray()
-        
-        # Iterate record columns
-        # Assuming record has m_Values (list of bytes) and m_ColSize
-        for col_idx in range(record.m_Col):
-            val = record.m_Values[col_idx]
-            # Ensure val is bytes
-            if isinstance(val, str): val = val.encode('utf-8')
-            
-            size = len(val)
-            data_buffer.extend(struct.pack('>I', size))
-            data_buffer.extend(val)
-            
-        total_size = len(data_buffer)
-        offset = 0
-        
-        # Send in Chunks
-        while offset < total_size:
-            res = DbRsQueryDataT()
-            res.m_QueryId = query_id
-            res.m_CurRow = row_cnt
-            
-            remaining = total_size - offset
-            
-            if remaining > MAX_DATA_SIZE:
-                res.m_SegFlag = SEG_ING
-                res.m_Data = data_buffer[offset : offset + MAX_DATA_SIZE]
-                res.m_Size = MAX_DATA_SIZE
-                send_len = MAX_DATA_SIZE
-            else:
-                res.m_SegFlag = SEG_END
-                res.m_Data = data_buffer[offset : offset + remaining]
-                res.m_Size = remaining
-                send_len = remaining
-                
-            self.m_DBServerSession.send_packet(DB_RS_QUERY_DATA, res)
-            offset += send_len
+    def _DbCommitReq(self) -> None:
+        """COMMIT 요청 처리."""
+        res = DB_COMMIT_RES_T()
+        res.m_Result = 1 if self.m_DbSession.Commit() else 0
+        self.m_DBServerSession.SendPacket(DB_COMMIT_RES, res.pack(), res.size())
 
-    def db_rs_close_req(self, req):
-        self.m_DbRecordSetMap.remove(req.m_QueryId)
+    def _DbRollBackReq(self) -> None:
+        """ROLLBACK 요청 처리."""
+        res = DB_ROLLBACK_RES_T()
+        res.m_Result = 1 if self.m_DbSession.RollBack() else 0
+        self.m_DBServerSession.SendPacket(DB_ROLLBACK_RES, res.pack(), res.size())
 
-    def db_close_req(self, req):
+    def _DbCloseReq(self, Req: DB_CLOSE_REQ_T) -> None:
+        """DB 닫기 요청 처리 (현재 구현 없음 - C++ 원본과 동일)."""
         pass
 
-    def db_commit_req(self):
-        from Class.Common.DbCommon import DbCommitResT
-        res = DbCommitResT()
-        res.m_Result = 1 if self.m_DbSession.commit() else 0
-        self.m_DBServerSession.send_packet(DB_COMMIT_RES, res)
+    def _DbQueryLongUpdateReq(self, Req: DB_QUERY_LONG_UPDATE_REQ_T) -> None:
+        """LONG UPDATE 요청 처리. 세그먼트 분할 수신 후 실제 UPDATE 수행."""
+        if Req.m_SegFlag == SEG_ING:
+            # 분할 수신 조립
+            data_buf = bytearray(Req.m_Data[:MAX_DATA_SIZE])
 
-    def db_rollback_req(self):
-        from Class.Common.DbCommon import DbRollbackResT
-        res = DbRollbackResT()
-        res.m_Result = 1 if self.m_DbSession.rollback() else 0
-        self.m_DBServerSession.send_packet(DB_ROLLBACK_RES, res)
-
-    def db_query_long_update_req(self, req):
-        """
-        C++: void DbQueryLongUpdateReq(...)
-        Handles Long Update requests by assembling segmented data.
-        """
-        from Class.Common.DbCommon import DbQueryLongUpdateReqT
-        
-        final_data = bytearray()
-        
-        if req.m_SegFlag == SEG_ING:
-            # First chunk
-            final_data.extend(req.m_Data) # Assuming m_Data is bytes
-            
             while True:
-                tmp_req = self.m_DBServerSession.wait_packet(DB_QUERY_LONG_UPDATE_REQ)
-                if tmp_req:
-                     final_data.extend(tmp_req.m_Data)
-                     if tmp_req.m_SegFlag != SEG_ING:
-                         break
-            
-            self.db_query_long_update(req.Table, req.Field, final_data)
-        else:
-            self.db_query_long_update(req.Table, req.Field, req.m_Data)
+                q_data = DB_QUERY_LONG_UPDATE_REQ_T()
+                if self.m_DBServerSession.WaitPacket(
+                    DB_QUERY_LONG_UPDATE_REQ, q_data
+                ) > 0:
+                    data_buf.extend(q_data.m_Data[:MAX_DATA_SIZE])
+                    if q_data.m_SegFlag == SEG_END:
+                        break
+                else:
+                    break
 
-    def db_query_long_update(self, table, field, data):
+            self._DbQueryLongUpdate(Req.Table, Req.Field, bytes(data_buf))
+        else:
+            self._DbQueryLongUpdate(Req.Table, Req.Field,
+                                    Req.m_Data if isinstance(Req.m_Data, bytes)
+                                    else Req.m_Data.encode("utf-8"))
+
+    def _DbQueryLongUpdate(self,
+                           Table: str,
+                           Field: str,
+                           Data: bytes) -> None:
         """
-        C++: void DbQueryLongUpdate(...)
-        Decodes the binary 'Where' and 'Value' clauses and executes UpdateLong.
-        Format: [WhereLen(4)][WhereStr][ValueLen(4)][ValueStr]
+        [where_len(4)][where][value_len(4)][value] 포맷 버퍼를 파싱하여
+        frDbSession.UpdateLong()을 호출하고 결과를 응답한다.
         """
         offset = 0
-        
-        # Decode Where Length
-        if len(data) < 4: return # Error
-        where_len = struct.unpack('>I', data[offset:offset+4])[0]
-        offset += 4
-        
-        # Decode Where String
-        where_str = data[offset : offset + where_len].decode('utf-8')
-        offset += where_len
-        
-        # Decode Value Length
-        value_len = struct.unpack('>I', data[offset:offset+4])[0]
-        offset += 4
-        
-        # Decode Value String
-        value_str = data[offset : offset + value_len].decode('utf-8')
-        
-        from Class.Common.DbCommon import DbQueryLongUpdateResT
-        res = DbQueryLongUpdateResT()
-        
-        result = self.m_DbSession.update_long(table, field, value_str, where_str)
-        
-        res.m_Result = 1 if result else 0
-        if not result:
-            res.m_Error = self.m_DbSession.get_error()[:MAX_ERROR_SIZE]
-            
-        self.m_DBServerSession.send_packet(DB_QUERY_LONG_UPDATE_RES, res)
 
-    def get_log_file(self):
-        return self.m_LogFile
+        where_len = struct.unpack_from("!I", Data, offset)[0]
+        offset += 4
+        where = Data[offset: offset + where_len].decode("utf-8", errors="replace")
+        offset += where_len
+
+        value_len = struct.unpack_from("!I", Data, offset)[0]
+        offset += 4
+        value = Data[offset: offset + value_len].decode("utf-8", errors="replace")
+
+        res = DB_QUERY_LONG_UPDATE_RES_T()
+        ok = self.m_DbSession.UpdateLong(Table, Field, value, where)
+        res.m_Result = 1 if ok else 0
+        if not ok:
+            res.m_Error = self.m_DbSession.GetError()[:MAX_ERROR_SIZE - 1]
+
+        self.m_DBServerSession.SendPacket(
+            DB_QUERY_LONG_UPDATE_RES, res.pack(), res.size()
+        )
+
+    # -------------------------------------------------------------------------
+    # 데이터 인코딩 & 분할 전송
+    # -------------------------------------------------------------------------
+
+    def _EncodeBulkDataSend(self,
+                             QueryId: int,
+                             QueryRes: DB_QUERY_RES_T,
+                             Result: QueryResult) -> None:
+        """
+        QueryResult 전체 레코드를 바이너리로 인코딩하여 분할 전송한다.
+        각 컬럼 : [col_size(4, network order)][col_data(col_size)]
+        """
+        # 전체 데이터 버퍼 구성 (동적 확장 대신 bytearray 사용)
+        buf = bytearray()
+        rec: Optional[frDbRecord] = Result.m_Param.GetRecordHead()
+
+        for row in range(Result.m_RowCnt):
+            for col in range(Result.m_ColCnt):
+                col_val   = Result.m_Buf[row][col]
+                col_bytes = col_val.encode("utf-8") if isinstance(col_val, str) else col_val
+                buf += struct.pack("!I", len(col_bytes))
+                buf += col_bytes
+            rec = rec.m_Next if rec else None
+
+        QueryRes.m_DataSize = len(buf)
+        self.m_DBServerSession.SendPacket(DB_QUERY_RES, QueryRes.pack(), QueryRes.size())
+
+        # 분할 전송
+        offset     = 0
+        total_size = len(buf)
+
+        while total_size > 0:
+            q_data = DB_BULK_QUERY_DATA_T()
+            q_data.m_QueryId = QueryId
+
+            if total_size > MAX_DATA_SIZE:
+                q_data.m_SegFlag = SEG_ING
+                q_data.m_Data    = buf[offset: offset + MAX_DATA_SIZE]
+                offset     += MAX_DATA_SIZE
+                total_size -= MAX_DATA_SIZE
+            else:
+                q_data.m_SegFlag = SEG_END
+                q_data.m_Data    = buf[offset: offset + total_size]
+                offset     += total_size
+                total_size  = 0
+
+            self.m_DBServerSession.SendPacket(
+                DB_BULK_QUERY_DATA, q_data.pack(), q_data.size()
+            )
+
+    def _EncodeRsDataSend(self,
+                           QueryId: int,
+                           RowCnt: int,
+                           Record: Optional[frDbRecord]) -> None:
+        """
+        단일 레코드(frDbRecord)를 바이너리로 인코딩하여 분할 전송한다.
+        Record가 None이면 EOF(-2) 응답을 보낸다.
+        """
+        q_data = DB_RS_QUERY_DATA_T()
+
+        if Record is None:
+            q_data.m_QueryId = QueryId
+            q_data.m_Size    = -2          # EOF 마커 (C++ 원본과 동일)
+            q_data.m_CurRow  = RowCnt
+            self.m_DBServerSession.SendPacket(
+                DB_RS_QUERY_DATA, q_data.pack(), q_data.size()
+            )
+            return
+
+        # 레코드 인코딩
+        buf = bytearray()
+        for col in range(Record.m_Col):
+            col_val   = Record.m_Values[col]
+            col_bytes = col_val.encode("utf-8") if isinstance(col_val, str) else (col_val or b"")
+            buf += struct.pack("!I", len(col_bytes))
+            buf += col_bytes
+
+        offset     = 0
+        total_size = len(buf)
+
+        while total_size > 0:
+            q_data = DB_RS_QUERY_DATA_T()
+            q_data.m_QueryId = QueryId
+            q_data.m_CurRow  = RowCnt
+
+            chunk_size = min(total_size, MAX_DATA_SIZE)
+            q_data.m_Data    = buf[offset: offset + chunk_size]
+            q_data.m_Size    = chunk_size
+            q_data.m_SegFlag = SEG_ING if total_size > MAX_DATA_SIZE else SEG_END
+
+            offset     += chunk_size
+            total_size -= chunk_size
+
+            self.m_DBServerSession.SendPacket(
+                DB_RS_QUERY_DATA, q_data.pack(), q_data.size()
+            )
+
+    def _ResizeBufSize(self, cur_buf: bytearray, increment: int = DEF_BUF_SIZE) -> bytearray:
+        """
+        버퍼를 increment 만큼 확장한다.
+        C++ 포인터 재할당 패턴 → Python bytearray 확장으로 대체.
+        (EncodeBulkDataSend에서 bytearray를 직접 사용하므로 현재 미사용)
+        """
+        cur_buf.extend(bytearray(increment))
+        return cur_buf
