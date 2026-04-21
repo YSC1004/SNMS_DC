@@ -1,100 +1,177 @@
-import sys
-import os
+"""
+NetFinderConnMgr.py / NetFinderConnection.py
+C++ NetFinderConnMgr.h/.C + NetFinderConnection.h/.C → Python 변환
 
-# -------------------------------------------------------
-# Project Path Setup
-# -------------------------------------------------------
-current_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.abspath(os.path.join(current_dir, '../..'))
-if project_root not in sys.path:
-    sys.path.append(project_root)
+단순 구조 → 하나의 파일로 통합.
 
-# 부모 클래스 임포트
-from Class.Common.SockMgrConnMgr import SockMgrConnMgr
-from Class.ProcNaServer.NetFinderConnection import NetFinderConnection
-from Class.Common.CommType import *
+NetFinderConnMgr  : ProcConnectionMgr 상속, Accept + ProcessDead + SendProcessInfo
+NetFinderConnection: AsSocket 상속, 세션 식별 + AS_LOG_INFO 수신(no-op)
+"""
 
-class NetFinderConnMgr(SockMgrConnMgr):
+import asyncio
+import logging
+from typing import Optional
+
+from Common.ProcConnectionMgr import ProcConnectionMgr  # process_dead/@abstractmethod (치트시트)
+from Common.AsSocket import AsSocket                    # 가상함수 오버라이드 (치트시트)
+from Common.AsUtil import AsUtil
+from Common.CommTypeList import AS_PROCESS_STATUS_T
+from Common.CommType import (
+    NETFINDER,
+    START, STOP, ORDER_KILL,
+    AS_LOG_INFO,
+)
+
+logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# NetFinderConnMgr
+# =============================================================================
+
+class NetFinderConnMgr(ProcConnectionMgr):
     """
-    Manages the connection with the NetFinder process.
-    Handles socket acceptance and process status updates.
+    C++ NetFinderConnMgr (ProcConnectionMgr 상속) 대응.
+    RuleDownLoaderConnMgr과 동일한 패턴.
     """
-    def __init__(self):
-        """
-        C++: NetFinderConnMgr::NetFinderConnMgr()
-        """
+
+    def __init__(self) -> None:
         super().__init__()
-        self.m_NetFinderConnection = None
+        self._net_finder_conn: Optional["NetFinderConnection"] = None
 
-    def __del__(self):
-        """
-        C++: NetFinderConnMgr::~NetFinderConnMgr()
-        """
-        super().__del__()
+    # =========================================================================
+    # ProcConnectionMgr 추상 메서드 구현
+    # =========================================================================
 
-    def process_dead(self, name, pid, status):
+    def process_dead(self, name: str, pid: int, status: int = -1) -> None:
         """
-        C++: void ProcessDead(string Name, int Pid, int Status)
-        Handles the event when the NetFinder process terminates.
+        C++: ProcessDead(string Name, int Pid, int Status)
+        ProcConnectionMgr.child_process_dead() 에서 호출.
         """
-        self.send_process_info(name, STOP)
-        
-        if status == ORDER_KILL:
-            pass
-        else:
-            self.m_NetFinderConnection = None
-            from AsciiServerWorld import AsciiServerWorld
-            AsciiServerWorld._instance.process_dead(name, pid)
+        self.SendProcessInfo(name, STOP)
 
-    def accept_socket(self):
-        """
-        C++: void AcceptSocket()
-        Overridden to create NetFinderConnection instances.
-        """
-        con = NetFinderConnection(self)
+        if status != ORDER_KILL:
+            self._net_finder_conn = None
+            from ProcNaServer.AsciiServerWorld import MAINPTR
+            MAINPTR().ProcessDead(name, pid)
 
-        if not self.accept(con):
-            print(f"[NetFinderConnMgr] NetFinderConnMgr Socket Accept Error : {self.get_obj_err_msg()}")
-            con.close()
+    # =========================================================================
+    # AcceptSocket
+    # =========================================================================
+
+    def AcceptSocket(self) -> None:
+        """C++: AcceptSocket()"""
+        conn = NetFinderConnection(self)
+        if not self.Accept(conn):
+            logger.debug("NetFinderConnMgr Socket Accept Error : %s",
+                         self.GetObjErrMsg())
             return
 
-        print("[NetFinderConnMgr] Connection success Netfinder")
-        self.add(con)
+        logger.debug("Connection success Netfinder")
+        self.add(conn)                              # ConnectionMgr.add()
 
-    def set_net_finder_conn(self, con):
-        """
-        C++: void SetNetFinderConn(NetFinderConnection* Con)
-        """
-        self.m_NetFinderConnection = con
+    # =========================================================================
+    # StartProc (ProcConnectionMgr.start_proc 위임)
+    # =========================================================================
 
-    def send_process_info(self, session_name, status):
-        """
-        C++: void SendProcessInfo(const char* SessionName, int Status)
-        Updates the global process information (World) regarding NetFinder status.
-        """
-        from AsciiServerWorld import AsciiServerWorld
-        world = AsciiServerWorld._instance
-        
-        proc_info = AsProcessStatusT()
-        proc_info.ProcessId = session_name
-        proc_info.Status = status
+    def StartProc(self, name: str, args: list) -> int:
+        """C++: StartProc() → ProcConnectionMgr.start_proc() 위임."""
+        return self.start_proc(name, args)          # ProcConnectionMgr.start_proc()
 
-        if proc_info.Status == START:
-            if not self.get_process_info(session_name, proc_info):
+    # =========================================================================
+    # SetNetFinderConn
+    # =========================================================================
+
+    def SetNetFinderConn(self,
+                          conn: Optional["NetFinderConnection"]) -> None:
+        """C++: SetNetFinderConn(NetFinderConnection* Con)"""
+        self._net_finder_conn = conn
+
+    # =========================================================================
+    # SendProcessInfo
+    # =========================================================================
+
+    def SendProcessInfo(self, session_name: str, status: int) -> None:
+        """C++: SendProcessInfo(const char* SessionName, int Status)"""
+        from ProcNaServer.AsciiServerWorld import MAINPTR
+
+        proc_info = AS_PROCESS_STATUS_T()
+        proc_info.ProcessId   = session_name
+        proc_info.Status      = status
+
+        if status == START:
+            # ProcConnectionMgr.get_process_info_by_name()
+            if not self.get_process_info_by_name(session_name, proc_info):
                 return
 
-        proc_info.ManagerId = world.get_proc_name()
+        proc_info.ManagerId   = MAINPTR().GetProcName()
         proc_info.ProcessType = NETFINDER
-        
-        world.update_process_info(proc_info)
+        MAINPTR().UpdateProcessInfo(proc_info)
 
-    def get_process_info(self, session_name, proc_info):
-        """
-        Helper method to fill process info (PID, StartTime).
-        (Matches logic from other Managers)
-        """
-        from datetime import datetime
-        # C++ GetProcessInfo typically fills StartTime and PID
-        proc_info.StartTime = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        proc_info.Pid = 0 # Replace with actual PID lookup if available/needed
-        return True
+
+# =============================================================================
+# NetFinderConnection
+# =============================================================================
+
+class NetFinderConnection(AsSocket):
+    """
+    C++ NetFinderConnection (AsSocket 상속) 대응.
+
+    AsSocket 가상 메서드 오버라이드:
+      receive_packet()              ← C++ ReceivePacket()
+      close_socket()                ← C++ CloseSocket()
+      session_identify_callback()   ← C++ SessionIdentify()
+    """
+
+    def __init__(self, conn_mgr: NetFinderConnMgr) -> None:
+        super().__init__()
+        self._net_finder_conn_mgr: NetFinderConnMgr = conn_mgr
+
+    # =========================================================================
+    # AsSocket 가상 메서드 오버라이드
+    # =========================================================================
+
+    def receive_packet(self, packet, session_identify: int = -1) -> None:
+        """C++: virtual ReceivePacket(PACKET_T*, const int SessionIdentify)"""
+        if session_identify == NETFINDER:
+            self._net_finder_req(packet)
+        else:
+            logger.debug("UnKnown Session : %d", session_identify)
+
+    def session_identify_callback(self, session_type: int,
+                                   session_name: str = "") -> None:
+        """C++: virtual SessionIdentify(int SessionType, string SessionName)"""
+        from ProcNaServer.AsciiServerWorld import MAINPTR
+
+        logger.debug("Session Identify : Type(%s), SessionName(%s)",
+                     AsUtil.GetProcessTypeString(session_type), session_name)
+
+        if not self._net_finder_conn_mgr.add_session_name(session_name):  # ConnectionMgr.add_session_name()
+            self._close()
+            self._net_finder_conn_mgr.remove(self)  # ConnectionMgr.remove()
+            return
+
+        # AliveCheck 시작 (AsSocket.StartAliveCheck)
+        self.StartAliveCheck(
+            MAINPTR().GetProcAliveCheckTime(),      # AsWorld.GetProcAliveCheckTime()
+            MAINPTR().GetAliveCheckLimitCnt(),      # AsWorld.GetAliveCheckLimitCnt()
+        )
+        self._net_finder_conn_mgr.SendProcessInfo(
+            self.GetSessionName(), START)
+        self._net_finder_conn_mgr.SetNetFinderConn(self)
+
+    def close_socket(self, errno_val: int) -> None:
+        """C++: virtual CloseSocket(int Errno)"""
+        logger.debug("Socket Broken : %s", self.GetSessionName())
+        self._net_finder_conn_mgr.child_process_dead(self)  # ProcConnectionMgr.child_process_dead()
+
+    # =========================================================================
+    # NetFinderReq
+    # =========================================================================
+
+    def _net_finder_req(self, packet) -> None:
+        """C++: NetFinderReq(PACKET_T*) — AS_LOG_INFO 수신(no-op)."""
+        if packet.MsgId == AS_LOG_INFO:
+            pass                                    # C++ 원본 동일하게 처리 없음
+        else:
+            logger.error("Unknown Msg Id : %d", packet.MsgId)

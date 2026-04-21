@@ -1,75 +1,98 @@
-import sys
-import os
+"""
+MMCRequestConnection.py
+C++ MMCRequestConnection.h/.C → Python 변환
 
-# -------------------------------------------------------
-# Project Path Setup
-# -------------------------------------------------------
-current_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.abspath(os.path.join(current_dir, '../..'))
-if project_root not in sys.path:
-    sys.path.append(project_root)
+MMC 요청 처리 소켓 기반 클래스.
+  - AsSocket 상속
+  - MMCRequestQueue 보유 (세션 종료 시 SetStatus(false))
+  - SendFlowControl: 큐 초과 시 흐름 제어 패킷 전송
+  - SendMMCResult: 가상 메서드 (하위 클래스 오버라이드)
+"""
 
-from Class.Common.AsSocket import AsSocket
-from Class.Common.CommType import *
+import asyncio
+import logging
+from typing import Optional, TYPE_CHECKING
+
+from Common.AsSocket import AsSocket                    # 치트시트: AsSocket 가상함수
+from Common.CommTypeList import (
+    AS_MMC_FLOW_CONTROL_T, AS_MMC_RESULT_T,
+)
+from Common.CommType import AS_MMC_FLOW_CONTROL
+
+if TYPE_CHECKING:
+    from ProcNaServer.MMCRequestQueue import MMCRequestQueue
+
+logger = logging.getLogger(__name__)
+
+# 흐름 제어 타임아웃 이유
+FLOW_CONTROL_TIMEOUT_REASON = 1019
+
 
 class MMCRequestConnection(AsSocket):
     """
-    MMC 요청을 처리하는 연결의 기본 클래스.
-    MMCRequestQueue와 연동하여 흐름 제어(Flow Control) 메시지를 전송합니다.
+    C++ MMCRequestConnection (AsSocket 상속) 대응.
+
+    하위 클래스:
+      MMCGenConnection  (MMCGenerator/Scheduler/JobMonitor)
+      ExternalConnection (외부 시스템 MMC 요청)
     """
-    def __init__(self):
-        """
-        C++: MMCRequestConnection()
-        """
+
+    def __init__(self) -> None:
         super().__init__()
-        self.m_MMCRequestQueue = None
-        self.m_SessionStatus = False
+        self._mmc_request_queue: Optional["MMCRequestQueue"] = None
+        self._session_status:    bool = False               # C++: m_SessionStatus
 
-    def __del__(self):
-        """
-        C++: ~MMCRequestConnection()
-        """
-        # 큐에게 현재 연결이 끊어짐을 알림
-        if self.m_MMCRequestQueue:
-            self.m_MMCRequestQueue.set_status(False)
-        
-        super().__del__()
+    def __del__(self) -> None:
+        # C++: ~MMCRequestConnection() → m_MMCRequestQueue->SetStatus(false)
+        if self._mmc_request_queue is not None:
+            self._mmc_request_queue.SetStatus(False)
 
-    def send_flow_control(self, msg_id=0):
+    # =========================================================================
+    # SendFlowControl (virtual)
+    # =========================================================================
+
+    async def SendFlowControl(self, msg_id: int = -1) -> bool:
         """
-        C++: bool SendFlowControl(int MsgId)
-        MMC 요청 큐가 가득 찼을 때(STOP) 또는 해소되었을 때(RESTART)
-        클라이언트에게 흐름 제어 패킷을 전송합니다.
-        
-        Args:
-            msg_id (int): 0보다 크면 STOP(오버플로우), 0 이하이면 RESTART
+        C++: virtual SendFlowControl(int MsgId = -1)
+
+        MsgId > 0 : 큐 초과로 Stop   (controlMode=0, msgId=MsgId)
+        MsgId <= 0: 큐 여유로 Restart (controlMode=1, msgId=MsgId)
+
+        C++ 원본: SendNonBlockPacket → Python: SendPacket (async)
         """
-        flow_ctl = AsMmcFlowControlT()
-        
-        # C++ Logic:
-        # if(MsgId > 0) -> STOP (0)
-        # else -> RESTART (1)
-        
+        flow_ctl = AS_MMC_FLOW_CONTROL_T()
+
         if msg_id > 0:
-            # STOP: Queue Full
+            # Stop: 커맨드 양 초과
             flow_ctl.controlMode = 0
-            flow_ctl.msgId = msg_id
-            flow_ctl.controlInfo = "Command 허용량을 초과하였습니다"
+            flow_ctl.msgId       = msg_id
+            flow_ctl.controlInfo = "Command 양을 초과하였습니다"
         else:
-            # RESTART: Queue Available
-            flow_ctl.msgId = msg_id # 보통 0
+            # Restart
+            flow_ctl.msgId       = msg_id
             flow_ctl.controlMode = 1
-            
-        # 패킷 직렬화 및 전송
-        # C++: SendNonBlockPacket 사용. Python AsSocket은 기본적으로 블로킹/논블로킹 설정을 따름.
-        # 여기서는 표준 packet_send 사용.
-        body = flow_ctl.pack()
-        return self.packet_send(PacketT(AS_MMC_FLOW_CONTROL, len(body), body))
 
-    def send_mmc_result(self, result):
+        payload = _pack(flow_ctl)
+        return await self.SendPacket(AS_MMC_FLOW_CONTROL, payload, len(payload))
+
+    # =========================================================================
+    # SendMMCResult (virtual)
+    # =========================================================================
+
+    async def SendMMCResult(self, result: AS_MMC_RESULT_T) -> bool:
         """
-        C++: virtual bool SendMMCResult(AS_MMC_RESULT_T* Result)
-        가상 함수: 자식 클래스에서 구현해야 함.
+        C++: virtual SendMMCResult(AS_MMC_RESULT_T*) — 가상 메서드.
+        하위 클래스(ExternalConnection 등)에서 오버라이드.
         """
-        print("[MMCRequestConnection] MMCRequestConnection::SendMMCResult is virtual Function")
+        logger.debug("MMCRequestConnection::SendMMCResult is virtual Function")
         return True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 패킷 직렬화 헬퍼
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _pack(obj) -> bytes:
+    if hasattr(obj, 'pack'):
+        return obj.pack()
+    return b''

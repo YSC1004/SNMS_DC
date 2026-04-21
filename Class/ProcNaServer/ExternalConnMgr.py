@@ -1,99 +1,104 @@
-import sys
-import os
+"""
+ExternalConnMgr.py
+C++ ExternalConnMgr.h/.C → Python 변환
+
+외부 시스템(MMC 요청 클라이언트) 연결 관리자.
+  - ExternalConnection Accept 관리
+  - MMC 결과 해당 세션으로 전달 (SendExtMMCReqResult)
+  - 세션 ID 별 현재 접속 수 조회 (GetCurSessionCnt)
+"""
+
+import asyncio
+import logging
 import threading
+from typing import TYPE_CHECKING
 
-# -------------------------------------------------------
-# Project Path Setup
-# -------------------------------------------------------
-current_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.abspath(os.path.join(current_dir, '../..'))
-if project_root not in sys.path:
-    sys.path.append(project_root)
+from Common.ConnectionMgr import ConnectionMgr          # add/remove/is_valid_connection (치트시트)
+from Common.CommTypeList import AS_MMC_RESULT_T
+from ProcNaServer.MMCRequestConnection import MMCRequestConnection
 
-# 부모 클래스 임포트 (경로에 맞게 수정)
-from Class.Common.SockMgrConnMgr import SockMgrConnMgr
-from Class.ProcNaServer.ExternalConnection import ExternalConnection
+if TYPE_CHECKING:
+    from ProcNaServer.ExternalConnection import ExternalConnection
 
-class ExternalConnMgr(SockMgrConnMgr):
+logger = logging.getLogger(__name__)
+
+
+class ExternalConnMgr(ConnectionMgr):
     """
-    Manages connections from External Systems.
-    Handles Accept, MMC Result forwarding, and session counting.
+    C++ ExternalConnMgr (ConnectionMgr 상속) 대응.
+
+    뮤텍스:
+      C++ frMutex m_SocketRemoveLock
+      → _socket_remove_lock() / _socket_remove_unlock() 오버라이드
     """
-    def __init__(self):
-        """
-        C++: ExternalConnMgr::ExternalConnMgr()
-        """
+
+    def __init__(self) -> None:
         super().__init__()
-        # 리스트 접근 보호를 위한 뮤텍스
-        self.m_SocketRemoveLock = threading.Lock()
+        self._remove_lock = threading.Lock()    # C++: frMutex m_SocketRemoveLock
 
-    def __del__(self):
-        """
-        C++: ExternalConnMgr::~ExternalConnMgr()
-        """
-        super().__del__()
+    # =========================================================================
+    # ConnectionMgr 뮤텍스 오버라이드
+    # =========================================================================
 
-    def accept_socket(self):
-        """
-        C++: void AcceptSocket()
-        """
-        # 1. ExternalConnection 객체 생성
-        ext_conn = ExternalConnection(self)
+    def _socket_remove_lock(self) -> None:
+        """C++: SocketRemoveLock() → frMutex.Lock()"""
+        self._remove_lock.acquire()
 
-        # 2. Accept 수행 (부모 클래스 메서드 활용)
-        if not self.accept(ext_conn):
-            print(f"[ExternalConnMgr] Ext Socket Accept Error : {self.get_obj_err_msg()}")
-            ext_conn.close()
+    def _socket_remove_unlock(self) -> None:
+        """C++: SocketRemoveUnLock() → frMutex.UnLock()"""
+        self._remove_lock.release()
+
+    # =========================================================================
+    # AcceptSocket
+    # =========================================================================
+
+    def AcceptSocket(self) -> None:
+        """C++: AcceptSocket()"""
+        from ProcNaServer.ExternalConnection import ExternalConnection
+
+        conn = ExternalConnection(self)
+        if not self.Accept(conn):
+            logger.debug("Ext Socket Accept Error : %s", self.GetObjErrMsg())
             return
 
-        # 3. 관리 리스트에 추가
-        # C++ 코드에서는 Lock을 Add 내부나 별도로 처리할 수 있으나, 
-        # 여기서는 Add 호출 (SockMgrConnMgr 구현에 따름)
-        self.add(ext_conn)
+        self.add(conn)                              # ConnectionMgr.add()
+        conn.SetReReadCheck(True)                   # AsSocket.SetReReadCheck()
+        logger.debug("External System Connection(%s)", conn.get_peer_ip())
 
-        # C++: extConn->SetWriterableCheck(true);
-        # Python AsSocket 구현에 따라 필요 시 호출. (여기서는 생략 또는 스텁)
-        # ext_conn.set_writable_check(True) 
+    # =========================================================================
+    # SendExtMMCReqResult
+    # =========================================================================
 
-        print(f"[ExternalConnMgr] External System Connection({ext_conn.get_peer_ip()})")
-
-    def send_ext_mmc_req_result(self, ext_con, res):
+    def SendExtMMCReqResult(self, ext_con: MMCRequestConnection,
+                             res: AS_MMC_RESULT_T) -> None:
         """
-        C++: void SendExtMMCReqResult(MMCRequestConnection* ExtCon, AS_MMC_RESULT_T* Res)
-        ExternalConnection(또는 부모인 MMCRequestConnection)에게 결과 전송
+        C++: SendExtMMCReqResult(MMCRequestConnection* ExtCon, AS_MMC_RESULT_T* Res)
+        해당 External 세션이 유효한 경우에만 MMC 결과 전송.
         """
-        with self.m_SocketRemoveLock:
-            # 연결 유효성 확인 (SockMgrConnMgr의 메서드)
-            if self.is_valid_connection(ext_con):
-                # 로그 출력 (필요 시 주석 해제)
-                # print(f"[ExternalConnMgr] Send MMC Result to [{ext_con.get_session_name()}][{ext_con.get_peer_ip()}]")
-                
-                # 결과 전송
-                ext_con.send_mmc_result(res)
+        self._socket_remove_lock()
+        try:
+            if self.is_valid_connection(ext_con):   # ConnectionMgr.is_valid_connection()
+                logger.debug("Send MMC Result to [%s][%s]",
+                             ext_con.GetSessionName(), ext_con.get_peer_ip())
+                asyncio.ensure_future(ext_con.SendMMCResult(res))
             else:
-                print("[ExternalConnMgr] Send MMC Result Error : Disconnected Session Or Invalid Session...")
+                logger.debug("Send MMC Result Error : "
+                             "Disconnected Session Or Invalid Session...")
+        finally:
+            self._socket_remove_unlock()
 
-    def get_cur_session_cnt(self, session_id):
-        """
-        C++: int GetCurSessionCnt(string SessionID)
-        특정 SessionID를 가진 연결의 개수를 반환
-        """
-        cnt = 0
-        with self.m_SocketRemoveLock:
-            # m_SocketConnectionList는 부모 클래스(SockMgrConnMgr/ConnectionMgr) 멤버
-            for conn in self.m_SocketConnectionList:
-                if session_id == conn.get_session_name():
-                    cnt += 1
-        return cnt
+    # =========================================================================
+    # GetCurSessionCnt
+    # =========================================================================
 
-    def socket_remove_lock(self):
+    def GetCurSessionCnt(self, session_id: str) -> int:
         """
-        C++: void SocketRemoveLock()
+        C++: GetCurSessionCnt(string SessionID)
+        동일 세션명으로 접속 중인 수 반환.
+        C++: frMutexGuard → with self._remove_lock
         """
-        self.m_SocketRemoveLock.acquire()
-
-    def socket_remove_unlock(self):
-        """
-        C++: void SocketRemoveUnLock()
-        """
-        self.m_SocketRemoveLock.release()
+        with self._remove_lock:
+            return sum(
+                1 for sock in self._socket_connection_list
+                if sock.GetSessionName() == session_id
+            )

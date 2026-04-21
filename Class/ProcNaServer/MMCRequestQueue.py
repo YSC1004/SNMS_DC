@@ -1,205 +1,206 @@
-import sys
-import os
-import threading
+"""
+MMCRequestQueue.py
+C++ MMCRequestQueue.h/.C + MMCRequestQueueTimer.h/.C → Python 변환
+
+MMC 요청 큐 + 타이머 (두 클래스를 하나의 파일로 통합).
+  - MMCRequestQueue: thread-safe deque + 흐름 제어
+  - MMCRequestQueueTimer: AsWorld.SetTimer 기반 (별도 클래스 불필요)
+
+C++ pthread_mutex → threading.Lock
+C++ MMCRequestQueueTimer(frTimerSensor) → AsWorld.SetTimer 직접 사용
+"""
+
+import asyncio
 import copy
+import logging
+import threading
 from collections import deque
+from typing import Optional, TYPE_CHECKING
 
-# -------------------------------------------------------
-# Project Path Setup
-# -------------------------------------------------------
-current_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.abspath(os.path.join(current_dir, '../..'))
-if project_root not in sys.path:
-    sys.path.append(project_root)
+from Common.CommTypeList import AS_MMC_REQUEST_T
 
-from Class.ProcNaServer.MMCRequestQueueTimer import MMCRequestQueueTimer
+if TYPE_CHECKING:
+    from ProcNaServer.MMCRequestConnection import MMCRequestConnection
+
+logger = logging.getLogger(__name__)
+
+# C++: case 1019 (타이머 이유값)
+QUEUE_CHECK_TIMEOUT_REASON = 1019
+
 
 class MMCRequestQueue:
     """
-    MMC 요청 메시지를 관리하는 큐 클래스.
-    최대 크기 제한 및 흐름 제어(Flow Control) 기능을 포함함.
+    C++ MMCRequestQueue (frObject 상속) 대응.
+
+    C++ frObject::SetTimer / ReceiveTimeOut
+    → AsWorld.SetTimer 대신 threading.Timer 직접 사용
+      (MMCRequestQueue는 AsWorld를 상속하지 않으므로)
     """
-    def __init__(self, max_cmd_cnt, req_conn):
-        """
-        C++: MMCRequestQueue(int MaxCmdCnt, MMCRequestConnection* ReqConn)
-        """
-        self.m_MaxCmdCnt = max_cmd_cnt
-        self.m_Status = True
-        self.m_QueueEmpty = True # True implies "Ready to accept", False implies "Full/Flow Control Active"
-        self.m_MMCRequestConnection = req_conn
-        
-        # C++ std::list -> Python deque (Thread-safe, O(1) pops)
-        self.m_ReqList = deque()
-        
-        self.m_QueueTimer = None
-        self.m_QueueLock = threading.Lock()
-        self.m_StatusLock = threading.Lock()
-        self.m_QueueName = ""
 
-    def __del__(self):
-        """
-        C++: ~MMCRequestQueue()
-        """
-        # Python handles memory deallocation automatically
-        self.m_ReqList.clear()
-        if self.m_QueueTimer:
-            # Assuming timer has a cancel or stop method if inherited from AsTimer
-            pass
+    def __init__(self, max_cmd_cnt: int,
+                 req_conn: "MMCRequestConnection") -> None:
+        self._max_cmd_cnt:           int                      = max_cmd_cnt
+        self._status:                bool                     = True
+        self._queue_empty:           bool                     = True   # C++: m_QueueEmpty (큐 수용 가능 여부)
+        self._mmc_request_connection: Optional["MMCRequestConnection"] = req_conn
 
-    def insert_mmc_request(self, mmc_req):
-        """
-        C++: bool InsertMMCRequest(AS_MMC_REQUEST_T* MMCReq)
-        큐에 요청 삽입. 큐가 가득 찼으면 Flow Control 시작.
-        """
-        if self.m_QueueEmpty:
-            with self.m_QueueLock:
-                # 큐 크기 체크
-                if self.m_MaxCmdCnt < len(self.m_ReqList):
-                    # Lock 해제는 with 문이 처리
-                    
-                    # 1. Flow Control 시작 (Stop)
-                    # print(f"[MMCRequestQueue] Send Flow Control Stop... MaxSize({self.m_MaxCmdCnt}), QueueSize({len(self.m_ReqList)})")
-                    
-                    if self.m_MMCRequestConnection:
-                        # C++: SendFlowControl(MMCReq->id)
-                        self.m_MMCRequestConnection.send_flow_control(mmc_req.id)
-                    
-                    self.m_QueueEmpty = False
-                    self.set_timer()
-                    return False
+        self._req_list:   deque[AS_MMC_REQUEST_T] = deque()
+        self._queue_lock: threading.Lock           = threading.Lock()  # C++: m_QueueLock
+        self._status_lock: threading.Lock          = threading.Lock()  # C++: m_StatusLock
 
-                # 2. 큐에 삽입
-                # C++: memcpy -> push_back
-                # Python: Deep copy to act like separate memory instance
-                new_req = copy.deepcopy(mmc_req)
-                self.m_ReqList.append(new_req)
-                
-                return True
-        else:
-            # print("[MMCRequestQueue] Command Not Receive Because of Queue is Full...")
+        self._queue_name:  str                     = ""
+        self._timer:       Optional[threading.Timer] = None            # MMCRequestQueueTimer 대체
+
+    def __del__(self) -> None:
+        self._cancel_timer()
+
+    # =========================================================================
+    # InsertMMCRequest
+    # =========================================================================
+
+    def InsertMMCRequest(self, mmc_req: AS_MMC_REQUEST_T) -> bool:
+        """
+        C++: InsertMMCRequest(AS_MMC_REQUEST_T*)
+        큐가 수용 가능 상태(_queue_empty=True)일 때만 삽입.
+        최대 크기 초과 시 FlowControl Stop 전송 후 타이머 설정.
+        """
+        if not self._queue_empty:
+            logger.debug("Command Not Receive Because of Queue is Full...")
             return False
 
-    def get_mmc_request(self):
-        """
-        C++: AS_MMC_REQUEST_T* GetMMCRequest()
-        큐에서 요청 하나를 꺼냄 (FIFO)
-        """
-        mmc_req = None
-        
-        with self.m_QueueLock:
-            # --- Debug Logging (Before) ---
-            # self.status_lock()
-            # conn_name = self.m_MMCRequestConnection.get_session_name() if self.m_MMCRequestConnection else "Disconnect Session"
-            # print(f"GetMMCRequest Before cnt({conn_name}) : {len(self.m_ReqList)}")
-            # self.status_unlock()
-            # ------------------------------
+        with self._queue_lock:
+            if len(self._req_list) >= self._max_cmd_cnt:
+                # 큐 초과 → FlowControl Stop
+                logger.debug("Send Flow Control Stop... MaxSize(%d), QueueSize(%d)",
+                             self._max_cmd_cnt, len(self._req_list))
+                if self._mmc_request_connection:
+                    asyncio.ensure_future(
+                        self._mmc_request_connection.SendFlowControl(mmc_req.id))
+                self._queue_empty = False
+                self._set_timer()
+                return False
 
-            if len(self.m_ReqList) > 0:
-                mmc_req = self.m_ReqList.popleft() # pop_front
+            new_req = copy.copy(mmc_req)
+            self._req_list.append(new_req)
+            return True
 
-            # --- Debug Logging (After) ---
-            # self.status_lock()
-            # conn_name = self.m_MMCRequestConnection.get_session_name() if self.m_MMCRequestConnection else "Disconnect Session"
-            # print(f"GetMMCRequest After cnt({conn_name}) : {len(self.m_ReqList)}")
-            # self.status_unlock()
-            # -----------------------------
+    # =========================================================================
+    # GetMMCRequest
+    # =========================================================================
 
-        return mmc_req
-
-    def set_status(self, status):
+    def GetMMCRequest(self) -> Optional[AS_MMC_REQUEST_T]:
         """
-        C++: void SetStatus(bool Status)
+        C++: GetMMCRequest() → deque 앞에서 꺼내 반환. 비어있으면 None.
         """
-        with self.m_StatusLock:
-            self.m_Status = status
-            # Status가 변경(주로 False)되면 연결 객체 참조를 해제
-            self.m_MMCRequestConnection = None
+        with self._queue_lock:
+            self.StatusLock()
+            conn_name = (self._mmc_request_connection.GetSessionName()
+                         if self._mmc_request_connection else "Disconnect Session")
+            logger.debug("GetMMCRequest Before cnt(%s) : %d",
+                         conn_name, len(self._req_list))
+            self.StatusUnLock()
 
-    def get_status(self):
-        """
-        C++: bool GetStatus()
-        """
-        return self.m_Status
-
-    def receive_time_out(self, reason, extra_reason=None):
-        """
-        C++: void ReceiveTimeOut(int Reason, void* ExtraReason)
-        타이머 콜백: Flow Control 해제 조건 확인
-        """
-        if reason == 1019:
-            # --- Debug Log ---
-            # self.status_lock()
-            # conn_name = self.m_MMCRequestConnection.get_session_name() if self.m_MMCRequestConnection else "Disconnect Session"
-            # print(f"Check MMCReqQueue size({conn_name})...")
-            # self.status_unlock()
-            # -----------------
-
-            # 큐 상태 재확인 (Lock 필요 여부는 상황에 따르나, 여기선 size 체크만 수행)
-            current_size = len(self.m_ReqList)
-
-            if self.m_MaxCmdCnt < current_size:
-                # 여전히 큐가 가득 참 -> 타이머 재설정
-                # print(f"[MMCRequestQueue] MaxSize({self.m_MaxCmdCnt}), QueueSize({current_size})")
-                self.set_timer()
+            if self._req_list:
+                req = self._req_list.popleft()
             else:
-                # 큐가 비워짐 -> Flow Control 해제 (Restart)
-                # print("[MMCRequestQueue] Send Flow Control Restart...")
-                
-                with self.m_StatusLock:
-                    if self.m_Status and self.m_MMCRequestConnection:
-                        # C++: SendFlowControl() (Overloaded or Default Arg)
-                        # Python: Pass None or specific flag to indicate Resume
-                        # Assuming connection handles None as Resume or generic signal
-                        # If connection only accepts one arg, you might need to check implementation.
-                        # Here assuming send_flow_control(-1) or similar means resume.
-                        # For now, calling without args equivalent if implemented with default.
-                        if hasattr(self.m_MMCRequestConnection, 'send_flow_control'):
-                             # Assuming implementation supports resume logic
-                             try:
-                                 self.m_MMCRequestConnection.send_flow_control(None)
-                             except TypeError:
-                                 # Fallback if signature requires argument
-                                 self.m_MMCRequestConnection.send_flow_control(-1)
+                req = None
 
-                self.m_QueueEmpty = True # Ready to accept again
+            self.StatusLock()
+            logger.debug("GetMMCRequest After cnt(%s) : %d",
+                         conn_name, len(self._req_list))
+            self.StatusUnLock()
 
+        return req
+
+    # =========================================================================
+    # SetStatus / GetStatus
+    # =========================================================================
+
+    def SetStatus(self, status: bool) -> None:
+        """
+        C++: SetStatus(bool Status)
+        세션 종료 시 MMCRequestConnection 포인터 해제.
+        """
+        with self._status_lock:
+            self._status = status
+            self._mmc_request_connection = None
+
+    def GetStatus(self) -> bool:
+        """C++: GetStatus()"""
+        return self._status
+
+    # =========================================================================
+    # StatusLock / StatusUnLock
+    # =========================================================================
+
+    def StatusLock(self) -> None:
+        """C++: StatusLock() → pthread_mutex_lock(&m_StatusLock)"""
+        self._status_lock.acquire()
+
+    def StatusUnLock(self) -> None:
+        """C++: StatusUnLock() → pthread_mutex_unlock(&m_StatusLock)"""
+        self._status_lock.release()
+
+    # =========================================================================
+    # QueueName
+    # =========================================================================
+
+    def SetQueueName(self, name: str) -> None:
+        self._queue_name = name
+
+    def GetQueueName(self) -> str:
+        return self._queue_name
+
+    # =========================================================================
+    # ReceiveTimeOut (타이머 콜백)
+    # =========================================================================
+
+    def ReceiveTimeOut(self, reason: int, extra_reason=None) -> None:
+        """
+        C++: ReceiveTimeOut(int Reason, void* ExtraReason)
+        MMCRequestQueueTimer → threading.Timer 콜백으로 직접 호출.
+        reason=1019: 큐 크기 재확인 후 FlowControl Restart 또는 재타이머.
+        """
+        if reason == QUEUE_CHECK_TIMEOUT_REASON:
+            self.StatusLock()
+            conn_name = (self._mmc_request_connection.GetSessionName()
+                         if self._mmc_request_connection else "Disconnect Session")
+            self.StatusUnLock()
+            logger.debug("Check MMCReqQueue size(%s)...", conn_name)
+
+            with self._queue_lock:
+                q_size = len(self._req_list)
+
+            if q_size >= self._max_cmd_cnt:
+                logger.debug("MaxSize(%d), QueueSize(%d)",
+                             self._max_cmd_cnt, q_size)
+                self._set_timer()
+            else:
+                logger.debug("Send Flow Control Restart...")
+                with self._status_lock:
+                    if self._status and self._mmc_request_connection:
+                        asyncio.ensure_future(
+                            self._mmc_request_connection.SendFlowControl())
+                self._queue_empty = True
         else:
-            print(f"[MMCRequestQueue] [CORE_ERROR] Unknown Time Out : {reason}")
+            logger.error("Unknown Time Out : %d", reason)
 
-    def set_timer(self):
-        """
-        C++: void SetTimer()
-        """
-        if self.m_QueueTimer is None:
-            self.m_QueueTimer = MMCRequestQueueTimer(self)
-        
-        # Assuming MMCRequestQueueTimer / AsTimer has set_timer(seconds, id)
-        # 2초 후 1019번 이벤트 발생
-        if hasattr(self.m_QueueTimer, 'set_timer'):
-            self.m_QueueTimer.set_timer(2, 1019)
-        elif hasattr(self.m_QueueTimer, 'SetTimer'): # C++ style naming check
-             self.m_QueueTimer.SetTimer(2, 1019)
+    # =========================================================================
+    # 내부 타이머 헬퍼
+    # =========================================================================
 
-    def set_queue_name(self, name):
+    def _set_timer(self) -> None:
         """
-        C++: void SetQueueName(string Name)
+        C++: SetTimer() → MMCRequestQueueTimer::SetTimer(2, 1019)
+        threading.Timer로 2초 후 ReceiveTimeOut(1019) 호출.
         """
-        self.m_QueueName = name
+        self._cancel_timer()
+        self._timer = threading.Timer(
+            2.0, self.ReceiveTimeOut, args=(QUEUE_CHECK_TIMEOUT_REASON,))
+        self._timer.daemon = True
+        self._timer.start()
 
-    def get_queue_name(self):
-        """
-        C++: string GetQueueName()
-        """
-        return self.m_QueueName
-
-    def status_lock(self):
-        """
-        C++: void StatusLock()
-        """
-        self.m_StatusLock.acquire()
-
-    def status_unlock(self):
-        """
-        C++: void StatusUnLock()
-        """
-        self.m_StatusLock.release()
+    def _cancel_timer(self) -> None:
+        if self._timer:
+            self._timer.cancel()
+            self._timer = None

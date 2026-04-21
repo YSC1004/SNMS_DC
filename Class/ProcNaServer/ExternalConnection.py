@@ -1,234 +1,269 @@
-import sys
-import os
+"""
+ExternalConnection.py
+C++ ExternalConnection.h/.C → Python 변환
 
-# -------------------------------------------------------
-# Project Path Setup
-# -------------------------------------------------------
-current_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.abspath(os.path.join(current_dir, '../..'))
-if project_root not in sys.path:
-    sys.path.append(project_root)
+외부 시스템 MMC 요청 소켓 연결 처리.
+  - MMCRequestConnection 상속
+  - 세션 식별 (ReceiveMMCIdentReq): 권한 확인 → MMCRequestQueue 등록
+  - MMC 요청 수신 → 큐 삽입 + ACK 전송
+  - MMC 결과 전송 (SendMMCResult 오버라이드)
+"""
 
-from Class.Common.AsSocket import AsSocket
-from Class.Common.CommType import *
-from Class.Common.AsciiMmcType import *
-from Class.Common.AsUtil import AsUtil
+import asyncio
+import logging
+from typing import Optional, TYPE_CHECKING
 
-class ExternalConnection(AsSocket):
+from ProcNaServer.MMCRequestConnection import MMCRequestConnection
+from Common.CommTypeList import (
+    AS_MMC_REQUEST_T, AS_MMC_REQUEST_OLD_T, AS_MMC_RESULT_T,
+    AS_MMC_IDENT_REQ_T, AS_MMC_IDENT_RES_T, AS_MMC_ACK_T,
+    AS_COMMAND_AUTHORITY_INFO_T,
+)
+from Common.CommType import (
+    AS_MMC_REQ, AS_MMC_REQ_OLD, AS_MMC_IDENT_REQ,
+    AS_MMC_IDENT_RES, AS_MMC_REQ_ACK, AS_MMC_RES,
+)
+from Common.AsUtil import AsUtil
+
+# 필드 최대 길이 상수 (CommType 또는 CommTypeList에서 import)
+try:
+    from Common.CommType import (
+        EQUIP_ID_LEN, MMC_CMD_LEN_EX, USER_ID_LEN, IP_ADDRESS_LEN,
+    )
+except ImportError:
+    EQUIP_ID_LEN    = 64
+    MMC_CMD_LEN_EX  = 512
+    USER_ID_LEN     = 40
+    IP_ADDRESS_LEN  = 20
+
+from ProcNaServer.AsciiServerType import SESSION_TYPE_MMC
+
+if TYPE_CHECKING:
+    from ProcNaServer.ExternalConnMgr import ExternalConnMgr
+
+logger = logging.getLogger(__name__)
+
+# 큐 삽입 실패 최대 허용 횟수
+MAX_FAULT_CNT = 200
+
+
+class ExternalConnection(MMCRequestConnection):
     """
-    Handles connections from External Systems (sending MMC commands).
-    Inherits from AsSocket.
+    C++ ExternalConnection (MMCRequestConnection 상속) 대응.
+
+    AsSocket 가상 메서드 오버라이드:
+      receive_packet()    ← C++ ReceivePacket()
+      close_socket()      ← C++ CloseSocket()
+
+    MMCRequestConnection 가상 메서드 오버라이드:
+      SendMMCResult()     ← C++ SendMMCResult()
     """
-    def __init__(self, conn_mgr):
-        """
-        C++: ExternalConnection(ExternalConnMgr* ConnMgr)
-        """
+
+    def __init__(self, conn_mgr: "ExternalConnMgr") -> None:
         super().__init__()
-        self.m_ExtConnMgr = conn_mgr
-        self.m_IdentFlag = False
-        self.m_FaultCnt = 0
-        self.m_CommandAuthorityInfo = AsCommandAuthorityInfoT()
-        self.m_SessionStatus = False
-        self.m_MMCRequestQueue = None
+        self._ext_conn_mgr:            "ExternalConnMgr"          = conn_mgr
+        self._ident_flag:              bool                        = False
+        self._fault_cnt:               int                        = 0
+        self._command_authority_info:  AS_COMMAND_AUTHORITY_INFO_T = AS_COMMAND_AUTHORITY_INFO_T()
 
-    def __del__(self):
-        """
-        C++: ~ExternalConnection()
-        """
-        super().__del__()
+    # =========================================================================
+    # AsSocket 가상 메서드 오버라이드
+    # =========================================================================
 
-    def receive_packet(self, packet, session_identify=0):
+    def receive_packet(self, packet, session_identify: int = -1) -> None:
         """
-        C++: void ReceivePacket(PACKET_T* Packet, const int SessionIdentify)
+        C++: virtual ReceivePacket(PACKET_T*, const int SessionIdentify)
+        MsgId 기반 분기 (세션 타입 무관).
         """
-        msg_id = packet.msg_id
+        msg_id = packet.MsgId
 
         if msg_id == AS_MMC_REQ_OLD:
-            req_old = AsMmcRequestOldT.unpack(packet.msg_body)
-            if req_old:
-                self.receive_mmc_req_old(req_old)
+            asyncio.ensure_future(self._recv_mmc_req_old(packet.Msg))
 
         elif msg_id == AS_MMC_REQ:
-            req = AsMmcRequestT.unpack(packet.msg_body)
-            if req:
-                self.receive_mmc_req(req)
+            asyncio.ensure_future(self._recv_mmc_req(packet.Msg))
 
         elif msg_id == AS_MMC_IDENT_REQ:
-            ident_req = AsMmcIdentReqT.unpack(packet.msg_body)
-            if ident_req:
-                self.receive_mmc_ident_req(ident_req)
+            asyncio.ensure_future(self._recv_mmc_ident_req(packet.Msg))
 
         else:
-            print(f"[ExternalConnection] Unknown MsgId : {msg_id}")
-            print(f"[ExternalConnection] so now disconnecting.........")
-            self.close_socket(1)
+            logger.debug("Unknown MsgId : %d", msg_id)
+            logger.debug("so now disconnecting.........")
+            asyncio.ensure_future(self._force_close())
 
-    def receive_mmc_req_old(self, mmc_req_old):
-        """
-        C++: void ReceiveMMCReq(AS_MMC_REQUEST_OLD_T* MMCReq)
-        """
-        req_new = AsMmcRequestT()
-        AsUtil.convert_mmc_old_to_new(mmc_req_old, req_new)
-        self.receive_mmc_req(req_new)
+    def close_socket(self, errno_val: int) -> None:
+        """C++: virtual CloseSocket(int Errno)"""
+        logger.debug("External connection close (%s,%s)",
+                     self.GetSessionName(), self.get_peer_ip())
+        self._ext_conn_mgr.remove(self)            # ConnectionMgr.remove()
 
-    def check_req(self, mmc_req):
-        """
-        C++: bool CheckReq(AS_MMC_REQUEST_T* MmcReq)
-        Truncates string fields to ensure they fit within buffer limits.
-        """
-        # Ensure imports include length constants like EQUIP_ID_LEN
-        if len(mmc_req.ne) > EQUIP_ID_LEN - 1:
-            mmc_req.ne = mmc_req.ne[:EQUIP_ID_LEN - 1]
+    # =========================================================================
+    # MMCRequestConnection 가상 메서드 오버라이드
+    # =========================================================================
 
-        if len(mmc_req.mmc) > MMC_CMD_LEN_EX - 1:
-            mmc_req.mmc = mmc_req.mmc[:MMC_CMD_LEN_EX - 1]
+    async def SendMMCResult(self, result: AS_MMC_RESULT_T) -> bool:
+        """C++: virtual SendMMCResult(AS_MMC_RESULT_T*) → AS_MMC_RES 패킷 전송."""
+        payload = _pack(result)
+        return await self.SendPacket(AS_MMC_RES, payload, len(payload))
 
-        if len(mmc_req.userid) > USER_ID_LEN - 1:
-            mmc_req.userid = mmc_req.userid[:USER_ID_LEN - 1]
+    # =========================================================================
+    # 세션 식별 (ReceiveMMCIdentReq)
+    # =========================================================================
 
-        if len(mmc_req.display) > IP_ADDRESS_LEN - 1:
-            mmc_req.display = mmc_req.display[:IP_ADDRESS_LEN - 1]
+    async def _recv_mmc_ident_req(self,
+                                   ident_req: AS_MMC_IDENT_REQ_T) -> None:
+        """C++: ReceiveMMCIdentReq(AS_MMC_IDENT_REQ_T*)"""
+        from ProcNaServer.AsciiServerWorld import MAINPTR
 
-        return True
-
-    def receive_mmc_req(self, mmc_req):
-        """
-        C++: void ReceiveMMCReq(AS_MMC_REQUEST_T* MMCReq)
-        """
-        if self.m_SessionStatus:
-            # Set attributes from Authority Info
-            mmc_req.priority = self.m_CommandAuthorityInfo.Priority
-            mmc_req.logMode = self.m_CommandAuthorityInfo.LogMode
-            
-            # Set Display IP
-            mmc_req.display = self.get_peer_ip()
-
-            # Check and truncate lengths
-            self.check_req(mmc_req)
-
-            # Insert into Queue
-            # In C++: m_MMCRequestQueue->InsertMMCRequest(MMCReq)
-            # Python queue implies successful insertion usually, unless full.
-            # Assuming insert_mmc_request returns True on success.
-            if self.m_MMCRequestQueue and self.m_MMCRequestQueue.insert_mmc_request(mmc_req):
-                # Debug Log
-                # print(f"Recevie MMC External Command From {self.get_session_name()}({self.get_peer_ip()}) : ...")
-                
-                self.m_FaultCnt = 0
-
-                if self.m_CommandAuthorityInfo.AckMode:
-                    req_res = AsMmcAckT()
-                    req_res.id = mmc_req.id
-                    req_res.resultMode = 1 # Success
-                    
-                    body = req_res.pack()
-                    self.packet_send(PacketT(AS_MMC_REQ_ACK, len(body), body))
-                    # print(f"Send Cmd Req Ack(extid:{req_res.id})")
-
-            else:
-                # Queue Insert Failed
-                self.m_FaultCnt += 1
-                
-                if self.m_CommandAuthorityInfo.AckMode:
-                    req_res = AsMmcAckT()
-                    req_res.id = mmc_req.id
-                    req_res.resultMode = 0 # Fail
-                    
-                    body = req_res.pack()
-                    self.packet_send(PacketT(AS_MMC_REQ_ACK, len(body), body))
-                    # print(f"Send Cmd Req Ack(extid:{req_res.id})")
-
-                if self.m_FaultCnt > 200:
-                    print(f"[ExternalConnection] Insert Queue Fail Count Over({self.get_session_name()})")
-                    self.close()
-                    if self.m_ExtConnMgr:
-                        self.m_ExtConnMgr.remove(self)
-
-        else:
-            print("[ExternalConnection] Illegal Command of Not Ident Connection")
-
-    def close_socket(self, errno_val=0):
-        """
-        C++: void CloseSocket(int Errno)
-        """
-        print(f"[ExternalConnection] External connection close ({self.get_session_name()},{self.get_peer_ip()})")
-        if self.m_ExtConnMgr:
-            self.m_ExtConnMgr.remove(self)
-
-    def receive_mmc_ident_req(self, ident_req):
-        """
-        C++: void ReceiveMMCIdentReq(AS_MMC_IDENT_REQ_T* IdentReq)
-        """
-        if self.m_IdentFlag:
+        if self._ident_flag:
             return
 
-        ident_res = AsMmcIdentResT()
-        # Initialize resultMode to 0 (Fail) by default if necessary, or handled in logic
+        ident_res = AS_MMC_IDENT_RES_T()
 
-        from AsciiServerWorld import AsciiServerWorld
-        world = AsciiServerWorld._instance
-
-        # 1. Authenticate / Identify
-        result = world.ident_mmc_request_session(ident_req, self.m_CommandAuthorityInfo)
+        result = MAINPTR().IdentMMCRequestSession(
+            ident_req, self._command_authority_info)
 
         if result:
-            self.m_SessionStatus = True
-            ident_res.resultMode = 1 # Success
+            self._session_status  = True
+            ident_res.resultMode  = 1
 
-            print(f"[ExternalConnection] External Session Ident Ok : {ident_req.name}({self.get_peer_ip()}), "
-                  f"priority({self.m_CommandAuthorityInfo.Priority}), logmode({self.m_CommandAuthorityInfo.LogMode}), "
-                  f"maxqueuesize({self.m_CommandAuthorityInfo.MaxCmdQueue}), ackmode({self.m_CommandAuthorityInfo.AckMode})")
+            logger.debug(
+                "External Session Ident Ok : %s(%s), "
+                "priority(%d), logmode(%d), maxqueuesize(%d), ackmode(%d)",
+                ident_req.name, self.get_peer_ip(),
+                self._command_authority_info.Priority,
+                self._command_authority_info.LogMode,
+                self._command_authority_info.MaxCmdQueue,
+                self._command_authority_info.AckMode,
+            )
 
-            # 2. Register Queue
-            self.m_MMCRequestQueue = world.register_mmc_req_conn(self, self.m_CommandAuthorityInfo.MaxCmdQueue)
-            
-            if self.m_MMCRequestQueue is None:
-                print("[ExternalConnection] [CORE_ERROR] Error Get MMCRequest Queue")
-                # Need to handle failure scenario here? C++ code just logs and continues potentially in a broken state,
-                # but let's assume valid queue for now.
+            # MMCRequestQueue 등록 (AsciiServerWorld)
+            self._mmc_request_queue = MAINPTR().RegisterMMCReqConn(
+                self, self._command_authority_info.MaxCmdQueue)
+            if self._mmc_request_queue is None:
+                logger.error("Error Get MMCRequest Queue")
 
-            self.set_session_name(ident_req.name)
+            self.SetSessionName(ident_req.name)     # AsSocket.SetSessionName()
 
-            # 3. Check Session Count Limit
-            cur_session_cnt = self.m_ExtConnMgr.get_cur_session_cnt(ident_req.name)
+            # 최대 세션 수 초과 검사
+            cur_cnt = self._ext_conn_mgr.GetCurSessionCnt(ident_req.name)
+            max_cnt = self._command_authority_info.MaxSessionCnt
 
-            if self.m_CommandAuthorityInfo.MaxSessionCnt > 0 and cur_session_cnt > self.m_CommandAuthorityInfo.MaxSessionCnt:
-                self.m_SessionStatus = False
+            if max_cnt > 0 and cur_cnt > max_cnt:
+                self._session_status = False
                 ident_res.resultMode = 0
-                ident_res.result = f"Exceed max session : max({self.m_CommandAuthorityInfo.MaxSessionCnt} ea)"
-                
-                print(f"[ExternalConnection] ### Exceed max session : ID[{ident_req.name}], max({self.m_CommandAuthorityInfo.MaxSessionCnt} ea)")
-                print("[ExternalConnection] External Session Close")
+                ident_res.result = (f"Exceed max session : max({max_cnt} ea)")
+                logger.debug("### Exceed max session : ID[%s], max(%d ea)",
+                             ident_req.name, max_cnt)
+                logger.debug("External Session Close")
 
-            if self.m_SessionStatus:
-                world.session_cfg(self, SESSION_TYPE_MMC)
-
+            if self._session_status:
+                MAINPTR().SessionCfg(self, SESSION_TYPE_MMC)
         else:
-            # Identification Failed
-            self.m_SessionStatus = False
+            self._session_status = False
             ident_res.resultMode = 0
-            ident_res.result = "Unregistered ID"
-            print(f"[ExternalConnection] External Session Ident not ok : {ident_req.name}")
-            print("[ExternalConnection] External Session Close")
+            ident_res.result     = "Unregistered ID"
+            logger.debug("External Session Ident not ok : %s", ident_req.name)
+            logger.debug("External Session Close")
 
-        self.m_IdentFlag = True
-        
-        # 4. Send Response
-        body = ident_res.pack()
-        if not self.packet_send(PacketT(AS_MMC_IDENT_RES, len(body), body)):
-            print(f"[ExternalConnection] Socket Broken : {self.get_peer_ip()}")
-            self.close()
-            self.m_ExtConnMgr.remove(self)
+        self._ident_flag = True
+
+        payload = _pack(ident_res)
+        if not await self.SendPacket(AS_MMC_IDENT_RES, payload, len(payload)):
+            logger.info("Socket Broken : %s", self.get_peer_ip())
+            await self._force_close()
             return
 
-        # 5. Close if Failed
-        if not self.m_SessionStatus:
-            self.close()
-            self.m_ExtConnMgr.remove(self)
+        if not self._session_status:
+            await self._force_close()
 
-    def send_mmc_result(self, result):
+    # =========================================================================
+    # MMC 요청 수신
+    # =========================================================================
+
+    async def _recv_mmc_req_old(self,
+                                 mmc_req_old: AS_MMC_REQUEST_OLD_T) -> None:
+        """C++: ReceiveMMCReq(AS_MMC_REQUEST_OLD_T*) → 변환 후 처리."""
+        new_req = AS_MMC_REQUEST_T()
+        AsUtil.ConvertMMC_OldToNew(mmc_req_old, new_req)
+        await self._recv_mmc_req(new_req)
+
+    async def _recv_mmc_req(self, mmc_req: AS_MMC_REQUEST_T) -> None:
+        """C++: ReceiveMMCReq(AS_MMC_REQUEST_T*)"""
+        if not self._session_status:
+            logger.debug("Illegal Command of Not Ident Connection")
+            return
+
+        # 권한 정보 적용
+        mmc_req.priority = self._command_authority_info.Priority
+        mmc_req.logMode  = self._command_authority_info.LogMode
+        mmc_req.display  = self.get_peer_ip()       # AsSocket.get_peer_ip()
+
+        self._check_req(mmc_req)
+
+        if self._mmc_request_queue.InsertMMCRequest(mmc_req):
+            self._fault_cnt = 0
+
+            # ACK 모드: 성공 ACK 전송
+            if self._command_authority_info.AckMode:
+                ack = AS_MMC_ACK_T()
+                ack.id         = mmc_req.id
+                ack.resultMode = 1
+                payload = _pack(ack)
+                await self.SendPacket(AS_MMC_REQ_ACK, payload, len(payload))
+                logger.debug("Send Cmd Req Ack(extid:%d)", ack.id)
+        else:
+            self._fault_cnt += 1
+
+            # ACK 모드: 실패 ACK 전송
+            if self._command_authority_info.AckMode:
+                ack = AS_MMC_ACK_T()
+                ack.id         = mmc_req.id
+                ack.resultMode = 0
+                payload = _pack(ack)
+                await self.SendPacket(AS_MMC_REQ_ACK, payload, len(payload))
+                logger.debug("Send Cmd Req Ack(extid:%d)", ack.id)
+
+            # 실패 횟수 초과 시 강제 종료
+            if self._fault_cnt > MAX_FAULT_CNT:
+                logger.debug("Insert Queue Fail Count Over(%s)",
+                             self.GetSessionName())
+                await self._force_close()
+
+    # =========================================================================
+    # CheckReq
+    # =========================================================================
+
+    def _check_req(self, mmc_req: AS_MMC_REQUEST_T) -> bool:
         """
-        C++: bool SendMMCResult(AS_MMC_RESULT_T* Result)
+        C++: CheckReq(AS_MMC_REQUEST_T*)
+        각 필드 최대 길이 초과 시 잘라냄.
         """
-        body = result.pack()
-        return self.packet_send(PacketT(AS_MMC_RES, len(body), body))
+        if len(mmc_req.ne) > EQUIP_ID_LEN - 1:
+            mmc_req.ne = mmc_req.ne[:EQUIP_ID_LEN - 1]
+        if len(mmc_req.mmc) > MMC_CMD_LEN_EX - 1:
+            mmc_req.mmc = mmc_req.mmc[:MMC_CMD_LEN_EX - 1]
+        if len(mmc_req.userid) > USER_ID_LEN - 1:
+            mmc_req.userid = mmc_req.userid[:USER_ID_LEN - 1]
+        if len(mmc_req.display) > IP_ADDRESS_LEN - 1:
+            mmc_req.display = mmc_req.display[:IP_ADDRESS_LEN - 1]
+        return True
+
+    # =========================================================================
+    # 강제 종료 헬퍼
+    # =========================================================================
+
+    async def _force_close(self) -> None:
+        """C++: Close(); m_ExtConnMgr->Remove(this)"""
+        self._close()                               # AsSocket._close()
+        self._ext_conn_mgr.remove(self)             # ConnectionMgr.remove()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 패킷 직렬화 헬퍼
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _pack(obj) -> bytes:
+    if hasattr(obj, 'pack'):
+        return obj.pack()
+    return b''

@@ -1,125 +1,129 @@
-import sys
-import os
+"""
+RuleDownLoaderConnection.py
+C++ RuleDownLoaderConnection.h/.C → Python 변환
 
-# -------------------------------------------------------
-# Project Path Setup
-# -------------------------------------------------------
-current_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.abspath(os.path.join(current_dir, '../..'))
-if project_root not in sys.path:
-    sys.path.append(project_root)
+RuleDownLoader 프로세스 개별 소켓 연결 처리.
+  - 파싱/매핑 룰 다운 ACK 수신 → ConnMgr 전달
+  - 세션 식별 후 AliveCheck 시작
+  - 소켓 종료 시 ChildProcessDead 처리
+"""
 
-from Class.Common.AsSocket import AsSocket
-from Class.Common.CommType import *
-from Class.Common.AsUtil import AsUtil
+import asyncio
+import logging
+from typing import TYPE_CHECKING
+
+from Common.AsSocket import AsSocket                    # 가상함수 오버라이드 (치트시트)
+from Common.AsUtil import AsUtil
+from Common.CommTypeList import (
+    AS_LOG_STATUS_T, AS_ASCII_ACK_T,
+)
+from Common.CommType import (
+    ASCII_RULE_DOWNLOADER,
+    START, LOG_DEL,
+    CMD_PARSING_RULE_DOWN, CMD_MAPPING_RULE_DOWN,
+    CMD_PARSING_RULE_DOWN_ACK, CMD_MAPPING_RULE_DOWN_ACK,
+    AS_LOG_INFO,
+)
+
+if TYPE_CHECKING:
+    from ProcNaServer.RuleDownLoaderConnMgr import RuleDownLoaderConnMgr
+
+logger = logging.getLogger(__name__)
+
 
 class RuleDownLoaderConnection(AsSocket):
     """
-    Handles connection with RuleDownLoader process.
-    Sends rule down commands and receives acknowledgments.
+    C++ RuleDownLoaderConnection (AsSocket 상속) 대응.
+
+    AsSocket 가상 메서드 오버라이드:
+      receive_packet()              ← C++ ReceivePacket()
+      close_socket()                ← C++ CloseSocket()
+      session_identify_callback()   ← C++ SessionIdentify()
     """
-    def __init__(self, conn_mgr):
-        """
-        C++: RuleDownLoaderConnection(RuleDownLoaderConnMgr* ConMgr)
-        """
+
+    def __init__(self, conn_mgr: "RuleDownLoaderConnMgr") -> None:
         super().__init__()
-        self.m_RuleDownLoaderConnMgr = conn_mgr
+        self._rule_down_conn_mgr: "RuleDownLoaderConnMgr" = conn_mgr
 
-    def __del__(self):
-        """
-        C++: ~RuleDownLoaderConnection()
-        """
-        super().__del__()
+    # =========================================================================
+    # AsSocket 가상 메서드 오버라이드
+    # =========================================================================
 
-    def receive_packet(self, packet, session_identify):
-        """
-        C++: void ReceivePacket(PACKET_T* Packet, const int SessionIdentify)
-        """
+    def receive_packet(self, packet, session_identify: int = -1) -> None:
+        """C++: virtual ReceivePacket(PACKET_T*, const int SessionIdentify)"""
         if session_identify == ASCII_RULE_DOWNLOADER:
-            self.rule_down_loader_req(packet)
+            self._rule_down_loader_req(packet)
         else:
-            print(f"[RuleDownLoaderConnection] UnKnown Session : {session_identify}")
+            logger.debug("UnKnown Session : %d", session_identify)
 
-    def session_identify(self, session_type, session_name):
-        """
-        C++: void SessionIdentify(int SessionType, string SessionName)
-        """
-        print(f"[RuleDownLoaderConnection] Session Identify : Type({AsUtil.get_process_type_string(session_type)}), SessionName({session_name})")
+    def session_identify_callback(self, session_type: int,
+                                   session_name: str = "") -> None:
+        """C++: virtual SessionIdentify(int SessionType, string SessionName)"""
+        from ProcNaServer.AsciiServerWorld import MAINPTR
 
-        if not self.m_RuleDownLoaderConnMgr.add_session_name(session_name):
-            self.close()
-            self.m_RuleDownLoaderConnMgr.remove(self)
+        logger.debug("Session Identify : Type(%s), SessionName(%s)",
+                     AsUtil.GetProcessTypeString(session_type), session_name)
+
+        if not self._rule_down_conn_mgr.add_session_name(session_name):  # ConnectionMgr.add_session_name()
+            self._close()
+            self._rule_down_conn_mgr.remove(self)   # ConnectionMgr.remove()
             return
 
-        from AsciiServerWorld import AsciiServerWorld
-        world = AsciiServerWorld._instance
-        
-        # Alive Check Start
-        self.start_alive_check(world.get_proc_alive_check_time(), world.get_alive_check_limit_cnt())
-        
-        # Notify Manager
-        self.m_RuleDownLoaderConnMgr.send_process_info(session_name, START)
-        self.m_RuleDownLoaderConnMgr.set_rule_down_conn(self)
+        # AliveCheck 시작 (AsSocket.StartAliveCheck)
+        self.StartAliveCheck(
+            MAINPTR().GetProcAliveCheckTime(),      # AsWorld.GetProcAliveCheckTime()
+            MAINPTR().GetAliveCheckLimitCnt(),      # AsWorld.GetAliveCheckLimitCnt()
+        )
+        self._rule_down_conn_mgr.SendProcessInfo(
+            self.GetSessionName(), START)
+        self._rule_down_conn_mgr.SetRuleDownConn(self)
 
-    def close_socket(self, errno_val=0):
-        """
-        C++: void CloseSocket(int Errno)
-        """
-        print(f"[RuleDownLoaderConnection] Socket Broken : {self.get_session_name()}")
+    def close_socket(self, errno_val: int) -> None:
+        """C++: virtual CloseSocket(int Errno)"""
+        session_name = self.GetSessionName()
+        logger.debug("Socket Broken : %s", session_name)
 
-        log_status = AsLogStatusT()
-        log_status.name = self.get_session_name()
+        # 로그 상태 DEL (C++ 원본에서 logStatus를 만들지만 UpdateProcessLogStatus 미호출 — 동일 유지)
+        log_status = AS_LOG_STATUS_T()
+        log_status.name   = session_name
         log_status.status = LOG_DEL
-        log_status.logs = f"sun,{AsUtil.get_process_type_string(self.get_session_type())},{self.get_session_name()},"
+        log_status.logs   = (
+            f"sun,{AsUtil.GetProcessTypeString(self.GetSessionType())},"
+            f"{session_name},"
+        )
+        # C++ 원본: UpdateProcessLogStatus 호출 없이 바로 ChildProcessDead
+        self._rule_down_conn_mgr.child_process_dead(self)  # ProcConnectionMgr.child_process_dead()
 
-        # In C++, ChildProcessDead handles log update as well? 
-        # C++ code doesn't call UpdateProcessLogStatus explicitly here, 
-        # but sends logStatus struct via ... wait, it creates logStatus but doesn't use it?
-        # Ah, ChildProcessDead might use it or it's dead code in C++.
-        # Assuming ChildProcessDead needs the object, but C++ passed 'this'.
-        
-        self.m_RuleDownLoaderConnMgr.child_process_dead(self)
+    # =========================================================================
+    # 패킷 처리
+    # =========================================================================
 
-    def rule_down_loader_req(self, packet):
-        """
-        C++: void RuleDownLoaderReq(PACKET_T* Packet)
-        """
-        msg_id = packet.msg_id
-        
+    def _rule_down_loader_req(self, packet) -> None:
+        """C++: RuleDownLoaderReq(PACKET_T*)"""
+        msg_id = packet.MsgId
+
         if msg_id == CMD_PARSING_RULE_DOWN_ACK:
-            ack = AsAsciiAckT.unpack(packet.msg_body)
-            if ack:
-                self.m_RuleDownLoaderConnMgr.recv_rule_down_ack(ack)
+            self._rule_down_conn_mgr.RecvRuleDownAck(packet.Msg)
 
         elif msg_id == CMD_MAPPING_RULE_DOWN_ACK:
-            ack = AsAsciiAckT.unpack(packet.msg_body)
-            if ack:
-                self.m_RuleDownLoaderConnMgr.recv_mapping_rule_down_ack(ack)
+            self._rule_down_conn_mgr.RecvMappingRuleDownAck(packet.Msg)
 
         elif msg_id == AS_LOG_INFO:
-            status = AsLogStatusT.unpack(packet.msg_body)
-            if status:
-                self.receive_log_info(status)
+            self._rule_down_conn_mgr.UpdateProcessLogStatus(packet.Msg)
 
         else:
-            print(f"[RuleDownLoaderConnection] Unknown Msg Id : {msg_id}")
+            logger.error("Unknown Msg Id : %d", msg_id)
 
-    def send_cmd_parsing_rule_down(self):
-        """
-        C++: void SendCmdParsingRuleDown()
-        """
-        print("[RuleDownLoaderConnection] Send Rule Down Cmd")
-        self.packet_send_msg(CMD_PARSING_RULE_DOWN)
+    # =========================================================================
+    # Rule Down 명령 전송
+    # =========================================================================
 
-    def send_cmd_mapping_rule_down(self):
-        """
-        C++: void SendCmdMappingRuleDown()
-        """
-        print("[RuleDownLoaderConnection] Send Mapping Rule Down Cmd")
-        self.packet_send_msg(CMD_MAPPING_RULE_DOWN)
+    async def SendCmdParsingRuleDown(self) -> None:
+        """C++: SendCmdParsingRuleDown() → CMD_PARSING_RULE_DOWN 패킷 전송."""
+        logger.info("Send Rule Down Cmd")
+        await self.SendPacket(CMD_PARSING_RULE_DOWN)
 
-    def receive_log_info(self, status):
-        """
-        C++: void ReceiveLogInfo(AS_LOG_STATUS_T* Status)
-        """
-        self.m_RuleDownLoaderConnMgr.update_process_log_status(status)
+    async def SendCmdMappingRuleDown(self) -> None:
+        """C++: SendCmdMappingRuleDown() → CMD_MAPPING_RULE_DOWN 패킷 전송."""
+        logger.info("Send Mapping Rule Down Cmd")
+        await self.SendPacket(CMD_MAPPING_RULE_DOWN)

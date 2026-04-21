@@ -1,52 +1,64 @@
-import sys
-import os
+"""
+SimsConnMgr.py
+C++ SimsConnMgr.h/.C → Python 변환
 
-# -------------------------------------------------------
-# Project Path Setup
-# -------------------------------------------------------
-current_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.abspath(os.path.join(current_dir, '../..'))
-if project_root not in sys.path:
-    sys.path.append(project_root)
+SIMS 시스템 연결 관리자.
+  - C++: frSocketSensor 상속 → Python: ConnectionMgr 상속
+    (Accept() 사용을 위해 ConnectionMgr 기반으로 변환)
+  - AcceptSocket 시 ExternalConnection 생성 후
+    ExternalConnMgr(_ext_mgr)에 add() — 자신의 리스트가 아닌 ExtMgr에 위임
+  - ExternalConnMgr와 소켓 리스너를 분리하는 패턴:
+    SimsConnMgr는 별도 포트를 Listen하지만
+    접속된 커넥션은 ExternalConnMgr가 관리
+"""
 
-# 부모 클래스 임포트 (SockMgrConnMgr)
-from Class.Common.SockMgrConnMgr import SockMgrConnMgr
-from Class.ProcNaServer.ExternalConnection import ExternalConnection
+import logging
+from typing import TYPE_CHECKING
 
-class SimsConnMgr(SockMgrConnMgr):
+from Common.ConnectionMgr import ConnectionMgr          # Accept() 사용 (치트시트)
+
+if TYPE_CHECKING:
+    from ProcNaServer.ExternalConnMgr import ExternalConnMgr
+
+logger = logging.getLogger(__name__)
+
+
+class SimsConnMgr(ConnectionMgr):
     """
-    Manages connections from SIMS.
-    Acts as a listener but delegates connection management to ExternalConnMgr.
+    C++ SimsConnMgr (frSocketSensor 상속) 대응.
+
+    C++ frSocketSensor → Python ConnectionMgr
+      frSocketSensor는 소켓 수락(Accept) 기능만 제공하는 베이스.
+      Python에서는 Accept()가 ConnectionMgr에 구현되어 있으므로
+      ConnectionMgr를 상속하여 동일한 기능 활용.
+
+    핵심 특징:
+      Accept한 ExternalConnection을 자신이 아닌
+      m_ExtMgr(ExternalConnMgr)에 add() — C++ 원본 동일.
     """
-    def __init__(self, ext_mgr):
-        """
-        C++: SimsConnMgr(ExternalConnMgr *extMgr)
-        """
+
+    def __init__(self, ext_mgr: "ExternalConnMgr") -> None:
         super().__init__()
-        self.m_ExtMgr = ext_mgr
+        self._ext_mgr: "ExternalConnMgr" = ext_mgr
 
-    def __del__(self):
-        """
-        C++: ~SimsConnMgr()
-        """
-        super().__del__()
+    # =========================================================================
+    # AcceptSocket
+    # =========================================================================
 
-    def accept_socket(self):
+    def AcceptSocket(self) -> None:
         """
-        C++: void AcceptSocket()
-        Overridden to create ExternalConnection and add it to ExternalConnMgr.
+        C++: AcceptSocket()
+        SIMS 포트로 접속한 클라이언트를 ExternalConnection으로 수락.
+        커넥션 관리는 ExternalConnMgr에 위임 (m_ExtMgr->Add).
         """
-        # 1. ExternalConnection 객체 생성 (관리는 ext_mgr이 하므로 인자로 전달)
-        conn = ExternalConnection(self.m_ExtMgr)
+        from ProcNaServer.ExternalConnection import ExternalConnection
 
-        # 2. Accept 수행 (현재 SimsConnMgr의 리스닝 소켓 사용)
-        if not self.accept(conn):
-            print(f"[SimsConnMgr] Sims Connection Accept Error : {self.get_obj_err_msg()}")
-            conn.close()
+        conn = ExternalConnection(self._ext_mgr)
+        if not self.Accept(conn):
+            logger.error("Sims Connection Accept Error : %s",
+                         self.GetObjErrMsg())
             return
 
-        # 3. 연결 리스트 추가는 ExternalConnMgr에 위임
-        # C++: m_ExtMgr->Add(conn);
-        self.m_ExtMgr.add(conn)
-        
-        print(f"[SimsConnMgr] Connected with Sims({conn.get_peer_ip()})")
+        # ── 핵심: 자신(SimsConnMgr)이 아닌 ExtMgr에 add ──────────────────
+        self._ext_mgr.add(conn)                     # ConnectionMgr.add()
+        logger.debug("Connected with Sims(%s)", conn.get_peer_ip())
