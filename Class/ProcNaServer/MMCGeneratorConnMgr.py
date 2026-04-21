@@ -1,222 +1,245 @@
-import sys
-import os
-import threading
+"""
+MMCGeneratorConnMgr.py
+C++ MMCGeneratorConnMgr.h/.C → Python 변환
+
+MMC Generator/Scheduler/JobMonitor 연결 관리자.
+  - ProcConnectionMgr 상속 (start_proc / process_dead)
+  - MMCGenerator/Scheduler/JobMonitor 세션 관리
+  - MMC 요청 전달, MMC 로그 전달
+  - 프로세스 상태 / 로그 상태 관리
+"""
+
+import asyncio
 import copy
+import logging
+import threading
+from typing import Optional, Dict, TYPE_CHECKING
 
-# -------------------------------------------------------
-# Project Path Setup
-# -------------------------------------------------------
-current_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.abspath(os.path.join(current_dir, '../..'))
-if project_root not in sys.path:
-    sys.path.append(project_root)
+from Common.ProcConnectionMgr import ProcConnectionMgr  # start_proc/process_dead
+from Common.CommTypeList import (
+    AS_LOG_STATUS_T, AS_MMC_REQUEST_T, AS_MMC_LOG_T, AS_PROCESS_STATUS_T,
+)
+from Common.CommType import (
+    ASCII_MMC_GENERATOR, ASCII_MMC_SCHEDULER, ASCII_JOB_MONITOR,
+    START, STOP, LOG_ADD,
+    ORDER_KILL,
+    PROC_INIT_END, CMD_PROC_INIT,
+    CMD_SCHEDULER_RULE_DOWN, CMD_COMMAND_RULE_DOWN,
+    MMC_LOG,
+)
 
-# [중요] 부모 클래스 임포트
-# (경로는 사용자의 프로젝트 구조에 맞춰 조정 필요, 보통 Class/Common 혹은 Class/ProcNaServer에 위치)
-# 만약 SockMgrConnMgr가 Class/Common에 있다면 아래 경로입니다.
-from Class.Common.SockMgrConnMgr import SockMgrConnMgr
-from Class.ProcNaServer.MMCGenConnection import MMCGenConnection
-from Class.Common.CommType import *
+if TYPE_CHECKING:
+    from ProcNaServer.MMCGenConnection import MMCGenConnection
 
-class MMCGeneratorConnMgr(SockMgrConnMgr):
+logger = logging.getLogger(__name__)
+
+# LogStatusMap : name(str) → AS_LOG_STATUS_T
+LogStatusMap = Dict[str, AS_LOG_STATUS_T]
+
+
+class MMCGeneratorConnMgr(ProcConnectionMgr):
     """
-    SockMgrConnMgr를 상속받아 소켓 관리 기능(Accept, List 등)을 재사용하고,
-    MMC 관련 비즈니스 로직을 추가한 클래스
+    C++ MMCGeneratorConnMgr (ProcConnectionMgr 상속) 대응.
+
+    뮤텍스:
+      C++ pthread_mutex_t m_SocketRemoveLock
+      → _socket_remove_lock() / _socket_remove_unlock() 오버라이드
     """
-    def __init__(self):
-        """
-        C++: MMCGeneratorConnMgr::MMCGeneratorConnMgr()
-        """
-        # 1. 부모 생성자 호출 (소켓 초기화, 리스트 초기화)
+
+    def __init__(self) -> None:
         super().__init__()
-        
-        # 2. MMC 전용 멤버 변수 초기화
-        self.m_MMCGenerator = None
-        self.m_MMCScheduler = None
-        self.m_JobMonitor = None
-        self.m_MmcGeneratorStatus = False
-        
-        # Lock 초기화
-        self.m_SocketRemoveLock = threading.Lock()
-        
-        # Log Map 초기화
-        self.m_LogStatusMap = {} 
+        self._mmc_generator: Optional["MMCGenConnection"] = None
+        self._mmc_scheduler: Optional["MMCGenConnection"] = None
+        self._job_monitor:   Optional["MMCGenConnection"] = None
+        self._mmc_generator_status: bool = False
+        self._log_status_map: LogStatusMap = {}
+        self._remove_lock = threading.Lock()    # C++: pthread_mutex_t
 
-    def __del__(self):
-        """
-        C++: MMCGeneratorConnMgr::~MMCGeneratorConnMgr()
-        """
-        self.m_LogStatusMap.clear()
-        super().__del__()
+    def __del__(self) -> None:
+        self._log_status_map.clear()
 
-    # -------------------------------------------------------
-    # Override Methods (부모 메서드 재정의)
-    # -------------------------------------------------------
-    def accept_socket(self):
-        """
-        C++: void AcceptSocket()
-        [중요] 부모의 accept_socket을 오버라이딩하여 
-        SockMgrConnection 대신 'MMCGenConnection'을 생성합니다.
-        """
-        # 1. MMCGenConnection 객체 생성
-        mmc_conn = MMCGenConnection(self)
+    # =========================================================================
+    # ConnectionMgr 뮤텍스 오버라이드
+    # =========================================================================
 
-        # 2. 부모(FrSocketSensor)의 accept 기능 사용
-        if not self.accept(mmc_conn):
-            print(f"[MMCGeneratorConnMgr] MMCGenerator Socket Accept Error : {self.get_obj_err_msg()}")
-            mmc_conn.close()
+    def _socket_remove_lock(self) -> None:
+        self._remove_lock.acquire()
+
+    def _socket_remove_unlock(self) -> None:
+        self._remove_lock.release()
+
+    # =========================================================================
+    # ProcConnectionMgr 추상 메서드 구현
+    # =========================================================================
+
+    def process_dead(self, name: str, pid: int, status: int = -1) -> None:
+        """
+        C++: ProcessDead(string Name, int Pid, int Status)
+        ProcConnectionMgr.child_process_dead() 에서 호출.
+        """
+        self.SendProcessInfo(name, -1, STOP)
+
+        if status != ORDER_KILL:
+            from ProcNaServer.AsciiServerWorld import AsciiServerWorld
+            AsciiServerWorld.m_WorldPtr.ProcessDead(name, pid)
+
+    # =========================================================================
+    # AcceptSocket
+    # =========================================================================
+
+    def AcceptSocket(self) -> None:
+        """C++: AcceptSocket()"""
+        from ProcNaServer.MMCGenConnection import MMCGenConnection
+
+        conn = MMCGenConnection(self)
+        if not self.Accept(conn):
+            logger.debug("MMCGenerator Socket Accept Error : %s",
+                         self.GetObjErrMsg())
             return
+        self.add(conn)                          # ConnectionMgr.add()
 
-        # 3. 부모(ConnectionMgr)의 리스트 추가 기능 사용
-        self.add(mmc_conn)
+    # =========================================================================
+    # SetMMCGeneratorSession
+    # =========================================================================
 
-    # -------------------------------------------------------
-    # Business Logic (MMC 고유 기능)
-    # -------------------------------------------------------
-    def process_dead(self, name, pid, status):
-        """
-        C++: void ProcessDead(string Name, int Pid, int Status)
-        """
-        self.send_process_info(name, -1, STOP)
-
-        if status == ORDER_KILL:
-            pass
-        else:
-            from AsciiServerWorld import AsciiServerWorld
-            AsciiServerWorld._instance.process_dead(name, pid)
-
-    def set_mmc_generator_session(self, session_type, mmc_con):
-        """
-        C++: void SetMMCGeneratorSession(int SessionType, MMCGenConnection* MMCCon)
-        """
+    def SetMMCGeneratorSession(self, session_type: int,
+                                mmc_con: Optional["MMCGenConnection"]) -> None:
+        """C++: SetMMCGeneratorSession(int SessionType, MMCGenConnection*)"""
         if session_type == ASCII_MMC_GENERATOR:
-            self.m_MMCGenerator = mmc_con
+            self._mmc_generator = mmc_con
             if mmc_con is None:
-                self.m_MmcGeneratorStatus = False
+                self._mmc_generator_status = False
 
         elif session_type == ASCII_MMC_SCHEDULER:
-            self.m_MMCScheduler = mmc_con
-            if mmc_con and self.m_MmcGeneratorStatus:
-                self.m_MMCScheduler.packet_send_msg(CMD_PROC_INIT)
+            self._mmc_scheduler = mmc_con
+            if mmc_con and self._mmc_generator_status:
+                asyncio.ensure_future(mmc_con.SendPacket(CMD_PROC_INIT))
 
         elif session_type == ASCII_JOB_MONITOR:
-            self.m_JobMonitor = mmc_con
+            self._job_monitor = mmc_con
 
         else:
-            print(f"[MMCGeneratorConnMgr] [CORE_ERROR] UnKnown SessionType : {session_type}")
+            logger.error("UnKnown SessionType : %d", session_type)
 
-    def send_mmc_req_to_mmc_gen(self, mmc_req):
-        """
-        C++: void SendMMCReqToMMCGen(AS_MMC_REQUEST_T* MMCReq)
-        """
-        with self.m_SocketRemoveLock:
-            if self.m_MMCGenerator:
-                # is_valid_connection은 부모(ConnectionMgr)에 구현되어 있음
-                if self.is_valid_connection(self.m_MMCGenerator):
-                    self.m_MMCGenerator.send_mmc_req_to_mmc_gen(mmc_req)
-                else:
-                    print("[MMCGeneratorConnMgr] MMCGenerator Is Not Connection")
+    # =========================================================================
+    # SendMMCReqToMMCGen
+    # =========================================================================
+
+    def SendMMCReqToMMCGen(self, mmc_req: AS_MMC_REQUEST_T) -> None:
+        """C++: SendMMCReqToMMCGen(AS_MMC_REQUEST_T*)"""
+        self._socket_remove_lock()
+        try:
+            if self._mmc_generator and \
+               self.is_valid_connection(self._mmc_generator):   # ConnectionMgr
+                asyncio.ensure_future(
+                    self._mmc_generator.SendMMCReqToMMCGen(mmc_req))
             else:
-                print("[MMCGeneratorConnMgr] MMCGenerator Is Not Connection")
+                logger.debug("MMCGenerator Is Not Connection")
+        finally:
+            self._socket_remove_unlock()
 
-    def update_mmc_process_log_status(self, status):
-        """
-        C++: void UpdateMMCProcessLogStatus(AS_LOG_STATUS_T* Status)
-        """
-        if status.name in self.m_LogStatusMap:
-            del self.m_LogStatusMap[status.name]
+    # =========================================================================
+    # SendMMCLog
+    # =========================================================================
+
+    def SendMMCLog(self, mmc_log: AS_MMC_LOG_T) -> None:
+        """C++: SendMMCLog(AS_MMC_LOG_T*) — JobMonitor로 전송."""
+        self._socket_remove_lock()
+        try:
+            if self._job_monitor and \
+               self.is_valid_connection(self._job_monitor):
+                asyncio.ensure_future(
+                    self._job_monitor.SendMMCLog(mmc_log))
+            else:
+                logger.debug("Job Monitor is Not Connected")
+        finally:
+            self._socket_remove_unlock()
+
+    # =========================================================================
+    # UpdateMMCProcessLogStatus / GetLogStatusList
+    # =========================================================================
+
+    def UpdateMMCProcessLogStatus(self, status: AS_LOG_STATUS_T) -> None:
+        """C++: UpdateMMCProcessLogStatus(AS_LOG_STATUS_T*)"""
+        self._log_status_map.pop(status.name, None)
 
         if status.status == LOG_ADD:
-            self.m_LogStatusMap[status.name] = copy.deepcopy(status)
+            self._log_status_map[status.name] = copy.copy(status)
 
-        from AsciiServerWorld import AsciiServerWorld
-        AsciiServerWorld._instance.send_log_status(status)
+        from ProcNaServer.AsciiServerWorld import AsciiServerWorld
+        AsciiServerWorld.m_WorldPtr.SendLogStatus(status)
 
-    def get_log_status_list(self, status_list):
-        """
-        C++: void GetLogStatusList(LogStatusVector* StatusList)
-        """
-        for status in self.m_LogStatusMap.values():
-            status_list.append(status)
+    def GetLogStatusList(self, status_list: list) -> None:
+        """C++: GetLogStatusList(LogStatusVector*)"""
+        status_list.extend(self._log_status_map.values())
 
-    def send_mmc_log(self, mmc_log):
-        """
-        C++: void SendMMCLog(AS_MMC_LOG_T* MMCLog)
-        """
-        with self.m_SocketRemoveLock:
-            if self.m_JobMonitor:
-                if self.is_valid_connection(self.m_JobMonitor):
-                    self.m_JobMonitor.send_mmc_log(mmc_log)
-                else:
-                    print("[MMCGeneratorConnMgr] Job Monitor is Not Connected")
-            else:
-                print("[MMCGeneratorConnMgr] Job Monitor is Not Connected")
+    # =========================================================================
+    # SendProcessInfo
+    # =========================================================================
 
-    def stop_process(self, session_name):
-        return True
+    def SendProcessInfo(self, session_name: str,
+                         process_type: int, status: int) -> None:
+        """C++: SendProcessInfo(const char* SessionName, int ProcessType, int Status)"""
+        from ProcNaServer.AsciiServerWorld import MAINPTR
 
-    def send_process_info(self, session_name, process_type, status):
-        """
-        C++: void SendProcessInfo(...)
-        """
-        from AsciiServerWorld import AsciiServerWorld
-        
-        proc_info = AsProcessStatusT()
-        proc_info.ProcessId = session_name
-        proc_info.Status = status
+        proc_info = AS_PROCESS_STATUS_T()
+        proc_info.ProcessId   = session_name
+        proc_info.Status      = status
 
-        if proc_info.Status == START:
-            if not self.get_process_info(session_name, proc_info):
+        if status == START:
+            # ProcConnectionMgr.get_process_info_by_name()
+            if not self.get_process_info_by_name(session_name, proc_info):
                 return
 
-        world = AsciiServerWorld._instance
-        proc_info.ManagerId = world.get_proc_name()
+        proc_info.ManagerId   = MAINPTR().GetProcName()
         proc_info.ProcessType = process_type
-        
-        world.update_process_info(proc_info)
+        MAINPTR().UpdateProcessInfo(proc_info)
 
-    def notify_event(self, session_type, msg_id):
-        """
-        C++: void NotifyEvent(...)
-        """
+    # =========================================================================
+    # NotifyEvent
+    # =========================================================================
+
+    def NotifyEvent(self, session_type: int, msg_id: int) -> None:
+        """C++: NotifyEvent(int sessionType, int msgId)"""
         if session_type == ASCII_MMC_GENERATOR:
             if msg_id == PROC_INIT_END:
-                self.m_MmcGeneratorStatus = True
-                if self.m_MMCScheduler:
-                    if not self.m_MMCScheduler.packet_send_msg(CMD_PROC_INIT):
-                        print("[MMCGeneratorConnMgr] [CORE_ERROR] MMCScheduler Socket Broken")
-                        # remove는 부모(ConnectionMgr)에 구현되어 있음
-                        self.remove(self.m_MMCScheduler)
+                self._mmc_generator_status = True
+                if self._mmc_scheduler:
+                    if not asyncio.ensure_future(
+                            self._mmc_scheduler.SendPacket(CMD_PROC_INIT)):
+                        logger.error("MMCScheduler Socket Broken")
+                        self.remove(self._mmc_scheduler)    # ConnectionMgr.remove()
 
-    def send_cmd_scheduler_rule_down(self):
-        if self.m_MMCScheduler:
-            self.m_MMCScheduler.packet_send_msg(CMD_SCHEDULER_RULE_DOWN)
+        # ASCII_MMC_SCHEDULER / ASCII_JOB_MONITOR: C++ 원본 동일하게 처리 없음
 
-    def send_cmd_command_rule_down(self):
-        if self.m_MMCGenerator:
-            self.m_MMCGenerator.packet_send_msg(CMD_COMMAND_RULE_DOWN)
+    # =========================================================================
+    # Rule Down 명령
+    # =========================================================================
 
-    def get_process_info(self, session_name, proc_info):
-        """
-        C++: bool GetProcessInfo(string SessionName, AS_PROCESS_STATUS_T* ProcInfo)
-        프로세스 상세 정보(PID, 시작 시간)를 채웁니다.
-        """
-        import time
-        from datetime import datetime
+    def SendCmdSchedulerRuleDown(self) -> None:
+        """C++: SendCmdSchedulerRuleDown() — Scheduler에 룰 다운 명령."""
+        if self._mmc_scheduler:
+            asyncio.ensure_future(
+                self._mmc_scheduler.SendPacket(CMD_SCHEDULER_RULE_DOWN))
 
-        # 1. 시작 시간 설정 (현재 시간)
-        # C++ 포맷: YYYY-MM-DD HH:MM:SS
-        now = datetime.now()
-        proc_info.StartTime = now.strftime("%Y-%m-%d %H:%M:%S")
+    def SendCmdCommandRuleDown(self) -> None:
+        """C++: SendCmdCommandRuleDown() — Generator에 커맨드 룰 다운 명령."""
+        if self._mmc_generator:
+            asyncio.ensure_future(
+                self._mmc_generator.SendPacket(CMD_COMMAND_RULE_DOWN))
 
-        # 2. PID 설정
-        # 실제 운영 환경에서는 해당 프로세스의 실제 PID를 찾아야 합니다.
-        # (1) 클라이언트가 패킷에 담아 보냈다면 패킷에서 추출해야 하고,
-        # (2) 서버가 fork/exec로 띄운 자식 프로세스라면 관리 맵에서 조회해야 합니다.
-        # 정보가 없다면 0 또는 임시 값을 설정합니다.
-        proc_info.Pid = 0 
-        
-        # 만약 연결 객체(mmc_con)를 통해 Peer의 정보를 알 수 있다면 여기서 조회 로직 추가
-        # 예: proc_info.Pid = self.find_pid_by_name(session_name)
-        
+    # =========================================================================
+    # StartProc (ProcConnectionMgr.start_proc 위임)
+    # =========================================================================
+
+    def StartProc(self, name: str, args: list) -> int:
+        """C++: StartProc() — ProcConnectionMgr.start_proc() 위임."""
+        return self.start_proc(name, args)          # ProcConnectionMgr.start_proc()
+
+    # =========================================================================
+    # StopProcess
+    # =========================================================================
+
+    def StopProcess(self, session_name: str) -> bool:
+        """C++: StopProcess(string SessionName) — 원본 항상 true 반환."""
         return True

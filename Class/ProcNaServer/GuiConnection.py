@@ -1,815 +1,510 @@
-import sys
-import os
+"""
+GuiConnection.py
+C++ GuiConnection.h/.C → Python 변환
 
-# 프로젝트 경로 설정
-current_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.abspath(os.path.join(current_dir, '../..'))
-if project_root not in sys.path:
-    sys.path.append(project_root)
+GUI 클라이언트 개별 소켓 연결 처리.
+  - 세션 타입별 패킷 분기 (RuleEditor / StatusGui / CommandGui)
+  - 초기화 시 Manager/Connector/Connection/Process/DataHandler 정보 일괄 전송
+  - MMC 요청 처리 (AS_MMC_REQ / AS_MMC_REQ_OLD)
+  - Rule Down / InfoChange / LogStatus 처리
+"""
 
-from Class.Common.AsSocket import AsSocket
-from Class.Common.CommType import *
-from Class.Common.AsUtil import AsUtil
-from Class.Common.AsciiServerType import *
+import asyncio
+import logging
+from typing import TYPE_CHECKING
 
-# -------------------------------------------------------
-# Constants
-# -------------------------------------------------------
-INIT_INFO_MANAGER_MASK              = 0x00000001
-INIT_INFO_PROCESS_MASK              = 0x00000002
-INIT_INFO_DATAHANDLER_MASK          = 0x00000004
-INIT_INFO_COMMAND_AUTHORITY_MASK    = 0x00000008
+from Common.AsSocket import AsSocket                    # 가상함수 오버라이드
+from Common.AsUtil import AsUtil
+from Common.CommTypeList import (
+    AS_LOG_STATUS_T, AS_ASCII_ERROR_MSG_T, AS_ASCII_ACK_T,
+    AS_CMD_LOG_CONTROL_T, AS_MMC_REQUEST_T, AS_MMC_REQUEST_OLD_T,
+    AS_MMC_PUBLISH_T, AS_MMC_RESULT_T, AS_GUI_INIT_INFO_T,
+    AS_RULE_CHANGE_INFO_T, AS_CONNECTOR_DESC_CHANGE_INFO_T,
+    AS_PROC_CONTROL_T, AS_SESSION_CONTROL_T,
+    AS_MANAGER_INFO_T, AS_CONNECTOR_INFO_T, AS_CONNECTION_INFO_T,
+    AS_CONNECTION_INFO_LIST_T, AS_DATA_HANDLER_INFO_T,
+    AS_COMMAND_AUTHORITY_INFO_T, AS_SUB_PROC_INFO_T,
+    AS_DB_SYNC_INFO_LIST_T, AS_DATA_HANDLER_INIT_T,
+    AS_DATA_ROUTING_INIT_T, AS_SESSION_CFG_T, AS_SYSTEM_INFO_T,
+)
+from Common.CommType import (
+    GUI_RULE_EDITOR, GUI_ASCII_CONFIG_INFO, GUI_ASCII_STATUS_INFO,
+    GUI_COMMAND_INFO,
+    CMD_PARSING_RULE_DOWN, CMD_PARSING_RULE_DOWN_ACK,
+    CMD_MAPPING_RULE_DOWN, CMD_MAPPING_RULE_DOWN_ACK,
+    CMD_COMMAND_RULE_DOWN, CMD_COMMAND_RULE_DOWN_ACK,
+    CMD_SCHEDULER_RULE_DOWN, CMD_SCHEDULER_RULE_DOWN_ACK,
+    CMD_LOG_STATUS_CHANGE, CMD_PARSING_RULE_CHANGE,
+    CMD_CONNECTOR_DESC_CHANGE,
+    MANAGER_MODIFY, MANAGER_MODIFY_ACK,
+    CONNECTOR_MODIFY, CONNECTOR_MODIFY_ACK,
+    CONNECTION_MODIFY, CONNECTION_MODIFY_ACK,
+    CONNECTION_LIST_MODIFY, CONNECTION_LIST_MODIFY_ACK,
+    DATAHANDLER_MODIFY, DATAHANDLER_MODIFY_ACK,
+    COMMAND_AUTHORITY_MODIFY, COMMAND_AUTHORITY_MODIFY_ACK,
+    SUB_PROC_MODIFY, SUB_PROC_MODIFY_ACK,
+    PROC_CONTROL, SESSION_CONTROL,
+    AS_MMC_REQ, AS_MMC_REQ_OLD, AS_MMC_RES,
+    AS_DB_SYNC_INFO_REQ, AS_DB_SYNC_INFO_LIST, AS_DB_SYNC_INFO_REQ_ACK,
+    AS_DATA_HANDLER_INIT, AS_DATA_ROUTING_INIT, AS_SESSION_CFG,
+    AS_MANAGER_INFO, AS_CONNECTOR_INFO, AS_CONNECTION_INFO,
+    AS_PROCESS_INFO, AS_DATA_HANDLER_INFO, AS_COMMAND_AUTHORITY_INFO,
+    AS_SYSTEM_INFO, AS_SUB_PROC_INFO,
+    INIT_INFO_START, INIT_INFO_END,
+    ASCII_ERROR_MSG, AS_LOG_INFO,
+    GET_LOG_INFO,
+    NO_RESPONSE, IMMEDIATE, R_ERROR,
+)
+from ProcNaServer.AsciiServerType import (
+    SESSION_TYPE_GUI,
+)
 
-# -------------------------------------------------------
-# GuiConnection Class
-# GUI 클라이언트와의 통신 담당
-# -------------------------------------------------------
+if TYPE_CHECKING:
+    from ProcNaServer.GuiConnMgr import GuiConnMgr
+
+logger = logging.getLogger(__name__)
+
+# INIT_INFO 마스크 상수 (C++ #define)
+INIT_INFO_MANAGER_MASK           = 0x00000001
+INIT_INFO_PROCESS_MASK           = 0x00000002
+INIT_INFO_DATAHANDLER_MASK       = 0x00000004
+INIT_INFO_COMMAND_AUTHORITY_MASK = 0x00000008
+
+
 class GuiConnection(AsSocket):
-    def __init__(self, conn_mgr):
-        """
-        C++: GuiConnection(GuiConnMgr* ConnMgr)
-        """
+    """
+    C++ GuiConnection (AsSocket 상속) 대응.
+
+    AsSocket 가상 메서드 오버라이드:
+      receive_packet()              ← C++ ReceivePacket()
+      close_socket()                ← C++ CloseSocket()
+      session_identify_callback()   ← C++ SessionIdentify()
+    """
+
+    def __init__(self, gui_conn_mgr: "GuiConnMgr") -> None:
         super().__init__()
-        self.m_GuiConnMgr = conn_mgr
+        self._gui_conn_mgr: "GuiConnMgr" = gui_conn_mgr
 
-    def __del__(self):
-        super().__del__()
+    # =========================================================================
+    # AsSocket 가상 메서드 오버라이드
+    # =========================================================================
 
-    # ---------------------------------------------------
-    # Packet Receiver
-    # ---------------------------------------------------
-    def receive_packet(self, packet, session_id):
-        """
-        C++: void ReceivePacket(PACKET_T* Packet, const int SessionIdentify)
-        """
-        if session_id == GUI_RULE_EDITOR:
-            self.rule_editor_req_process(packet)
+    def receive_packet(self, packet, session_identify: int = -1) -> None:
+        """C++: virtual ReceivePacket(PACKET_T*, const int SessionIdentify)"""
+        if session_identify == GUI_RULE_EDITOR:
+            asyncio.ensure_future(self._rule_editor_req_process(packet))
 
-        elif session_id in [GUI_ASCII_CONFIG_INFO, GUI_ASCII_STATUS_INFO]:
-            self.gw_status_gui_req_process(packet)
-            
-        elif session_id == GUI_COMMAND_INFO:
-            self.gw_command_gui_req_process(packet)
-            
+        elif session_identify in (GUI_ASCII_CONFIG_INFO, GUI_ASCII_STATUS_INFO):
+            asyncio.ensure_future(self._gw_status_gui_req_process(packet))
+
+        elif session_identify == GUI_COMMAND_INFO:
+            asyncio.ensure_future(self._gw_command_gui_req_process(packet))
+
         else:
-            print(f"[GuiConnection] Not Identify Session :{session_id}")
+            logger.debug("Not Identify Session : %d", session_identify)
 
-    def close_socket(self, err):
-        """
-        C++: void CloseSocket(int Errno)
-        """
-        print(f"[GuiConnection] Gui Connection Broken({self.get_peer_ip()},{self.get_session_name()})")
-        # m_GuiConnMgr->RemoveRequestConn(this) 구현 필요 시 호출
-        if hasattr(self.m_GuiConnMgr, 'remove_request_conn'):
-            self.m_GuiConnMgr.remove_request_conn(self)
-        
-        self.m_GuiConnMgr.remove(self)
+    def close_socket(self, errno_val: int) -> None:
+        """C++: virtual CloseSocket(int Errno)"""
+        logger.debug("Gui Connection Broken(%s,%s)",
+                     self.get_peer_ip(), self.GetSessionName())
+        self._gui_conn_mgr.RemoveRequestConn(self)
+        self._gui_conn_mgr.remove(self)             # ConnectionMgr.remove()
 
-    # ---------------------------------------------------
-    # Request Processors
-    # ---------------------------------------------------
-    def rule_editor_req_process(self, packet):
-        from AsciiServerWorld import AsciiServerWorld
-        world = AsciiServerWorld._instance
-        
-        if packet.msg_id == CMD_PARSING_RULE_DOWN:
-            if not world.m_ParsingRuleDownLoading:
-                self.send_ack(CMD_PARSING_RULE_DOWN_ACK, 1, 1, "Rule Down Load is start")
-                if hasattr(self.m_GuiConnMgr, 'cmd_parsing_rule_down'):
-                    self.m_GuiConnMgr.cmd_parsing_rule_down(self)
+    def session_identify_callback(self, session_type: int,
+                                   session_name: str = "") -> None:
+        """
+        C++: virtual SessionIdentify(int SessionType, string SessionName)
+        세션 타입에 따라 초기 정보 일괄 전송.
+        """
+        from ProcNaServer.AsciiServerWorld import MAINPTR
+
+        MAINPTR().SessionCfg(self, SESSION_TYPE_GUI)
+        logger.debug("Session Identify : Type(%s,%s)",
+                     AsUtil.GetProcessTypeString(session_type), session_name)
+
+        if session_type in (GUI_RULE_EDITOR,
+                            GUI_ASCII_CONFIG_INFO,
+                            GUI_ASCII_STATUS_INFO):
+            asyncio.ensure_future(
+                self._send_initial_info(session_type))
+
+    # =========================================================================
+    # 초기 정보 전송
+    # =========================================================================
+
+    async def _send_initial_info(self, session_type: int) -> None:
+        """C++: SessionIdentify() 내부 초기화 블록 → async 분리."""
+        if session_type == GUI_ASCII_STATUS_INFO:
+            mask = (INIT_INFO_MANAGER_MASK | INIT_INFO_DATAHANDLER_MASK |
+                    INIT_INFO_PROCESS_MASK | INIT_INFO_COMMAND_AUTHORITY_MASK)
+            await self.SendInitInfo(INIT_INFO_START, mask)
+            await self.SendAllManagerInfo()
+            await self.SendAllProcStatusInfo()
+            await self.SendAllDataHandlerInfo()
+            await self.SendAllCommandAuthorityInfo()
+            await self.SendAllEtcInfo()
+
+        elif session_type == GUI_ASCII_CONFIG_INFO:
+            mask = (INIT_INFO_MANAGER_MASK | INIT_INFO_COMMAND_AUTHORITY_MASK |
+                    INIT_INFO_DATAHANDLER_MASK)
+            await self.SendInitInfo(INIT_INFO_START, mask)
+            await self.SendAllManagerInfo()
+            await self.SendAllDataHandlerInfo()
+            await self.SendAllCommandAuthorityInfo()
+
+        await self.SendInitInfo(INIT_INFO_END, 0)
+
+    # =========================================================================
+    # 패킷 처리 내부 메서드
+    # =========================================================================
+
+    async def _rule_editor_req_process(self, packet) -> None:
+        """C++: RuleEditorReqProcess(PACKET_T*)"""
+        from ProcNaServer.AsciiServerWorld import MAINPTR
+
+        if packet.MsgId == CMD_PARSING_RULE_DOWN:
+            if not MAINPTR().GetParsingRuleDownStatus():
+                await self.SendAck(CMD_PARSING_RULE_DOWN_ACK, 1, 1,
+                                   "Rule Down Load is start")
+                self._gui_conn_mgr.CmdParsingRuleDown(self)
             else:
-                self.send_ack(CMD_PARSING_RULE_DOWN_ACK, 1, 0, 
-                              "Already Rule Down Load is start\nPlease retry some time later")
+                await self.SendAck(CMD_PARSING_RULE_DOWN_ACK, 1, 0,
+                                   "Already Rule Down Load is start\n"
+                                   "Please retry some time later")
 
-    def gw_command_gui_req_process(self, packet):
-        from AsciiServerWorld import AsciiServerWorld
-        world = AsciiServerWorld._instance
-        
-        if packet.msg_id == CMD_COMMAND_RULE_DOWN:
-            if not world.m_CommandRuleDownLoading:
-                self.send_ack(CMD_COMMAND_RULE_DOWN_ACK, 1, 1, "Command Rule Down Load is start")
-                # m_GuiConnMgr->CmdCommandRuleDown(this)
+    async def _gw_command_gui_req_process(self, packet) -> None:
+        """C++: GwCommandGuiReqProcess(PACKET_T*)"""
+        from ProcNaServer.AsciiServerWorld import MAINPTR
+
+        logger.debug("Recv Request Cmd GUI : %d", packet.MsgId)
+
+        if packet.MsgId == CMD_COMMAND_RULE_DOWN:
+            if not MAINPTR().GetCommandRuleDownStatus():
+                await self.SendAck(CMD_COMMAND_RULE_DOWN_ACK, 1, 1,
+                                   "Command Rule Down Load is start")
+                self._gui_conn_mgr.CmdCommandRuleDown(self)
             else:
-                self.send_ack(CMD_COMMAND_RULE_DOWN_ACK, 1, 0, "Already Command Rule Down Load is start")
+                await self.SendAck(CMD_COMMAND_RULE_DOWN_ACK, 1, 0,
+                                   "Already Command Rule Down Load is start")
 
-        elif packet.msg_id == CMD_SCHEDULER_RULE_DOWN:
-            if not world.m_SchedulerRuleDownLoading:
-                self.send_ack(CMD_SCHEDULER_RULE_DOWN_ACK, 1, 1, "Scheduler Rule Down Load is start")
-                # m_GuiConnMgr->CmdSchedulerRuleDonw(this)
+        elif packet.MsgId == CMD_SCHEDULER_RULE_DOWN:
+            if not MAINPTR().GetSchedulerRuleDownStatus():
+                await self.SendAck(CMD_SCHEDULER_RULE_DOWN_ACK, 1, 1,
+                                   "Scheduler Rule Down Load is start")
+                self._gui_conn_mgr.CmdSchedulerRuleDonw(self)
             else:
-                self.send_ack(CMD_SCHEDULER_RULE_DOWN_ACK, 1, 0, "Already Scheduler Down Load is start")
+                await self.SendAck(CMD_SCHEDULER_RULE_DOWN_ACK, 1, 0,
+                                   "Already Scheduler Down Load is start")
 
-    def gw_status_gui_req_process(self, packet):
-        """
-        GUI로부터 설정 변경(Modify)이나 제어 명령 수신
-        """
-        print(f"[GuiConnection] Recv Request Status GUI : {packet.msg_id}")
-        
-        from AsciiServerWorld import AsciiServerWorld
-        world = AsciiServerWorld._instance
-        ret = False
-        result_msg = "" # Python에서는 참조로 문자열 변경 불가하므로 리턴값 등으로 처리 필요하지만 단순화
-        
-        msg_id = packet.msg_id
+        else:
+            logger.debug("Unknown Cmd Gui Request : %d", packet.MsgId)
 
-        # 1. Info Change Requests
-        if msg_id == MANAGER_MODIFY:
-            info = AsManagerInfoT.unpack(packet.msg_body)
-            if info: ret = world.recv_info_change(info)
-            self.send_ack(MANAGER_MODIFY_ACK, 0, 1 if ret else 0, "")
+    async def _gw_status_gui_req_process(self, packet) -> None:
+        """C++: GwStatusGuiReqProcess(PACKET_T*)"""
+        from ProcNaServer.AsciiServerWorld import MAINPTR
 
-        elif msg_id == CONNECTOR_MODIFY:
-            info = AsConnectorInfoT.unpack(packet.msg_body)
-            if info: ret = world.recv_info_change(info)
-            self.send_ack(CONNECTOR_MODIFY_ACK, 0, 1 if ret else 0, "")
-            
-        elif msg_id == CONNECTION_LIST_MODIFY:
-            # 1. 리스트 구조체 언패킹
-            info_list = AsConnectionInfoListT.unpack(packet.msg_body)
-            
-            ret = False
-            if info_list:
-                # 2. 월드로 전달 (AsciiServerWorld에서 리스트 순회 처리)
-                ret = world.recv_info_change(info_list)
-            
-            # 3. 결과 응답
-            self.send_ack(CONNECTION_LIST_MODIFY_ACK, 0, 1 if ret else 0, "")
+        logger.debug("Recv Request Status GUI : %d", packet.MsgId)
+        msg_id = packet.MsgId
+        msg    = packet.Msg
 
-        elif msg_id == CONNECTION_LIST_MODIFY:
-            # List unpack 구현 필요 (복잡하므로 여기선 생략하거나 단일 처리)
-            pass
+        # ── InfoChange (CRUD) ─────────────────────────────────────────────
+        _info_map = {
+            MANAGER_MODIFY:           (AS_MANAGER_INFO_T,          MANAGER_MODIFY_ACK),
+            CONNECTOR_MODIFY:         (AS_CONNECTOR_INFO_T,        CONNECTOR_MODIFY_ACK),
+            CONNECTION_MODIFY:        (AS_CONNECTION_INFO_T,       CONNECTION_MODIFY_ACK),
+            CONNECTION_LIST_MODIFY:   (AS_CONNECTION_INFO_LIST_T,  CONNECTION_LIST_MODIFY_ACK),
+            DATAHANDLER_MODIFY:       (AS_DATA_HANDLER_INFO_T,     DATAHANDLER_MODIFY_ACK),
+            COMMAND_AUTHORITY_MODIFY: (AS_COMMAND_AUTHORITY_INFO_T,COMMAND_AUTHORITY_MODIFY_ACK),
+            SUB_PROC_MODIFY:          (AS_SUB_PROC_INFO_T,         SUB_PROC_MODIFY_ACK),
+        }
+        if msg_id in _info_map:
+            _, ack_id = _info_map[msg_id]
+            result_msg = [""]
+            ret = MAINPTR().RecvInfoChange(msg, result_msg)
+            await self.SendAck(ack_id, 0, 1 if ret else 0, result_msg[0])
+            return
 
-        elif msg_id == DATAHANDLER_MODIFY:
-            info = AsDataHandlerInfoT.unpack(packet.msg_body)
-            if info: ret = world.recv_info_change(info)
-            self.send_ack(DATAHANDLER_MODIFY_ACK, 0, 1 if ret else 0, "")
-
-        elif msg_id == COMMAND_AUTHORITY_MODIFY:
-            info = AsCommandAuthorityInfoT.unpack(packet.msg_body)
-            if info: ret = world.recv_info_change(info)
-            self.send_ack(COMMAND_AUTHORITY_MODIFY_ACK, 0, 1 if ret else 0, "")
-            
-        elif msg_id == SUB_PROC_MODIFY:
-            info = AsSubProcInfoT.unpack(packet.msg_body)
-            if info: ret = world.recv_info_change(info)
-            self.send_ack(SUB_PROC_MODIFY_ACK, 0, 1 if ret else 0, "")
-
-        # 2. Control & Etc
-        elif msg_id == CMD_LOG_STATUS_CHANGE:
-            ctl = AsCmdLogControlT.unpack(packet.msg_body)
-            if ctl: self.receive_cmd_log_status_change(ctl)
+        # ── 기타 요청 ─────────────────────────────────────────────────────
+        if msg_id == CMD_LOG_STATUS_CHANGE:
+            await self._recv_cmd_log_status_change(msg)
 
         elif msg_id == PROC_CONTROL:
-            ctl = AsProcControlT.unpack(packet.msg_body)
-            if ctl: world.recv_process_control(ctl)
+            MAINPTR().RecvProcessControl(msg)
 
         elif msg_id == SESSION_CONTROL:
-            ctl = AsSessionControlT.unpack(packet.msg_body)
-            if ctl: world.recv_session_control(ctl)
+            MAINPTR().RecvSessionControl(msg)
 
         elif msg_id == CMD_PARSING_RULE_DOWN:
-            self.rule_editor_req_process(packet) # 재사용
-
-        elif msg_id == CMD_PARSING_RULE_CHANGE:
-            info = AsRuleChangeInfoT.unpack(packet.msg_body)
-            if info: world.parser_rule_change(info)
-
-        elif msg_id == CMD_CONNECTOR_DESC_CHANGE:
-            info = AsConnectorDescChangeInfoT.unpack(packet.msg_body)
-            if info: world.connector_desc_change(info)
-
-        elif msg_id == AS_MMC_REQ:
-            req = AsMmcRequestT.unpack(packet.msg_body)
-            if req: self.receive_mmc_req(req)
-
-        # [추가] AS_MMC_REQ_OLD
-        elif msg_id == AS_MMC_REQ_OLD:
-            req_old = AsMmcRequestOldT.unpack(packet.msg_body)
-            if req_old:
-                req_new = AsMmcRequestT()
-                AsUtil.convert_mmc_old_to_new(req_old, req_new)
-                self.receive_mmc_req(req_new)
-
-        # [추가] AS_DB_SYNC_INFO_REQ
-        elif msg_id == AS_DB_SYNC_INFO_REQ:
-            self.receive_db_sync_info_req()
-
-        # [추가] AS_DATA_HANDLER_INIT
-        elif msg_id == AS_DATA_HANDLER_INIT:
-            info = AsDataHandlerInitT.unpack(packet.msg_body)
-            if info: world.recv_init_info(info)
-
-        # [추가] AS_DATA_ROUTING_INIT
-        elif msg_id == AS_DATA_ROUTING_INIT:
-            info = AsDataRoutingInitT.unpack(packet.msg_body)
-            if info: world.recv_init_info(info)
-
-        # [추가] AS_SESSION_CFG
-        elif msg_id == AS_SESSION_CFG:
-            cfg = AsSessionCfgT.unpack(packet.msg_body)
-            if cfg:
-                # AsciiServerWorld에 recv_session_cfg 구현 필요
-                if hasattr(world, 'recv_session_cfg'):
-                    world.recv_session_cfg(cfg)
-
-        else:
-            print(f"[GuiConnection] Unknow Status Gui Request : {packet.msg_id}")
-
-    # ---------------------------------------------------
-    # DB Sync Info Handler
-    # ---------------------------------------------------
-    def receive_db_sync_info_req(self):
-        """
-        C++: void ReceiveDbSyncInfoReq()
-        DB 동기화 정보 요청 처리 -> Standby Server 여부 확인 후 응답
-        """
-        from AsciiServerWorld import AsciiServerWorld
-        from Class.Common.CommType import AS_DB_SYNC_INFO_LIST, AS_DB_SYNC_INFO_REQ_ACK
-        
-        world = AsciiServerWorld._instance
-        
-        # 월드에서 동기화 정보 가져오기 (Standby Server일 때만 유효한 포인터 반환)
-        info_list = world.get_db_sync_info() # AsDbSyncInfoListT 객체 반환 가정
-
-        if info_list:
-            body = info_list.pack()
-            self.packet_send(PacketT(AS_DB_SYNC_INFO_LIST, len(body), body))
-        else:
-            # Standby Server가 아니거나 정보가 없음
-            self.send_ack(AS_DB_SYNC_INFO_REQ_ACK, 1, 0, "StandBy Server is't running")
-
-    # ---------------------------------------------------
-    # Session Identification & Init
-    # ---------------------------------------------------
-    def session_identify(self, session_type, session_name):
-        """
-        세션 식별 후 초기 정보(Init Info) 전송
-        """
-        # MAINPTR->SessionCfg (구현 필요 시 호출)
-        print(f"[GuiConnection] Session Identify : Type({AsUtil.get_process_type_string(session_type)},{session_name})")
-
-        if session_type in [GUI_RULE_EDITOR, GUI_ASCII_CONFIG_INFO, GUI_ASCII_STATUS_INFO]:
-            mask = 0
-            if session_type == GUI_ASCII_STATUS_INFO:
-                mask = (INIT_INFO_MANAGER_MASK | INIT_INFO_DATAHANDLER_MASK |
-                        INIT_INFO_PROCESS_MASK | INIT_INFO_COMMAND_AUTHORITY_MASK)
-                
-                self.send_init_info(INIT_INFO_START, mask)
-                self.send_all_manager_info()
-                self.send_all_proc_status_info()
-                self.send_all_data_handler_info()
-                self.send_all_command_authority_info()
-                self.send_all_etc_info()
-                
-            elif session_type == GUI_ASCII_CONFIG_INFO:
-                mask = (INIT_INFO_MANAGER_MASK | INIT_INFO_COMMAND_AUTHORITY_MASK | INIT_INFO_DATAHANDLER_MASK)
-                
-                self.send_init_info(INIT_INFO_START, mask)
-                self.send_all_manager_info()
-                self.send_all_data_handler_info()
-                self.send_all_command_authority_info()
-
-            self.send_init_info(INIT_INFO_END, 0)
-
-    # ---------------------------------------------------
-    # Send Info Methods
-    # ---------------------------------------------------
-    def send_init_info(self, msg_id, mask):
-        """
-        C++: void SendInitInfo(int MsgId, unsigned int Mask)
-        초기화 데이터 전송 전, 전송할 데이터의 총 개수를 계산하여 알림
-        """
-        from AsciiServerWorld import AsciiServerWorld
-        from Class.Common.CommType import (
-            PacketT, AsGuiInitInfoT,
-            INIT_INFO_MANAGER_MASK, INIT_INFO_PROCESS_MASK,
-            INIT_INFO_DATAHANDLER_MASK, INIT_INFO_COMMAND_AUTHORITY_MASK,
-            GUI_ASCII_STATUS_INFO
-        )
-
-        world = AsciiServerWorld._instance
-        count = 0
-
-        # -------------------------------------------------------
-        # 1. Manager, Connector, Connection, SubProc Count
-        # -------------------------------------------------------
-        if mask & INIT_INFO_MANAGER_MASK:
-            # Manager Count
-            mgr_map = world.m_ManagerConnMgr.get_manager_info_map()
-            count += len(mgr_map)
-
-            for mgr in mgr_map.values():
-                # Connector Count
-                count += len(mgr.m_ConnectorInfoMap)
-                
-                # Connection Count
-                for conn in mgr.m_ConnectorInfoMap.values():
-                    count += len(conn.m_ConnectionInfoList)
-
-            # SubProc Count
-            sub_proc_map = world.get_sub_proc_info_map()
-            count += len(sub_proc_map)
-
-        # -------------------------------------------------------
-        # 2. Process Status Count
-        # -------------------------------------------------------
-        if mask & INIT_INFO_PROCESS_MASK:
-            # print("[GuiConnection] Process Info Counting")
-            proc_status_map = world.get_proc_status_map()
-            # Map<ManagerId, Map<ProcId, Status>> 구조
-            for sub_map in proc_status_map.values():
-                count += len(sub_map)
-
-        # -------------------------------------------------------
-        # 3. DataHandler Count
-        # -------------------------------------------------------
-        if mask & INIT_INFO_DATAHANDLER_MASK:
-            dh_map = world.get_data_handler_info_map()
-            count += len(dh_map)
-
-        # -------------------------------------------------------
-        # 4. Command Authority Count
-        # -------------------------------------------------------
-        if mask & INIT_INFO_COMMAND_AUTHORITY_MASK:
-            cmd_map = world.get_command_authority_info_map()
-            count += len(cmd_map)
-
-        # -------------------------------------------------------
-        # 5. System Info & Session Cfg (Status Info 세션일 경우만)
-        # -------------------------------------------------------
-        if self.m_SessionIdentify == GUI_ASCII_STATUS_INFO:
-            sys_map = world.get_as_system_info_map()
-            count += len(sys_map)
-
-            sess_map = world.get_as_session_cfg_map()
-            count += len(sess_map)
-
-        # -------------------------------------------------------
-        # 6. 패킷 전송
-        # -------------------------------------------------------
-        # AsGuiInitInfoT 구조체 생성 및 전송
-        init_info = AsGuiInitInfoT(count)
-        body = init_info.pack()
-        
-        self.packet_send(PacketT(msg_id, len(body), body))
-
-    def send_all_manager_info(self):
-        from AsciiServerWorld import AsciiServerWorld
-        world = AsciiServerWorld._instance
-        
-        # Manager Info
-        for mgr_info in world.m_ManagerConnMgr.m_ManagerInfoMap.values():
-            self.packet_send(PacketT(AS_MANAGER_INFO, len(mgr_info.m_ManagerInfo.pack()), mgr_info.m_ManagerInfo.pack()))
-            
-            # Connector & Connection Info
-            for conn_info in mgr_info.m_ConnectorInfoMap.values():
-                self.packet_send(PacketT(AS_CONNECTOR_INFO, len(conn_info.m_ConnectorInfo.pack()), conn_info.m_ConnectorInfo.pack()))
-                
-                for c in conn_info.m_ConnectionInfoList:
-                    self.packet_send(PacketT(AS_CONNECTION_INFO, len(c.pack()), c.pack()))
-
-    def send_all_data_handler_info(self):
-        from AsciiServerWorld import AsciiServerWorld
-        world = AsciiServerWorld._instance
-        
-        for info in world.m_DataHandlerConnMgr.get_data_handler_info_map().values():
-            self.packet_send(PacketT(AS_DATA_HANDLER_INFO, len(info.pack()), info.pack()))
-
-    def send_all_command_authority_info(self):
-        """
-        C++: void SendAllCommandAuthorityInfo()
-        모든 명령어 권한 정보를 GUI로 전송
-        """
-        from AsciiServerWorld import AsciiServerWorld
-        from Class.Common.CommType import AS_COMMAND_AUTHORITY_INFO, PacketT
-
-        world = AsciiServerWorld._instance
-        
-        # 1. 맵 정보 가져오기
-        # C++: MAINPTR->GetCommandAuthorityInfoMap()
-        info_map = world.get_command_authority_info_map()
-
-        if info_map:
-            # 2. 순회하며 패킷 전송
-            # C++: for(itr = info->begin() ; itr != info->end() ; itr++)
-            for info in info_map.values():
-                # C++: (char*)((*itr).second) -> Python: info.pack()
-                body = info.pack()
-                
-                packet = PacketT(AS_COMMAND_AUTHORITY_INFO, len(body), body)
-                
-                # C++: if(!SendPacket(...)) return;
-                if not self.packet_send(packet):
-                    return
-        
-    def send_all_proc_status_info(self):
-        """
-        C++: void SendAllProcStatusInfo()
-        전체 프로세스 상태 정보를 GUI로 전송
-        구조: Map(ManagerId) -> Map(ProcessId) -> StatusObj
-        """
-        from AsciiServerWorld import AsciiServerWorld
-        from Class.Common.CommType import AS_PROCESS_INFO, PacketT
-
-        world = AsciiServerWorld._instance
-        
-        # 1. 전체 프로세스 맵 가져오기
-        # C++: ProcStatusMap* info = MAINPTR->GetProcStatusMap();
-        proc_map = world.get_proc_status_map()
-
-        if proc_map:
-            # 2. Outer Loop: 매니저 단위 순회
-            # C++: for(itr = info->begin() ; itr != info->end() ; itr++)
-            for sub_map in proc_map.values():
-                
-                # 3. Inner Loop: 개별 프로세스 단위 순회
-                # C++: for(infoItr = infoMap->begin() ; infoItr != infoMap->end() ; infoItr++)
-                for proc_status in sub_map.values():
-                    
-                    # 4. 패킷 전송
-                    # C++: SendPacket(AS_PROCESS_INFO, (char*)((*infoItr).second), ...)
-                    body = proc_status.pack()
-                    packet = PacketT(AS_PROCESS_INFO, len(body), body)
-                    
-                    if not self.packet_send(packet):
-                        return
-
-    def send_all_etc_info(self):
-        """
-        C++: void SendAllEtcInfo()
-        시스템 정보 및 세션 설정 정보 전송
-        """
-        from AsciiServerWorld import AsciiServerWorld
-        from Class.Common.CommType import AS_SYSTEM_INFO, AS_SESSION_CFG, PacketT
-
-        world = AsciiServerWorld._instance
-
-        # 1. System Info 전송
-        # C++: MAINPTR->GetAsSystemInfoMap(sysInfoMap)
-        sys_info_map = world.get_as_system_info_map()
-        
-        if sys_info_map:
-            for info in sys_info_map.values():
-                body = info.pack()
-                packet = PacketT(AS_SYSTEM_INFO, len(body), body)
-                
-                if not self.packet_send(packet):
-                    return
-
-        # 2. Session Config 전송
-        # C++: MAINPTR->GetAsSessionCfgMap(sessioncfgMap)
-        session_cfg_map = world.get_as_session_cfg_map()
-        
-        if session_cfg_map:
-            for cfg in session_cfg_map.values():
-                body = cfg.pack()
-                packet = PacketT(AS_SESSION_CFG, len(body), body)
-                
-                if not self.packet_send(packet):
-                    return
-
-    # ---------------------------------------------------
-    # MMC & Log Handling
-    # ---------------------------------------------------
-    def receive_mmc_req(self, mmc_req):
-        """
-        C++: void ReceiveMMCReq(AS_MMC_REQUEST_T* MMCReq)
-        MMC 요청 처리 및 결과 전송
-        """
-        from AsciiServerWorld import AsciiServerWorld
-        from Class.Common.CommType import (
-            AsMmcPublishT, AsMmcResultT, PacketT,
-            NO_RESPONSE, IMMEDIATE, R_ERROR, AS_MMC_RES
-        )
-
-        # 1. Publish 구조체 생성 및 데이터 복사
-        # C++: AS_MMC_PUBLISH_T mmcCom; memset... strcpy...
-        mmc_com = AsMmcPublishT()
-        mmc_com.ne = mmc_req.ne
-        mmc_com.mmc = mmc_req.mmc
-        mmc_com.responseMode = NO_RESPONSE
-        mmc_com.publishMode = IMMEDIATE
-
-        # 2. 명령 실행 요청 (World -> Manager)
-        # C++: MAINPTR->SendMMCCommandFromStatusGui(&mmcCom, errStr);
-        # Python에서는 (bool, err_msg) 튜플 반환 방식으로 처리
-        world = AsciiServerWorld._instance
-        ret, err_str = world.send_mmc_command_from_status_gui(mmc_com)
-
-        # 3. 실패 시 에러 응답 전송
-        if not ret:
-            # C++: AS_MMC_RESULT_T mmcRes; ...
-            mmc_res = AsMmcResultT()
-            mmc_res.id = 0
-            mmc_res.resultMode = R_ERROR
-            mmc_res.result = err_str
-
-            # Packet 전송
-            body = mmc_res.pack()
-            self.packet_send(PacketT(AS_MMC_RES, len(body), body))
-
-    def receive_cmd_log_status_change(self, log_ctl):
-        if log_ctl.Type == GET_LOG_INFO:
-            self.send_all_log_status()
-        else:
-            from AsciiServerWorld import AsciiServerWorld
-            AsciiServerWorld._instance.receive_cmd_log_status_change(log_ctl)
-
-    def send_all_log_status(self):
-        """
-        C++: void SendAllLogStatus()
-        시스템의 모든 로그 상태 정보를 조회하여 GUI로 전송
-        """
-        from AsciiServerWorld import AsciiServerWorld
-        
-        # 1. 로그 상태 리스트 수집
-        # C++: LogStatusVector logStatusList; MAINPTR->GetLogStatusList(&logStatusList);
-        log_status_list = []
-        AsciiServerWorld._instance.get_log_status_list(log_status_list)
-
-        # 2. 순회하며 전송
-        # C++: for(...) { SendLogStatus(...) }
-        for status in log_status_list:
-            if not self.send_log_status(status):
-                return
-
-        print("[GuiConnection] Send All Log Status To Gui")
-    
-    def send_log_status(self, status):
-        body = status.pack()
-        return self.packet_send(PacketT(AS_LOG_INFO, len(body), body))
-    
-    def receive_cmd_log_status_change(self, log_ctl):
-        """
-        C++: void ReceiveCmdLogStatusChange(AS_CMD_LOG_CONTROL_T* LogCtl)
-        로그 제어 패킷 처리 (조회 vs 변경)
-        """
-        # 디버그 로그
-        print(f"[GuiConnection] ReceiveCmdLogStatusChange : Type={log_ctl.Type}")
-
-        # 필요한 상수 Import
-        from Class.Common.CommType import GET_LOG_INFO
-        from AsciiServerWorld import AsciiServerWorld
-
-        # 1. 로그 정보 조회 요청 (GET_LOG_INFO)
-        if log_ctl.Type == GET_LOG_INFO:
-            self.send_all_log_status()
-
-        # 2. 로그 상태 변경 요청 (SET) -> World로 위임
-        else:
-            AsciiServerWorld._instance.receive_cmd_log_status_change(log_ctl)
-            
-    def send_ascii_error(self, err_msg):
-        """
-        C++: bool SendAsciiError(AS_ASCII_ERROR_MSG_T* ErrMsg)
-        에러 메시지를 GUI로 전송
-        """
-        from Class.Common.CommType import ASCII_ERROR_MSG, PacketT
-
-        # 1. 구조체 직렬화
-        # C++: (char*)ErrMsg
-        body = err_msg.pack()
-
-        # 2. 패킷 생성 및 전송
-        # C++: SendNonBlockPacket(ASCII_ERROR_MSG, ...)
-        # Python의 packet_send는 보통 쓰기 버퍼에 데이터를 넣고 즉시 반환되므로
-        # Non-Blocking 전송과 유사한 효과를 냅니다.
-        packet = PacketT(ASCII_ERROR_MSG, len(body), body)
-        
-        return self.packet_send(packet)
-    
-    def gw_command_gui_req_process(self, packet):
-        """
-        C++: void GwCommandGuiReqProcess(PACKET_T* Packet)
-        명령어/스케줄러 룰 다운로드 요청 처리
-        """
-        print(f"[GuiConnection] Recv Request Cmd GUI : {packet.msg_id}")
-
-        from AsciiServerWorld import AsciiServerWorld
-        from Class.Common.CommType import (
-            CMD_COMMAND_RULE_DOWN, CMD_COMMAND_RULE_DOWN_ACK,
-            CMD_SCHEDULER_RULE_DOWN, CMD_SCHEDULER_RULE_DOWN_ACK
-        )
-
-        world = AsciiServerWorld._instance
-        msg_id = packet.msg_id
-
-        # 1. Command Rule Down 요청
-        if msg_id == CMD_COMMAND_RULE_DOWN:
-            # 진행 상태 확인 (C++: GetCommandRuleDownStatus)
-            if not world.m_CommandRuleDownLoading:
-                self.send_ack(CMD_COMMAND_RULE_DOWN_ACK, 1, 1, "Command Rule Down Load is start")
-                # 매니저에게 요청 위임
-                if self.m_GuiConnMgr:
-                    self.m_GuiConnMgr.cmd_command_rule_down(self)
+            if not MAINPTR().GetParsingRuleDownStatus():
+                await self.SendAck(CMD_PARSING_RULE_DOWN_ACK, 1, 1,
+                                   "Rule Down Load is start")
+                self._gui_conn_mgr.CmdParsingRuleDown(self)
             else:
-                self.send_ack(CMD_COMMAND_RULE_DOWN_ACK, 1, 0, "Already Command Rule Down Load is start")
-
-        # 2. Scheduler Rule Down 요청
-        elif msg_id == CMD_SCHEDULER_RULE_DOWN:
-            # 진행 상태 확인 (C++: GetSchedulerRuleDownStatus)
-            if not world.m_SchedulerRuleDownLoading:
-                self.send_ack(CMD_SCHEDULER_RULE_DOWN_ACK, 1, 1, "Scheduler Rule Down Load is start")
-                # 매니저에게 요청 위임 (C++ 오타 Donw -> Down 수정)
-                if self.m_GuiConnMgr:
-                    self.m_GuiConnMgr.cmd_scheduler_rule_down(self)
-            else:
-                self.send_ack(CMD_SCHEDULER_RULE_DOWN_ACK, 1, 0, "Already Scheduler Down Load is start")
-
-        else:
-            print(f"[GuiConnection] Unknown Cmd Gui Request : {msg_id}")
-            
-    def gw_status_gui_req_process(self, packet):
-        """
-        C++: void GwStatusGuiReqProcess(PACKET_T* Packet)
-        GUI로부터의 상태/설정 변경 요청 처리
-        """
-        # 디버그 로그
-        # print(f"[GuiConnection] Recv Request Status GUI : {packet.msg_id}")
-
-        from AsciiServerWorld import AsciiServerWorld
-        from Class.Common.CommType import (
-            MANAGER_MODIFY, MANAGER_MODIFY_ACK,
-            CONNECTOR_MODIFY, CONNECTOR_MODIFY_ACK,
-            CONNECTION_MODIFY, CONNECTION_MODIFY_ACK,
-            CONNECTION_LIST_MODIFY, CONNECTION_LIST_MODIFY_ACK,
-            DATAHANDLER_MODIFY, DATAHANDLER_MODIFY_ACK,
-            COMMAND_AUTHORITY_MODIFY, COMMAND_AUTHORITY_MODIFY_ACK,
-            SUB_PROC_MODIFY, SUB_PROC_MODIFY_ACK,
-            CMD_LOG_STATUS_CHANGE, PROC_CONTROL, SESSION_CONTROL,
-            CMD_PARSING_RULE_DOWN, CMD_PARSING_RULE_DOWN_ACK,
-            CMD_MAPPING_RULE_DOWN, CMD_MAPPING_RULE_DOWN_ACK,
-            CMD_PARSING_RULE_CHANGE, CMD_CONNECTOR_DESC_CHANGE,
-            AS_MMC_REQ, AS_MMC_REQ_OLD, AS_DB_SYNC_INFO_REQ,
-            AS_DATA_HANDLER_INIT, AS_DATA_ROUTING_INIT, AS_SESSION_CFG,
-            # 구조체들
-            AsManagerInfoT, AsConnectorInfoT, AsConnectionInfoT,
-            AsConnectionInfoListT, AsDataHandlerInfoT, AsCommandAuthorityInfoT,
-            AsSubProcInfoT, AsCmdLogControlT, AsProcControlT, AsSessionControlT,
-            AsRuleChangeInfoT, AsConnectorDescChangeInfoT,
-            AsMmcRequestT, AsMmcRequestOldT,
-            AsDataHandlerInitT, AsDataRoutingInitT, AsSessionCfgT
-        )
-        from Class.Common.AsUtil import AsUtil
-
-        world = AsciiServerWorld._instance
-        msg_id = packet.msg_id
-        result_msg = "" # C++에서는 RecvInfoChange에서 채워짐 (여기선 단순화)
-
-        # -------------------------------------------------------
-        # 1. Info Modify Requests (설정 변경)
-        # -------------------------------------------------------
-        if msg_id == MANAGER_MODIFY:
-            info = AsManagerInfoT.unpack(packet.msg_body)
-            ret = world.recv_info_change(info) if info else False
-            self.send_ack(MANAGER_MODIFY_ACK, 0, 1 if ret else 0, result_msg)
-
-        elif msg_id == CONNECTOR_MODIFY:
-            info = AsConnectorInfoT.unpack(packet.msg_body)
-            ret = world.recv_info_change(info) if info else False
-            self.send_ack(CONNECTOR_MODIFY_ACK, 0, 1 if ret else 0, result_msg)
-
-        elif msg_id == CONNECTION_MODIFY:
-            info = AsConnectionInfoT.unpack(packet.msg_body)
-            ret = world.recv_info_change(info) if info else False
-            self.send_ack(CONNECTION_MODIFY_ACK, 0, 1 if ret else 0, result_msg)
-
-        elif msg_id == CONNECTION_LIST_MODIFY:
-            info = AsConnectionInfoListT.unpack(packet.msg_body)
-            ret = world.recv_info_change(info) if info else False
-            self.send_ack(CONNECTION_LIST_MODIFY_ACK, 0, 1 if ret else 0, result_msg)
-
-        elif msg_id == DATAHANDLER_MODIFY:
-            info = AsDataHandlerInfoT.unpack(packet.msg_body)
-            ret = world.recv_info_change(info) if info else False
-            self.send_ack(DATAHANDLER_MODIFY_ACK, 0, 1 if ret else 0, result_msg)
-
-        elif msg_id == COMMAND_AUTHORITY_MODIFY:
-            info = AsCommandAuthorityInfoT.unpack(packet.msg_body)
-            ret = world.recv_info_change(info) if info else False
-            self.send_ack(COMMAND_AUTHORITY_MODIFY_ACK, 0, 1 if ret else 0, result_msg)
-
-        elif msg_id == SUB_PROC_MODIFY:
-            info = AsSubProcInfoT.unpack(packet.msg_body)
-            ret = world.recv_info_change(info) if info else False
-            self.send_ack(SUB_PROC_MODIFY_ACK, 0, 1 if ret else 0, result_msg)
-
-        # -------------------------------------------------------
-        # 2. Control & Status
-        # -------------------------------------------------------
-        elif msg_id == CMD_LOG_STATUS_CHANGE:
-            ctl = AsCmdLogControlT.unpack(packet.msg_body)
-            if ctl: self.receive_cmd_log_status_change(ctl)
-
-        elif msg_id == PROC_CONTROL:
-            ctl = AsProcControlT.unpack(packet.msg_body)
-            if ctl: world.recv_process_control(ctl)
-
-        elif msg_id == SESSION_CONTROL:
-            ctl = AsSessionControlT.unpack(packet.msg_body)
-            if ctl: world.recv_session_control(ctl)
-
-        # -------------------------------------------------------
-        # 3. Rule Down Load
-        # -------------------------------------------------------
-        elif msg_id == CMD_PARSING_RULE_DOWN:
-            if not world.m_ParsingRuleDownLoading:
-                self.send_ack(CMD_PARSING_RULE_DOWN_ACK, 1, 1, "Rule Down Load is start")
-                if self.m_GuiConnMgr: self.m_GuiConnMgr.cmd_parsing_rule_down(self)
-            else:
-                self.send_ack(CMD_PARSING_RULE_DOWN_ACK, 1, 0, "Already Rule Down Load is start")
+                await self.SendAck(CMD_PARSING_RULE_DOWN_ACK, 1, 0,
+                                   "Already Rule Down Load is start")
 
         elif msg_id == CMD_MAPPING_RULE_DOWN:
-            if not world.m_MappingRuleDownLoading:
-                self.send_ack(CMD_MAPPING_RULE_DOWN_ACK, 1, 1, "Mapping Rule Down Load is start")
-                if self.m_GuiConnMgr: self.m_GuiConnMgr.cmd_mapping_rule_down(self)
+            if not MAINPTR().GetMappingRuleDownStatus():
+                await self.SendAck(CMD_MAPPING_RULE_DOWN_ACK, 1, 1,
+                                   "Mapping Rule Down Load is start")
+                self._gui_conn_mgr.CmdMappingRuleDown(self)
             else:
-                self.send_ack(CMD_MAPPING_RULE_DOWN_ACK, 1, 0, "Already Mapping Rule Down Load is start")
+                await self.SendAck(CMD_MAPPING_RULE_DOWN_ACK, 1, 0,
+                                   "Already Mapping Rule Down Load is start")
 
-        # -------------------------------------------------------
-        # 4. Other Changes
-        # -------------------------------------------------------
         elif msg_id == CMD_PARSING_RULE_CHANGE:
-            info = AsRuleChangeInfoT.unpack(packet.msg_body)
-            if info: world.parser_rule_change(info)
+            MAINPTR().ParserRuleChange(msg)
 
         elif msg_id == CMD_CONNECTOR_DESC_CHANGE:
-            info = AsConnectorDescChangeInfoT.unpack(packet.msg_body)
-            if info: world.connector_desc_change(info)
+            MAINPTR().ConnectorDescChange(msg)
 
-        # -------------------------------------------------------
-        # 5. MMC & Init
-        # -------------------------------------------------------
         elif msg_id == AS_MMC_REQ:
-            req = AsMmcRequestT.unpack(packet.msg_body)
-            if req: self.receive_mmc_req(req)
+            await self._receive_mmc_req(msg)
 
         elif msg_id == AS_MMC_REQ_OLD:
-            req_old = AsMmcRequestOldT.unpack(packet.msg_body)
-            if req_old:
-                req_new = AsMmcRequestT()
-                AsUtil.convert_mmc_old_to_new(req_old, req_new)
-                self.receive_mmc_req(req_new)
+            new_req = AS_MMC_REQUEST_T()
+            AsUtil.ConvertMMC_OldToNew(msg, new_req)
+            await self._receive_mmc_req(new_req)
 
         elif msg_id == AS_DB_SYNC_INFO_REQ:
-            self.receive_db_sync_info_req()
+            await self._receive_db_sync_info_req()
 
         elif msg_id == AS_DATA_HANDLER_INIT:
-            info = AsDataHandlerInitT.unpack(packet.msg_body)
-            if info: world.recv_init_info(info)
+            MAINPTR().RecvInitInfo(msg)
 
         elif msg_id == AS_DATA_ROUTING_INIT:
-            info = AsDataRoutingInitT.unpack(packet.msg_body)
-            if info: world.recv_init_info(info)
+            MAINPTR().RecvInitInfo(msg)
 
         elif msg_id == AS_SESSION_CFG:
-            cfg = AsSessionCfgT.unpack(packet.msg_body)
-            if cfg: world.recv_session_cfg(cfg)
+            MAINPTR().RecvSessionCfg(msg)
 
         else:
-            print(f"[GuiConnection] Unknown Status Gui Request : {msg_id}")
-            
-    def receive_mmc_req_old(self, mmc_req_old):
-        """
-        C++: void ReceiveMMCReq(AS_MMC_REQUEST_OLD_T* MMCReq)
-        구형 MMC 요청을 신형으로 변환하여 처리
-        """
-        from Class.Common.CommType import AsMmcRequestT
-        from Class.Common.AsUtil import AsUtil
+            logger.debug("Unknown Status Gui Request : %d", msg_id)
 
-        # 1. 신형 구조체 생성
-        # C++: AS_MMC_REQUEST_T req; memset...
-        req_new = AsMmcRequestT()
+    # =========================================================================
+    # 초기 데이터 일괄 전송
+    # =========================================================================
 
-        # 2. 변환 (Old -> New)
-        # C++: AsUtil::ConvertMMC_OldToNew(MMCReq, &req);
-        AsUtil.convert_mmc_old_to_new(mmc_req_old, req_new)
+    async def SendAllManagerInfo(self) -> None:
+        """C++: SendAllManagerInfo()"""
+        from ProcNaServer.AsciiServerWorld import MAINPTR
 
-        # 3. 신형 처리 함수 호출
-        # C++: ReceiveMMCReq(&req);
-        self.receive_mmc_req(req_new)
-        
-    # ---------------------------------------------------
-    # Error & Shutdown Handling
-    # ---------------------------------------------------
-    def recv_shut_down_info(self, info):
-        """
-        C++: void RecvShutDownInfo(string Info)
-        세션 강제 종료 알림 (블로킹 감지 등)
-        """
-        # C++: frCORE_ERROR(...)
-        print(f"[GuiConnection] [CORE_ERROR] Closed session enforced(may be blocked) : {self.get_session_name()}")
+        info_map = MAINPTR().GetManagerInfoMap()
+        for mgr_info in info_map.values():
+            if not await self.SendPacket(
+                    AS_MANAGER_INFO, _pack(mgr_info.m_ManagerInfo),
+                    _size(mgr_info.m_ManagerInfo)):
+                return
+            for con_info in mgr_info.m_ConnectorInfoMap.values():
+                if not await self.SendPacket(
+                        AS_CONNECTOR_INFO, _pack(con_info.m_ConnectorInfo),
+                        _size(con_info.m_ConnectorInfo)):
+                    return
+                for conn in con_info.m_ConnectionInfoList:
+                    if not await self.SendPacket(
+                            AS_CONNECTION_INFO, _pack(conn), _size(conn)):
+                        return
 
-    def recv_over_flow_data_buf_info(self, max_buf_size, cur_buf_size):
+        sub_info_map = MAINPTR().GetSubProcInfoMap()
+        for sub_info in sub_info_map.values():
+            if not await self.SendPacket(
+                    AS_SUB_PROC_INFO, _pack(sub_info), _size(sub_info)):
+                return
+
+    async def SendAllProcStatusInfo(self) -> None:
+        """C++: SendAllProcStatusInfo()"""
+        from ProcNaServer.AsciiServerWorld import MAINPTR
+
+        proc_map = MAINPTR().GetProcStatusMap()
+        for info_map in proc_map.values():
+            for proc_info in info_map.values():
+                if not await self.SendPacket(
+                        AS_PROCESS_INFO, _pack(proc_info), _size(proc_info)):
+                    return
+
+    async def SendAllDataHandlerInfo(self) -> None:
+        """C++: SendAllDataHandlerInfo()"""
+        from ProcNaServer.AsciiServerWorld import MAINPTR
+
+        for dh_info in MAINPTR().GetDataHandlerInfoMap().values():
+            if not await self.SendPacket(
+                    AS_DATA_HANDLER_INFO, _pack(dh_info), _size(dh_info)):
+                return
+
+    async def SendAllCommandAuthorityInfo(self) -> None:
+        """C++: SendAllCommandAuthorityInfo()"""
+        from ProcNaServer.AsciiServerWorld import MAINPTR
+
+        for ca_info in MAINPTR().GetCommandAuthorityInfoMap().values():
+            if not await self.SendPacket(
+                    AS_COMMAND_AUTHORITY_INFO, _pack(ca_info), _size(ca_info)):
+                return
+
+    async def SendAllEtcInfo(self) -> None:
+        """C++: SendAllEtcInfo() — SystemInfo + SessionCfg 전송."""
+        from ProcNaServer.AsciiServerWorld import MAINPTR
+
+        sys_info_map = {}
+        MAINPTR().GetAsSystemInfoMap(sys_info_map)
+        for sys_info in sys_info_map.values():
+            if not await self.SendPacket(
+                    AS_SYSTEM_INFO, _pack(sys_info), _size(sys_info)):
+                return
+
+        session_cfg_map = {}
+        MAINPTR().GetAsSessionCfgMap(session_cfg_map)
+        for cfg in session_cfg_map.values():
+            if not await self.SendPacket(
+                    AS_SESSION_CFG, _pack(cfg), _size(cfg)):
+                return
+
+    async def SendAllLogStatus(self) -> None:
+        """C++: SendAllLogStatus()"""
+        from ProcNaServer.AsciiServerWorld import MAINPTR
+
+        log_list = []
+        MAINPTR().GetLogStatusList(log_list)
+        for status in log_list:
+            if not await self.SendLogStatus(status):
+                return
+        logger.debug("Send All Log Status To Gui")
+
+    async def SendInitInfo(self, msg_id: int, mask: int) -> None:
+        """C++: SendInitInfo(int MsgId, unsigned int Mask)"""
+        from ProcNaServer.AsciiServerWorld import MAINPTR
+
+        init_info = AS_GUI_INIT_INFO_T()
+        init_info.Count = 0
+
+        if mask & INIT_INFO_MANAGER_MASK:
+            info_map = MAINPTR().GetManagerInfoMap()
+            init_info.Count += len(info_map)
+            for mgr_info in info_map.values():
+                init_info.Count += len(mgr_info.m_ConnectorInfoMap)
+                for con_info in mgr_info.m_ConnectorInfoMap.values():
+                    init_info.Count += len(con_info.m_ConnectionInfoList)
+            init_info.Count += len(MAINPTR().GetSubProcInfoMap())
+
+        if mask & INIT_INFO_PROCESS_MASK:
+            logger.debug("Process Info Counting")
+            for info_map in MAINPTR().GetProcStatusMap().values():
+                init_info.Count += len(info_map)
+
+        if mask & INIT_INFO_DATAHANDLER_MASK:
+            init_info.Count += len(MAINPTR().GetDataHandlerInfoMap())
+
+        if mask & INIT_INFO_COMMAND_AUTHORITY_MASK:
+            init_info.Count += len(MAINPTR().GetCommandAuthorityInfoMap())
+
+        if self.GetSessionType() == GUI_ASCII_STATUS_INFO:
+            sys_map = {}
+            MAINPTR().GetAsSystemInfoMap(sys_map)
+            cfg_map = {}
+            MAINPTR().GetAsSessionCfgMap(cfg_map)
+            init_info.Count += len(sys_map) + len(cfg_map)
+
+        await self.SendPacket(msg_id, _pack(init_info), _size(init_info))
+
+    # =========================================================================
+    # LogStatus / AsciiError
+    # =========================================================================
+
+    async def SendLogStatus(self, status: AS_LOG_STATUS_T) -> bool:
+        """C++: SendLogStatus(const AS_LOG_STATUS_T*)"""
+        return await self.SendPacket(AS_LOG_INFO, _pack(status), _size(status))
+
+    async def SendAsciiError(self, err_msg: AS_ASCII_ERROR_MSG_T) -> bool:
         """
-        C++: void RecvOverFlowDataBufInfo(int MaxBufSize, int CurBufSize)
-        송신 버퍼 오버플로우 감지 시 세션 강제 종료
+        C++: SendAsciiError() → SendNonBlockPacket (비블로킹)
+        Python에서는 asyncio SendPacket 으로 대응.
         """
-        # C++: frCORE_ERROR(...)
-        msg = (f"Session may be blocked(MAX:{max_buf_size} byte, "
-               f"CUR:{cur_buf_size} byte)[{self.get_session_name()}]")
-        print(f"[GuiConnection] [CORE_ERROR] {msg}")
-        
-        # 소켓 강제 종료
-        # C++: ShutDown(m_FD);
-        self.shutdown()
+        return await self.SendPacket(
+            ASCII_ERROR_MSG, _pack(err_msg), _size(err_msg))
+
+    # =========================================================================
+    # CmdLogStatusChange
+    # =========================================================================
+
+    async def _recv_cmd_log_status_change(self,
+                                           log_ctl: AS_CMD_LOG_CONTROL_T) -> None:
+        """C++: ReceiveCmdLogStatusChange(AS_CMD_LOG_CONTROL_T*)"""
+        from ProcNaServer.AsciiServerWorld import MAINPTR
+
+        logger.debug("ReceiveCmdLogStatusChange")
+        if log_ctl.Type == GET_LOG_INFO:
+            await self.SendAllLogStatus()
+        else:
+            MAINPTR().ReceiveCmdLogStatusChange(log_ctl)
+
+    # =========================================================================
+    # MMC 요청
+    # =========================================================================
+
+    async def _receive_mmc_req(self, mmc_req: AS_MMC_REQUEST_T) -> None:
+        """C++: ReceiveMMCReq(AS_MMC_REQUEST_T*)"""
+        from ProcNaServer.AsciiServerWorld import MAINPTR
+
+        mmc_com = AS_MMC_PUBLISH_T()
+        mmc_com.ne           = mmc_req.ne
+        mmc_com.mmc          = mmc_req.mmc
+        mmc_com.responseMode = NO_RESPONSE
+        mmc_com.publishMode  = IMMEDIATE
+
+        err_str = [""]
+        ret = MAINPTR().SendMMCCommandFromStatusGui(mmc_com, err_str)
+
+        if not ret:
+            mmc_res = AS_MMC_RESULT_T()
+            mmc_res.id         = 0
+            mmc_res.resultMode = R_ERROR
+            mmc_res.result     = err_str[0]
+            await self.SendPacket(AS_MMC_RES, _pack(mmc_res), _size(mmc_res))
+
+    # =========================================================================
+    # DB Sync 정보 요청
+    # =========================================================================
+
+    async def _receive_db_sync_info_req(self) -> None:
+        """C++: ReceiveDbSyncInfoReq()"""
+        from ProcNaServer.AsciiServerWorld import MAINPTR
+
+        info_list = MAINPTR().GetDbSyncInfo()
+        if info_list:
+            await self.SendPacket(
+                AS_DB_SYNC_INFO_LIST, _pack(info_list), _size(info_list))
+        else:
+            await self.SendAck(AS_DB_SYNC_INFO_REQ_ACK, 1, 0,
+                               "StandBy Server is't running")
+
+    # =========================================================================
+    # 소켓 오버플로 / 셧다운
+    # =========================================================================
+
+    def RecvShutDownInfo(self, info: str) -> None:
+        """C++: RecvShutDownInfo(string Info)"""
+        logger.error("Closed session enforced(may be blocked) : %s",
+                     self.GetSessionName())
+
+    def RecvOverFlowDataBufInfo(self, max_buf: int, cur_buf: int) -> None:
+        """C++: RecvOverFlowDataBufInfo(int MaxBufSize, int CurBufSize)"""
+        logger.error("Session may be blocked(MAX:%d byte, CUR:%d byte)[%s]",
+                     max_buf, cur_buf, self.GetSessionName())
+        # C++: ShutDown(m_FD) → writer 강제 종료
+        if self._writer:
+            try:
+                self._writer.close()
+            except Exception:
+                pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 패킷 직렬화 헬퍼
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _pack(obj) -> bytes:
+    if hasattr(obj, 'pack'):
+        return obj.pack()
+    return b''
+
+def _size(obj) -> int:
+    return len(_pack(obj))

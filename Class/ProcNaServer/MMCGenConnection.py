@@ -1,285 +1,290 @@
-import sys
-import os
+"""
+MMCGenConnection.py
+C++ MMCGenConnection.h/.C → Python 변환
 
-# -------------------------------------------------------
-# Project Path Setup
-# -------------------------------------------------------
-current_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.abspath(os.path.join(current_dir, '../..'))
-if project_root not in sys.path:
-    sys.path.append(project_root)
+MMCGenerator / MMCScheduler / JobMonitor 소켓 연결 처리.
+  - MMCRequestConnection 상속
+  - 세션 타입별 패킷 분기 처리
+  - MMC 요청 큐 삽입 / Generator 전달 / Log 전송
+"""
 
-from Class.Common.AsSocket import AsSocket
-from Class.Common.CommType import *
-from Class.Common.AsUtil import AsUtil
+import asyncio
+import logging
+from typing import Optional, TYPE_CHECKING
 
-class MMCGenConnection(AsSocket):
+from ProcNaServer.MMCRequestConnection import MMCRequestConnection  # 부모 클래스
+from Common.CommTypeList import (
+    AS_MMC_REQUEST_T, AS_MMC_GEN_RESULT_T, AS_MMC_LOG_T,
+    AS_LOG_STATUS_T, AS_ASCII_ERROR_MSG_T, AS_ASCII_ACK_T,
+)
+from Common.CommType import (
+    ASCII_MMC_GENERATOR, ASCII_MMC_SCHEDULER, ASCII_JOB_MONITOR,
+    NOT_ASSIGN, START,
+    PROC_INIT_END,
+    AS_MMC_REQ, AS_LOG_INFO, ASCII_ERROR_MSG,
+    MMC_GEN_REQ, MMC_GEN_RES, MMC_LOG,
+    CMD_SCHEDULER_RULE_DOWN_ACK, CMD_COMMAND_RULE_DOWN_ACK,
+    LOG_DEL, ORDER_KILL,
+)
+from Common.AsUtil import AsUtil
+
+if TYPE_CHECKING:
+    from ProcNaServer.MMCGeneratorConnMgr import MMCGeneratorConnMgr
+
+logger = logging.getLogger(__name__)
+
+
+class MMCGenConnection(MMCRequestConnection):
     """
-    Handles connections for MMC related processes:
-    - ASCII_MMC_GENERATOR
-    - ASCII_MMC_SCHEDULER
-    - ASCII_JOB_MONITOR
+    C++ MMCGenConnection (MMCRequestConnection 상속) 대응.
+
+    AsSocket 가상 메서드 오버라이드:
+      receive_packet()              ← C++ ReceivePacket()
+      close_socket()                ← C++ CloseSocket()
+      session_identify_callback()   ← C++ SessionIdentify()
+      alive_check_fail()            ← C++ AliveCheckFail()
+      ReceiveTimeOut()              ← C++ ReceiveTimeOut()
     """
-    def __init__(self, conn_mgr):
-        """
-        C++: MMCGenConnection(MMCGeneratorConnMgr* ConMgr)
-        """
+
+    def __init__(self, conn_mgr: "MMCGeneratorConnMgr") -> None:
         super().__init__()
-        self.m_MMCGeneratorConnMgr = conn_mgr
-        self.m_MMCProcStatus = True
-        self.m_MMCRequestQueue = None # Populated in SessionIdentify
+        self._mmc_gen_conn_mgr: "MMCGeneratorConnMgr" = conn_mgr
+        self._mmc_proc_status: bool = True          # C++: m_MMCProcStatus
 
-    def __del__(self):
-        """
-        C++: ~MMCGenConnection()
-        """
-        if self.get_session_type() != NOT_ASSIGN:
-            # Note: set_mmc_generator_session checks if conn_mgr exists
-            if self.m_MMCGeneratorConnMgr:
-                self.m_MMCGeneratorConnMgr.set_mmc_generator_session(self.get_session_type(), None)
-        super().__del__()
+    def __del__(self) -> None:
+        # 세션 식별이 완료된 경우 세션 포인터 해제
+        if self.GetSessionType() != NOT_ASSIGN:
+            self._mmc_gen_conn_mgr.SetMMCGeneratorSession(
+                self.GetSessionType(), None)
 
-    def receive_packet(self, packet, session_identify):
-        """
-        C++: void ReceivePacket(PACKET_T* Packet, const int SessionIdentify)
-        """
+    # =========================================================================
+    # AsSocket 가상 메서드 오버라이드
+    # =========================================================================
+
+    def receive_packet(self, packet, session_identify: int = -1) -> None:
+        """C++: virtual ReceivePacket(PACKET_T*, const int SessionIdentify)"""
         if session_identify == ASCII_MMC_SCHEDULER:
-            self.mmc_sch_proc_req(packet)
-            
+            self._mmc_sch_proc_req(packet)
         elif session_identify == ASCII_MMC_GENERATOR:
-            self.mmc_gen_proc_req(packet)
-            
+            self._mmc_gen_proc_req(packet)
         elif session_identify == ASCII_JOB_MONITOR:
-            self.job_monitor_req(packet)
-            
+            self._job_monitor_req(packet)
         else:
-            print(f"[MMCGenConnection] UnKnown Session : {session_identify}")
+            logger.debug("UnKnown Session : %d", session_identify)
 
-    def session_identify(self, session_type, session_name):
-        """
-        C++: void SessionIdentify(int SessionType, string SessionName)
-        """
-        print(f"[MMCGenConnection] Session Identify : Type({AsUtil.get_process_type_string(session_type)}), SessionName({session_name})")
+    def session_identify_callback(self, session_type: int,
+                                   session_name: str = "") -> None:
+        """C++: virtual SessionIdentify(int SessionType, string SessionName)"""
+        from ProcNaServer.AsciiServerWorld import MAINPTR, AsciiServerWorld
 
-        if not self.m_MMCGeneratorConnMgr.add_session_name(session_name):
-            self.close()
-            self.m_MMCGeneratorConnMgr.remove(self)
+        logger.debug("Session Identify : Type(%s), SessionName(%s)",
+                     AsUtil.GetProcessTypeString(session_type), session_name)
+
+        # 중복 세션명 검사 (ConnectionMgr.add_session_name)
+        if not self._mmc_gen_conn_mgr.add_session_name(session_name):
+            self._close()
+            self._mmc_gen_conn_mgr.remove(self)     # ConnectionMgr.remove()
             return
 
-        self.m_MMCGeneratorConnMgr.set_mmc_generator_session(session_type, self)
+        self._mmc_gen_conn_mgr.SetMMCGeneratorSession(session_type, self)
 
-        if session_type == ASCII_JOB_MONITOR or session_type == ASCII_MMC_SCHEDULER:
-            from AsciiServerWorld import AsciiServerWorld
-            # Register to World and get the Queue reference
-            self.m_MMCRequestQueue = AsciiServerWorld._instance.register_mmc_req_conn(self, 100000)
+        # Scheduler / JobMonitor → MMCRequestQueue 등록
+        if session_type in (ASCII_JOB_MONITOR, ASCII_MMC_SCHEDULER):
+            self._mmc_request_queue = \
+                AsciiServerWorld.m_WorldPtr.RegisterMMCReqConn(self, 100000)
 
-        self.m_MMCGeneratorConnMgr.send_process_info(session_name, session_type, START)
-        
-        # Start Alive Check
-        from AsciiServerWorld import AsciiServerWorld
-        world = AsciiServerWorld._instance
-        self.start_alive_check(world.get_proc_alive_check_time(), world.get_alive_check_limit_cnt())
+        self._mmc_gen_conn_mgr.SendProcessInfo(
+            session_name, session_type, START)
 
-    def close_socket(self, errno_val=0):
-        """
-        C++: void CloseSocket(int Errno)
-        """
-        print(f"[MMCGenConnection] Socket Broken : {self.get_session_name()}")
+        # AliveCheck 시작 (AsSocket.StartAliveCheck)
+        self.StartAliveCheck(
+            MAINPTR().GetProcAliveCheckTime(),      # AsWorld
+            MAINPTR().GetAliveCheckLimitCnt(),      # AsWorld
+        )
 
-        # Create Log Status for disconnection
-        log_status = AsLogStatusT()
-        log_status.name = self.get_session_name()
+    def close_socket(self, errno_val: int) -> None:
+        """C++: virtual CloseSocket(int Errno)"""
+        session_name = self.GetSessionName()
+        logger.debug("Socket Broken : %s", session_name)
+
+        # 로그 상태 DEL 처리
+        log_status = AS_LOG_STATUS_T()
+        log_status.name   = session_name
         log_status.status = LOG_DEL
-        log_status.logs = f"sUn,{AsUtil.get_process_type_string(self.get_session_type())},{self.get_session_name()},"
+        log_status.logs   = (
+            f"sUn,{AsUtil.GetProcessTypeString(self.GetSessionType())},"
+            f"{session_name},"
+        )
+        self._mmc_gen_conn_mgr.UpdateMMCProcessLogStatus(log_status)
 
-        self.m_MMCGeneratorConnMgr.update_mmc_process_log_status(log_status)
-
-        if self.m_MMCProcStatus:
-            self.m_MMCGeneratorConnMgr.child_process_dead(self)
+        # ProcConnectionMgr.child_process_dead() 호출
+        if self._mmc_proc_status:
+            self._mmc_gen_conn_mgr.child_process_dead(self)
         else:
-            self.m_MMCGeneratorConnMgr.child_process_dead(self, ORDER_KILL)
+            self._mmc_gen_conn_mgr.child_process_dead(self, ORDER_KILL)
 
-    def receive_time_out(self, reason, extra_reason=None):
-        """
-        C++: void ReceiveTimeOut(int Reason, void* ExtraReason)
-        """
-        print(f"[MMCGenConnection] Unknown Time Out Reason : {reason}")
+    def alive_check_fail(self, fail_count: int) -> None:
+        """C++: virtual AliveCheckFail(int FailCount)"""
+        from ProcNaServer.AsciiServerWorld import MAINPTR
 
-    def alive_check_fail(self, fail_count):
-        """
-        C++: void AliveCheckFail(int FailCount)
-        """
-        print(f"[MMCGenConnection] AliveCheckFail({self.get_session_name()}) , Count : {fail_count}")
-        
-        from AsciiServerWorld import AsciiServerWorld
-        msg = f"The Process is killed on purpose for no reply from {self.get_session_name()}."
-        AsciiServerWorld._instance.send_ascii_error(1, msg)
-        
-        self.m_MMCGeneratorConnMgr.various_ack_check_time_out(self)
+        logger.debug("AliveCheckFail(%s) , Count : %d",
+                     self.GetSessionName(), fail_count)
+        MAINPTR().SendAsciiError(
+            1,
+            "The Process is killed on purpose for no reply from %s.",
+            self.GetSessionName(),
+        )
+        # ProcConnectionMgr.various_ack_check_time_out()
+        self._mmc_gen_conn_mgr.various_ack_check_time_out(self)
 
-    # -----------------------------------------------------------
-    # Request Handlers by Session Type
-    # -----------------------------------------------------------
+    def ReceiveTimeOut(self, reason: int, extra_reason=None) -> None:
+        """C++: ReceiveTimeOut(int Reason, void* ExtraReason)"""
+        logger.error("Unknown Time Out Reason : %d", reason)
 
-    def mmc_sch_proc_req(self, packet):
-        """
-        C++: void MMCSchProcReq(PACKET_T* Packet)
-        """
-        msg_id = packet.msg_id
-        
+    # =========================================================================
+    # 패킷 처리 내부 메서드
+    # =========================================================================
+
+    def _mmc_sch_proc_req(self, packet) -> None:
+        """C++: MMCSchProcReq(PACKET_T*) — Scheduler 패킷 처리."""
+        from ProcNaServer.AsciiServerWorld import MAINPTR, AsciiServerWorld
+
+        msg_id = packet.MsgId
+
         if msg_id == PROC_INIT_END:
-            pass # No action in C++
+            pass                                    # C++ 원본 동일하게 처리 없음
 
         elif msg_id == AS_MMC_REQ:
-            req = AsMmcRequestT.unpack(packet.msg_body)
-            if req: self.receive_mmc_req_from_sch(req)
+            self.ReceiveMMCReqFromSch(packet.Msg)
 
         elif msg_id == AS_LOG_INFO:
-            status = AsLogStatusT.unpack(packet.msg_body)
-            if status: self.receive_log_info(status)
+            self.ReceiveLogInfo(packet.Msg)
 
         elif msg_id == ASCII_ERROR_MSG:
-            error = AsAsciiErrorMsgT.unpack(packet.msg_body)
-            if error:
-                error.ProcessId = self.get_session_name()
-                from AsciiServerWorld import AsciiServerWorld
-                # Assuming send_ascii_error handles the object logging
-                AsciiServerWorld._instance.write_error_log(error) 
+            err: AS_ASCII_ERROR_MSG_T = packet.Msg
+            err.ProcessId = self.GetSessionName()
+            MAINPTR().SendAsciiError(err)
 
         elif msg_id == CMD_SCHEDULER_RULE_DOWN_ACK:
-            ack = AsAsciiAckT.unpack(packet.msg_body)
-            if ack:
-                from AsciiServerWorld import AsciiServerWorld
-                # World needs to have this method or delegate to GuiConnMgr
-                if hasattr(AsciiServerWorld._instance.m_GuiConnMgr, 'recv_scheduler_rule_down_result'):
-                    AsciiServerWorld._instance.m_GuiConnMgr.recv_scheduler_rule_down_result(ack)
+            AsciiServerWorld.m_WorldPtr.RecvSchedulerRuleDownResult(packet.Msg)
 
         else:
-            print(f"[MMCGenConnection] Unknown Msg Id : {msg_id}")
+            logger.error("Unknown Msg Id : %d", msg_id)
 
-    def mmc_gen_proc_req(self, packet):
-        """
-        C++: void MMCGenProcReq(PACKET_T* Packet)
-        """
-        msg_id = packet.msg_id
-        from AsciiServerWorld import AsciiServerWorld
-        world = AsciiServerWorld._instance
+    def _mmc_gen_proc_req(self, packet) -> None:
+        """C++: MMCGenProcReq(PACKET_T*) — Generator 패킷 처리."""
+        from ProcNaServer.AsciiServerWorld import MAINPTR, AsciiServerWorld
+
+        msg_id = packet.MsgId
 
         if msg_id == PROC_INIT_END:
-            world.notify_event(ASCII_MMC_GENERATOR, msg_id)
+            MAINPTR().NotifyEvent(ASCII_MMC_GENERATOR, msg_id)
 
         elif msg_id == MMC_GEN_RES:
-            res = AsMmcGenResultT.unpack(packet.msg_body)
-            if res: self.mmc_res_from_mmc_gen(res)
+            self.MMCResFromMMCGen(packet.Msg)
 
         elif msg_id == AS_LOG_INFO:
-            status = AsLogStatusT.unpack(packet.msg_body)
-            if status: self.receive_log_info(status)
+            self.ReceiveLogInfo(packet.Msg)
 
         elif msg_id == ASCII_ERROR_MSG:
-            error = AsAsciiErrorMsgT.unpack(packet.msg_body)
-            if error:
-                error.ProcessId = self.get_session_name()
-                world.write_error_log(error)
+            err: AS_ASCII_ERROR_MSG_T = packet.Msg
+            err.ProcessId = self.GetSessionName()
+            MAINPTR().SendAsciiError(err)
 
         elif msg_id == CMD_COMMAND_RULE_DOWN_ACK:
-            ack = AsAsciiAckT.unpack(packet.msg_body)
-            if ack:
-                if hasattr(world.m_GuiConnMgr, 'recv_command_rule_down_result'):
-                    world.m_GuiConnMgr.recv_command_rule_down_result(ack)
+            AsciiServerWorld.m_WorldPtr.RecvCommandRuleDownResult(packet.Msg)
 
         else:
-            print(f"[MMCGenConnection] Unknown Msg Id : {msg_id}")
+            logger.error("Unknown Msg Id : %d", msg_id)
 
-    def job_monitor_req(self, packet):
-        """
-        C++: void JobMonitorReq(PACKET_T* Packet)
-        """
-        msg_id = packet.msg_id
+    def _job_monitor_req(self, packet) -> None:
+        """C++: JobMonitorReq(PACKET_T*) — JobMonitor 패킷 처리."""
+        from ProcNaServer.AsciiServerWorld import MAINPTR
+
+        msg_id = packet.MsgId
 
         if msg_id == PROC_INIT_END:
             pass
 
         elif msg_id == AS_MMC_REQ:
-            req = AsMmcRequestT.unpack(packet.msg_body)
-            if req: self.receive_mmc_req_from_job(req)
+            self.ReceiveMMCReqFromJob(packet.Msg)
 
         elif msg_id == AS_LOG_INFO:
-            status = AsLogStatusT.unpack(packet.msg_body)
-            if status: self.receive_log_info(status)
+            self.ReceiveLogInfo(packet.Msg)
 
         elif msg_id == ASCII_ERROR_MSG:
-            error = AsAsciiErrorMsgT.unpack(packet.msg_body)
-            if error:
-                error.ProcessId = self.get_session_name()
-                from AsciiServerWorld import AsciiServerWorld
-                AsciiServerWorld._instance.write_error_log(error)
+            err: AS_ASCII_ERROR_MSG_T = packet.Msg
+            err.ProcessId = self.GetSessionName()
+            MAINPTR().SendAsciiError(err)
 
         else:
-            print(f"[MMCGenConnection] Unknown Msg Id : {msg_id}")
+            logger.error("Unknown Msg Id : %d", msg_id)
 
-    # -----------------------------------------------------------
-    # Logic Methods
-    # -----------------------------------------------------------
+    # =========================================================================
+    # MMC 요청 처리 (Scheduler / JobMonitor)
+    # =========================================================================
 
-    def receive_mmc_req_from_sch(self, mmc_req):
-        """
-        C++: void ReceiveMMCReqFromSch(AS_MMC_REQUEST_T* MMCReq)
-        """
+    def ReceiveMMCReqFromSch(self, mmc_req: AS_MMC_REQUEST_T) -> None:
+        """C++: ReceiveMMCReqFromSch(AS_MMC_REQUEST_T*) — Scheduler MMC 요청."""
         mmc_req.priority = 2
-        mmc_req.logMode = 0
-        # Debug Log
-        # print(f"Receive MMCReq From MMCSch : ne({mmc_req.ne}), mmc({mmc_req.mmc}), type({mmc_req.type}), referenceId({mmc_req.referenceId})")
-        
-        if self.m_MMCRequestQueue:
-            self.m_MMCRequestQueue.insert_mmc_request(mmc_req)
+        mmc_req.logMode  = 0
+        logger.debug(
+            "Receive MMCReq From MMCSch : ne(%s), mmc(%s), type(%s), referenceId(%d)",
+            mmc_req.ne, mmc_req.mmc,
+            AsUtil.GetEnumTypeString(mmc_req.type),
+            mmc_req.referenceId,
+        )
+        # MMCRequestConnection._mmc_request_queue
+        self._mmc_request_queue.InsertMMCRequest(mmc_req)
 
-    def receive_mmc_req_from_job(self, mmc_req):
-        """
-        C++: void ReceiveMMCReqFromJob(AS_MMC_REQUEST_T* MMCReq)
-        """
-        # Debug Log
-        # print(f"Receive MMCReq From JobMonitor : ne({mmc_req.ne}), mmc({mmc_req.mmc})")
-        
-        if self.m_MMCRequestQueue:
-            self.m_MMCRequestQueue.insert_mmc_request(mmc_req)
+    def ReceiveMMCReqFromJob(self, mmc_req: AS_MMC_REQUEST_T) -> None:
+        """C++: ReceiveMMCReqFromJob(AS_MMC_REQUEST_T*) — JobMonitor MMC 요청."""
+        logger.debug("Receive MMCReq From JobMonitor : ne(%s), mmc(%s)",
+                     mmc_req.ne, mmc_req.mmc)
+        self._mmc_request_queue.InsertMMCRequest(mmc_req)
 
-    def send_mmc_req_to_mmc_gen(self, mmc_req):
-        """
-        C++: bool SendMMCReqToMMCGen(AS_MMC_REQUEST_T* MMCReq)
-        """
-        # Debug Log
-        # print(f"Send MMCReq to MMCGen : ne({mmc_req.ne}), mmc({mmc_req.mmc})")
-        body = mmc_req.pack()
-        return self.packet_send(PacketT(MMC_GEN_REQ, len(body), body))
+    # =========================================================================
+    # Generator 전달
+    # =========================================================================
 
-    def mmc_res_from_mmc_gen(self, result):
-        """
-        C++: void MMCResFromMMCGen(AS_MMC_GEN_RESULT_T* Result)
-        """
-        # Debug Log
-        # print(f"Recv Command Gen Size : {result.commandNo}")
-        from AsciiServerWorld import AsciiServerWorld
-        # Note: In C++, MAINPTR->MMCResFromMMCGen(Result) is called.
-        # Ensure AsciiServerWorld has this method.
-        AsciiServerWorld._instance.mmc_res_from_mmc_gen(result)
+    async def SendMMCReqToMMCGen(self, mmc_req: AS_MMC_REQUEST_T) -> bool:
+        """C++: SendMMCReqToMMCGen(AS_MMC_REQUEST_T*) → MMC_GEN_REQ 전송."""
+        logger.debug("Send MMCReq to MMCGen : ne(%s), mmc(%s)",
+                     mmc_req.ne, mmc_req.mmc)
+        payload = _pack(mmc_req)
+        return await self.SendPacket(MMC_GEN_REQ, payload, len(payload))
 
-    def receive_log_info(self, status):
-        """
-        C++: void ReceiveLogInfo(AS_LOG_STATUS_T* Status)
-        """
-        self.m_MMCGeneratorConnMgr.update_mmc_process_log_status(status)
+    def MMCResFromMMCGen(self, result: AS_MMC_GEN_RESULT_T) -> None:
+        """C++: MMCResFromMMCGen(AS_MMC_GEN_RESULT_T*)"""
+        from ProcNaServer.AsciiServerWorld import MAINPTR
 
-    def send_flow_control(self, msg_id):
-        """
-        C++: bool SendFlowControl(int MsgId)
-        """
-        print("[MMCGenConnection] virtual Call MMCGenConnection SendFlowControl")
+        logger.debug("Recv Command Gen Size : %d", result.commandNo)
+        MAINPTR().MMCResFromMMCGen(result)
+
+    # =========================================================================
+    # Log / FlowControl
+    # =========================================================================
+
+    def ReceiveLogInfo(self, status: AS_LOG_STATUS_T) -> None:
+        """C++: ReceiveLogInfo(AS_LOG_STATUS_T*)"""
+        self._mmc_gen_conn_mgr.UpdateMMCProcessLogStatus(status)
+
+    async def SendMMCLog(self, mmc_log: AS_MMC_LOG_T) -> bool:
+        """C++: SendMMCLog(AS_MMC_LOG_T*) → MMC_LOG 패킷 전송."""
+        payload = _pack(mmc_log)
+        return await self.SendPacket(MMC_LOG, payload, len(payload))
+
+    async def SendFlowControl(self, msg_id: int = -1) -> bool:
+        """C++: virtual SendFlowControl(int MsgId=-1) — 가상함수, 로그만."""
+        logger.error("virtual Call MMCGenConnection SendFlowControl")
         return True
 
-    def send_mmc_log(self, mmc_log):
-        """
-        C++: bool SendMMCLog(AS_MMC_LOG_T* MMCLog)
-        """
-        body = mmc_log.pack()
-        return self.packet_send(PacketT(MMC_LOG, len(body), body))
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 패킷 직렬화 헬퍼
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _pack(obj) -> bytes:
+    if hasattr(obj, 'pack'):
+        return obj.pack()
+    return b''
