@@ -1,216 +1,415 @@
-import sys
-import os
+"""
+ParserConnMgr.py / ParserConnection.py
+C++ ParserConnMgr.h/.C + ParserConnection.h/.C → Python 변환
+
+Parser 프로세스 연결 관리자 + 개별 소켓 연결 처리.
+  - ConnectorConnMgr/Connection과 대칭적 구조
+  - 세션 식별 시 PARSER_LISTEN 포트 정보 전달
+  - 룰 다운 명령 브로드캐스트
+  - DataHandlerInfo 브로드캐스트
+"""
+
+import asyncio
+import logging
 import threading
+from typing import Optional, TYPE_CHECKING
 
-# -------------------------------------------------------
-# Project Path Setup
-# -------------------------------------------------------
-current_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.abspath(os.path.join(current_dir, '../..'))
-if project_root not in sys.path:
-    sys.path.append(project_root)
+from Common.ProcConnectionMgr import ProcConnectionMgr  # process_dead (치트시트)
+from Common.AsSocket import AsSocket                    # 가상함수 오버라이드 (치트시트)
+from Common.AsUtil import AsUtil
+from Common.CommTypeList import (
+    AS_CMD_OPEN_PORT_T, AS_MMC_PUBLISH_T, AS_MMC_RESULT_T,
+    AS_ASCII_ACK_T, AS_LOG_STATUS_T, AS_ASCII_ERROR_MSG_T,
+    AS_DATA_HANDLER_INFO_T, AS_RULE_CHANGE_INFO_T, AS_PROCESS_STATUS_T,
+)
+from Common.CommType import (
+    ASCII_PARSER,
+    START, STOP, ORDER_KILL, LOG_DEL,
+    CMD_OPEN_PORT, CMD_OPEN_PORT_ACK,
+    CMD_PARSING_RULE_DOWN, CMD_MAPPING_RULE_DOWN,
+    CMD_PARSING_RULE_CHANGE,
+    AS_LOG_INFO, ASCII_ERROR_MSG,
+    PROC_INIT_END, MMC_RESPONSE_DATA,
+    MMC_RESPONSE_DATA_REQ, AS_DATA_HANDLER_INFO,
+    PARSER_LISTEN,
+)
 
-# Try importing parent class based on availability
-from Class.Common.SockMgrConnMgr import SockMgrConnMgr
-from Class.ProcNaManager.ParserConnection import ParserConnection
-from Class.Common.CommType import *
-from Class.Common.AsUtil import AsUtil
+logger = logging.getLogger(__name__)
 
-class ParserConnMgr(SockMgrConnMgr):
+
+# =============================================================================
+# ParserConnMgr
+# =============================================================================
+
+class ParserConnMgr(ProcConnectionMgr):
     """
-    Manages connections to Parser processes.
-    Handles broadcasting rules, syncing DataHandler info, and routing commands.
+    C++ ParserConnMgr (ProcConnectionMgr 상속) 대응.
+    ConnectorConnMgr과 대칭적 구조.
     """
-    def __init__(self):
-        """
-        C++: ParserConnMgr::ParserConnMgr()
-        """
+
+    def __init__(self) -> None:
         super().__init__()
-        self.m_SocketRemoveLock = threading.Lock()
+        self._remove_lock = threading.Lock()        # C++: pthread_mutex_t
 
-    def __del__(self):
-        """
-        C++: ParserConnMgr::~ParserConnMgr()
-        """
-        super().__del__()
+    # =========================================================================
+    # ConnectionMgr 뮤텍스 오버라이드
+    # =========================================================================
 
-    def accept_socket(self):
-        """
-        C++: void AcceptSocket()
-        """
-        parser_conn = ParserConnection(self)
+    def _socket_remove_lock(self) -> None:
+        self._remove_lock.acquire()
 
-        if not self.accept(parser_conn):
-            print(f"[ParserConnMgr] Parser Socket Accept Error : {self.get_obj_err_msg()}")
-            parser_conn.close()
-            return
+    def _socket_remove_unlock(self) -> None:
+        self._remove_lock.release()
 
-        self.add(parser_conn)
+    # =========================================================================
+    # ProcConnectionMgr 추상 메서드 구현
+    # =========================================================================
 
-    def send_router_conn_info(self, router_name):
-        """
-        C++: void SendRouterConnInfo(string RouterName)
-        (C++ source has this commented out, implemented here for reference)
-        """
-        # print(f"[ParserConnMgr] SendRouterConnInfo : {router_name}")
-        # from AsciiManagerWorld import AsciiManagerWorld
-        # world = AsciiManagerWorld._instance
-        # socket_path = world.get_router_listen_socket_path("Router")
-        
-        # open_port = AsCmdOpenPortT()
-        # open_port.ProtocolType = ROUTER_CONNECT
-        # open_port.PortPath = socket_path
-        
-        # self.send_all_cmd_open_port_info(open_port)
-        pass
+    def process_dead(self, name: str, pid: int, status: int = -1) -> None:
+        """C++: ProcessDead(string Name, int Pid, int Status)"""
+        from ProcNaManager.AsciiManagerWorld import MAINPTR
 
-    def parser_start(self, conn):
-        """
-        C++: void ParserStart(ParserConnection* Conn)
-        Called when Parser finishes initialization.
-        Syncs DataHandler info to the new Parser.
-        """
-        from AsciiManagerWorld import AsciiManagerWorld
-        world = AsciiManagerWorld._instance
-
-        # 1. Update Process Status in World
-        if world.set_parser_proc_status(conn.get_session_name()):
-            # 2. Send all DataHandler Info to the Parser
-            info_map = world.get_data_handler_info_map()
-            
-            for info in info_map.values():
-                body = info.pack()
-                # C++: if(!Conn->SendPacket(...)) return;
-                if not conn.packet_send(PacketT(AS_DATA_HANDLER_INFO, len(body), body)):
-                    return
-
-    def send_data_handler_info(self, info):
-        """
-        C++: void SendDataHandlerInfo(AS_DATA_HANDLER_INFO_T* Info)
-        Broadcasts DataHandler info update to ALL Parsers.
-        """
-        body = info.pack()
-        
-        # Iterate all connections and send
-        for conn in self.m_SocketConnectionList:
-            conn.packet_send(PacketT(AS_DATA_HANDLER_INFO, len(body), body))
-
-    def process_dead(self, name, pid, status):
-        """
-        C++: void ProcessDead(string Name, int Pid, int Status)
-        """
-        self.send_process_info(name, STOP)
-
-        from AsciiManagerWorld import AsciiManagerWorld
-        world = AsciiManagerWorld._instance
+        self.SendProcessInfo(name, STOP)
 
         if status == ORDER_KILL:
-            world.remove_pid(pid)
-            world.send_ascii_error(1, f"{name} is killed normally.")
+            MAINPTR().RemovePid(pid)
+            MAINPTR().SendAsciiError(1, "%s is killed normally.", name)
         else:
-            world.process_dead(ASCII_PARSER, name, pid)
+            MAINPTR().ProcessDead(ASCII_PARSER, name, pid)
 
-    def send_response_command(self, session_name, mmc_com):
+    # =========================================================================
+    # AcceptSocket
+    # =========================================================================
+
+    def AcceptSocket(self) -> None:
+        """C++: AcceptSocket()"""
+        conn = ParserConnection(self)
+        if not self.Accept(conn):
+            logger.debug("Parser Socket Accept Error : %s",
+                         self.GetObjErrMsg())
+            return
+        self.add(conn)                              # ConnectionMgr.add()
+
+    # =========================================================================
+    # ParserStart
+    # =========================================================================
+
+    def ParserStart(self, conn: "ParserConnection") -> None:
         """
-        C++: bool SendResponseCommand(const char* SessionName, AS_MMC_PUBLISH_T* MMCCom)
-        Routes MMC response to the specific Parser that requested it.
+        C++: ParserStart(ParserConnection* Conn)
+        Parser PROC_INIT_END 수신 후 호출.
+        SetParserProcStatus + DataHandlerInfo 전송.
         """
-        with self.m_SocketRemoveLock:
-            con = self.find_session(session_name)
-            
+        from ProcNaManager.AsciiManagerWorld import MAINPTR
+
+        if MAINPTR().SetParserProcStatus(conn.GetSessionName()):
+            info_map = MAINPTR().GetDataHandlerInfoMap()
+            asyncio.ensure_future(
+                self._send_data_handler_info_to_conn(conn, info_map))
+
+    async def _send_data_handler_info_to_conn(
+            self, conn: "ParserConnection",
+            info_map: dict) -> None:
+        """DataHandlerInfo 목록을 특정 Parser 세션에 전송."""
+        for info in info_map.values():
+            payload = _pack(info)
+            if not await conn.SendPacket(
+                    AS_DATA_HANDLER_INFO, payload, len(payload)):
+                return
+
+    # =========================================================================
+    # SendDataHandlerInfo
+    # =========================================================================
+
+    def SendDataHandlerInfo(self, info: AS_DATA_HANDLER_INFO_T) -> None:
+        """C++: SendDataHandlerInfo(AS_DATA_HANDLER_INFO_T*) — 전체 Parser에 브로드캐스트."""
+        payload = _pack(info)
+        for sock in self._socket_connection_list:
+            asyncio.ensure_future(
+                sock.SendPacket(AS_DATA_HANDLER_INFO, payload, len(payload)))
+
+    # =========================================================================
+    # SendRouterConnInfo (C++ 원본 주석 처리 — no-op)
+    # =========================================================================
+
+    def SendRouterConnInfo(self, router_name: str) -> None:
+        """C++: SendRouterConnInfo(string RouterName) — C++ 원본 전체 주석 처리."""
+        pass
+
+    # =========================================================================
+    # SendResponseCommand
+    # =========================================================================
+
+    def SendResponseCommand(self, session_name: str,
+                             mmc_com: AS_MMC_PUBLISH_T) -> bool:
+        """C++: SendResponseCommand(const char* SessionName, AS_MMC_PUBLISH_T*)"""
+        self._socket_remove_lock()
+        try:
+            con: Optional[ParserConnection] = self.find_session(session_name)
             if con is None:
-                # print(f"[ParserConnMgr] Can't Find Parser : {session_name}")
+                logger.debug("Can't Find Parser : %s", session_name)
                 return False
-            
-            # C++: con->SendResponseCommand(MMCCom)
-            con.send_response_command(mmc_com)
+            asyncio.ensure_future(con.SendResponseCommand(mmc_com))
             return True
+        finally:
+            self._socket_remove_unlock()
 
-    def socket_remove_lock(self):
-        """
-        C++: void SocketRemoveLock()
-        """
-        self.m_SocketRemoveLock.acquire()
+    # =========================================================================
+    # StopProcess
+    # =========================================================================
 
-    def socket_remove_unlock(self):
-        """
-        C++: void SocketRemoveUnLock()
-        """
-        self.m_SocketRemoveLock.release()
-
-    def stop_process(self, session_name):
-        """
-        C++: bool StopProcess(string SessionName)
-        """
-        con = self.find_session(session_name)
-        
+    def StopProcess(self, session_name: str) -> bool:
+        """C++: StopProcess(string SessionName)"""
+        con: Optional[ParserConnection] = self.find_session(session_name)
         if con is None:
-            print(f"[ParserConnMgr] Can't Find Parser : {session_name}")
+            logger.debug("Can't Find Parser : %s", session_name)
             return False
+        con.StopProcess()
+        return self.stop_process_by_name(session_name)  # ProcConnectionMgr
 
-        con.stop_process()
-        
-        # Physical kill via ProcConnectionMgr (or World helper)
-        # return ProcConnectionMgr.stop_process(session_name)
-        return True
+    # =========================================================================
+    # SendProcessInfo
+    # =========================================================================
 
-    def send_process_info(self, session_name, status):
-        """
-        C++: void SendProcessInfo(const char* SessionName, int Status)
-        """
-        proc_info = AsProcessStatusT()
-        proc_info.ProcessId = session_name
-        proc_info.Status = status
+    def SendProcessInfo(self, session_name: str, status: int) -> None:
+        """C++: SendProcessInfo(const char* SessionName, int Status)"""
+        from ProcNaManager.AsciiManagerWorld import AsciiManagerWorld
+
+        proc_info = AS_PROCESS_STATUS_T()
+        proc_info.ProcessId   = session_name
+        proc_info.Status      = status
         proc_info.ProcessType = ASCII_PARSER
 
-        if proc_info.Status == START:
-            if not self.get_process_info(session_name, proc_info):
+        if status == START:
+            if not self.get_process_info_by_name(session_name, proc_info):
                 return
 
-        from AsciiManagerWorld import AsciiManagerWorld
-        AsciiManagerWorld._instance.send_process_info(proc_info)
+        AsciiManagerWorld.m_WorldPtr.SendProcessInfo(proc_info)
 
-    def send_cmd_rule_down(self):
-        """
-        C++: void SendCmdRuleDown()
-        Broadcasts Rule Down command.
-        """
-        for conn in self.m_SocketConnectionList:
-            conn.send_cmd_rule_down()
+    # =========================================================================
+    # 룰 다운 브로드캐스트
+    # =========================================================================
 
-    def send_cmd_mapping_rule_down(self):
-        """
-        C++: void SendCmdMappingRuleDown()
-        Broadcasts Mapping Rule Down command.
-        """
-        for conn in self.m_SocketConnectionList:
-            conn.send_cmd_mapping_rule_down()
+    def SendCmdRuleDown(self) -> None:
+        """C++: SendCmdRuleDown() — 전체 Parser에 CMD_PARSING_RULE_DOWN 전송."""
+        for sock in self._socket_connection_list:
+            asyncio.ensure_future(
+                sock.SendPacket(CMD_PARSING_RULE_DOWN))
 
-    def parser_rule_change(self, change_info):
-        """
-        C++: void ParserRuleChange(AS_RULE_CHANGE_INFO_T* ChangeInfo)
-        Sends rule change command to a SPECIFIC Parser.
-        """
-        with self.m_SocketRemoveLock:
-            con = self.find_session(change_info.ProcessId)
-            
+    def SendCmdMappingRuleDown(self) -> None:
+        """C++: SendCmdMappingRuleDown() — 전체 Parser에 CMD_MAPPING_RULE_DOWN 전송."""
+        for sock in self._socket_connection_list:
+            asyncio.ensure_future(
+                sock.SendPacket(CMD_MAPPING_RULE_DOWN))
+
+    # =========================================================================
+    # ParserRuleChange
+    # =========================================================================
+
+    def ParserRuleChange(self,
+                          change_info: AS_RULE_CHANGE_INFO_T) -> None:
+        """C++: ParserRuleChange(AS_RULE_CHANGE_INFO_T*)"""
+        self._socket_remove_lock()
+        try:
+            con: Optional[ParserConnection] = self.find_session(
+                change_info.ProcessId)
             if con is None:
-                print(f"[ParserConnMgr] Can't Find Parser : {change_info.ProcessId}")
+                logger.debug("Can't Find Parser : %s", change_info.ProcessId)
                 return
-            
-            con.parser_rule_change(change_info)
+            asyncio.ensure_future(con.ParserRuleChange(change_info))
+        finally:
+            self._socket_remove_unlock()
 
-    # -------------------------------------------------------
-    # Helper Methods
-    # -------------------------------------------------------
-    def find_session(self, session_name):
-        for conn in self.m_SocketConnectionList:
-            if conn.get_session_name() == session_name:
-                return conn
-        return None
 
-    def get_process_info(self, session_name, proc_info):
-        from datetime import datetime
-        proc_info.StartTime = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        proc_info.Pid = 0
-        return True
+# =============================================================================
+# ParserConnection
+# =============================================================================
+
+class ParserConnection(AsSocket):
+    """
+    C++ ParserConnection (AsSocket 상속) 대응.
+
+    AsSocket 가상 메서드 오버라이드:
+      receive_packet()              ← C++ ReceivePacket()
+      close_socket()                ← C++ CloseSocket()
+      session_identify_callback()   ← C++ SessionIdentify()
+      alive_check_fail()            ← C++ AliveCheckFail()
+      ReceiveTimeOut()              ← C++ ReceiveTimeOut()
+
+    ConnectorConnection과의 차이:
+      - 세션 식별 시 PARSER_LISTEN 포트 오픈 정보 전송
+      - PROC_INIT_END → ParserConnMgr.ParserStart()
+      - SendCmdRuleDown / SendCmdMappingRuleDown 개별 전송
+    """
+
+    def __init__(self, conn_mgr: ParserConnMgr) -> None:
+        super().__init__()
+        self._parser_conn_mgr: ParserConnMgr = conn_mgr
+        self._parser_status:   bool          = True    # C++: m_ParserStaus (오타 유지)
+
+    # =========================================================================
+    # AsSocket 가상 메서드 오버라이드
+    # =========================================================================
+
+    def receive_packet(self, packet, session_identify: int = -1) -> None:
+        """C++: virtual ReceivePacket(PACKET_T*, const int SessionIdentify)"""
+        if session_identify == ASCII_PARSER:
+            self._parser_proc_req(packet)
+        else:
+            logger.debug("UnKnown Session : %d", session_identify)
+
+    def session_identify_callback(self, session_type: int,
+                                   session_name: str = "") -> None:
+        """C++: virtual SessionIdentify(int SessionType, string SessionName)"""
+        from ProcNaManager.AsciiManagerWorld import MAINPTR
+
+        if not self._parser_conn_mgr.add_session_name(session_name):  # ConnectionMgr
+            self._close()
+            self._parser_conn_mgr.remove(self)      # ConnectionMgr.remove()
+            return
+
+        logger.debug("SessionType : %s, SessionName : %s",
+                     AsUtil.GetProcessTypeString(session_type), session_name)
+
+        # PARSER_LISTEN 포트 오픈 정보 전송
+        open_port = AS_CMD_OPEN_PORT_T()
+        open_port.ProtocolType = PARSER_LISTEN
+        socket_path = MAINPTR().GetParserListenSocketPath(
+            self.GetSessionName())
+        logger.debug("socketPath : %s", socket_path)
+        open_port.PortPath = socket_path
+        asyncio.ensure_future(self.CmdOpenPortInfo(open_port))
+
+        self._parser_conn_mgr.SendProcessInfo(
+            self.GetSessionName(), START)
+
+        self.StartAliveCheck(                       # AsSocket.StartAliveCheck
+            MAINPTR().GetProcAliveCheckTime(),
+            MAINPTR().GetAliveCheckLimitCnt(),
+        )
+
+    def close_socket(self, errno_val: int) -> None:
+        """C++: virtual CloseSocket(int Errno)"""
+        logger.debug("Socket Broken SessionName : %s", self.GetSessionName())
+        self.SendLogStatus()
+
+        if self._parser_status:
+            self._parser_conn_mgr.child_process_dead(self)          # ProcConnectionMgr
+        else:
+            self._parser_conn_mgr.child_process_dead(self, ORDER_KILL)
+
+    def alive_check_fail(self, fail_count: int) -> None:
+        """C++: virtual AliveCheckFail(int FailCount)"""
+        from ProcNaManager.AsciiManagerWorld import MAINPTR
+
+        logger.debug("AliveCheckFail(%s) , Count : %d",
+                     self.GetSessionName(), fail_count)
+        MAINPTR().SendAsciiError(
+            1, "The Process is killed on purpose for no reply from %s.",
+            self.GetSessionName())
+        self._parser_conn_mgr.various_ack_check_time_out(self)      # ProcConnectionMgr
+
+    def ReceiveTimeOut(self, reason: int, extra_reason=None) -> None:
+        """C++: ReceiveTimeOut(int Reason, void* ExtraReason)"""
+        logger.error("Unknown Time Out Reason : %d", reason)
+
+    # =========================================================================
+    # 패킷 처리
+    # =========================================================================
+
+    def _parser_proc_req(self, packet) -> None:
+        """C++: ParserProcReq(PACKET_T*)"""
+        from ProcNaManager.AsciiManagerWorld import MAINPTR
+
+        msg_id = packet.MsgId
+
+        if msg_id == CMD_OPEN_PORT_ACK:
+            self._cmd_open_port_ack(packet.Msg)
+
+        elif msg_id == MMC_RESPONSE_DATA:
+            self._receive_response_command(packet.Msg)
+
+        elif msg_id == AS_LOG_INFO:
+            MAINPTR().SendLogStatus(packet.Msg)
+
+        elif msg_id == ASCII_ERROR_MSG:
+            MAINPTR().SendAsciiError(packet.Msg)
+
+        elif msg_id == PROC_INIT_END:
+            self._parser_conn_mgr.ParserStart(self)
+
+        else:
+            logger.debug("Unknown Msg Id : %d", msg_id)
+
+    def _cmd_open_port_ack(self, ack: AS_ASCII_ACK_T) -> None:
+        """C++: CmdOpenPortAck(AS_ASCII_ACK_T*)"""
+        if not ack.ResultMode:
+            logger.debug("CmdOpen Error(%s) : %s",
+                         self.GetSessionName(), ack.Result)
+
+    def _receive_response_command(self,
+                                   mmc_result: AS_MMC_RESULT_T) -> None:
+        """C++: ReceiveResponseCommand(AS_MMC_RESULT_T*)"""
+        from ProcNaManager.AsciiManagerWorld import MAINPTR
+
+        logger.debug("Receive MMC Cmd Response : msgid(%d), resultMode(%s)",
+                     mmc_result.id,
+                     AsUtil.GetEnumTypeString(mmc_result.resultMode))
+        MAINPTR().SendCommandResponse(mmc_result)
+
+    # =========================================================================
+    # 전송 메서드
+    # =========================================================================
+
+    async def CmdOpenPortInfo(self,
+                               port_info: AS_CMD_OPEN_PORT_T) -> bool:
+        """C++: CmdOpenPortInfo(AS_CMD_OPEN_PORT_T*) → CMD_OPEN_PORT 전송."""
+        payload = _pack(port_info)
+        await self.SendPacket(CMD_OPEN_PORT, payload, len(payload))
+        return True                                 # C++ 원본: 항상 true
+
+    async def SendResponseCommand(self,
+                                   mmc_com: AS_MMC_PUBLISH_T) -> None:
+        """C++: SendResponseCommand(AS_MMC_PUBLISH_T*) → MMC_RESPONSE_DATA_REQ 전송."""
+        payload = _pack(mmc_com)
+        await self.SendPacket(MMC_RESPONSE_DATA_REQ, payload, len(payload))
+
+    def SendLogStatus(self) -> None:
+        """C++: SendLogStatus() — LOG_DEL 상태 전송."""
+        from ProcNaManager.AsciiManagerWorld import MAINPTR
+
+        log = AS_LOG_STATUS_T()
+        log.name   = self.GetSessionName()
+        log.logs   = (f"{AsUtil.GetProcessTypeString(self.GetSessionType())},"
+                      f"{self.GetSessionName()},")
+        log.status = LOG_DEL
+        MAINPTR().SendLogStatus(log)
+
+    async def SendCmdRuleDown(self) -> None:
+        """C++: SendCmdRuleDown() → CMD_PARSING_RULE_DOWN 전송."""
+        await self.SendPacket(CMD_PARSING_RULE_DOWN)
+
+    async def SendCmdMappingRuleDown(self) -> None:
+        """C++: SendCmdMappingRuleDown() → CMD_MAPPING_RULE_DOWN 전송."""
+        await self.SendPacket(CMD_MAPPING_RULE_DOWN)
+
+    async def ParserRuleChange(self,
+                                change_info: AS_RULE_CHANGE_INFO_T) -> None:
+        """C++: ParserRuleChange(AS_RULE_CHANGE_INFO_T*) → CMD_PARSING_RULE_CHANGE 전송."""
+        payload = _pack(change_info)
+        await self.SendPacket(
+            CMD_PARSING_RULE_CHANGE, payload, len(payload))
+
+    def StopProcess(self) -> None:
+        """C++: StopProcess() — 정상 종료 플래그 설정."""
+        self._parser_status = False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 패킷 직렬화 헬퍼
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _pack(obj) -> bytes:
+    if hasattr(obj, 'pack'):
+        return obj.pack()
+    return b''

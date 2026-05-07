@@ -1,694 +1,912 @@
-import sys
+"""
+AsciiManagerWorld.py
+C++ AsciiManagerWorld.h/.C → Python 변환
+
+ProcNaManager 최상위 애플리케이션 클래스.
+  - procNaServer TCP 접속
+  - Parser/Connector/Router/DataRouter/LogRouter Unix Domain 소켓 리스닝
+  - MMC 발행 스레드 (MMCPublishManager)
+  - Connector/Parser 프로세스 기동/관리
+  - 룰 복사 (ParsingRuleCopy / MappingRuleCopy)
+"""
+
+import asyncio
+import logging
 import os
+import subprocess
+import sys
 import threading
-import time
-import copy
-import signal
+from typing import Optional, ClassVar, Dict, List
+from datetime import datetime
 
-# -------------------------------------------------------
-# Project Path Setup
-# -------------------------------------------------------
-current_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.abspath(os.path.join(current_dir, '..'))
-if project_root not in sys.path:
-    sys.path.append(project_root)
+import paramiko                                         # C++: frSshUtil (치트시트)
 
-# -------------------------------------------------------
-# Imports
-# -------------------------------------------------------
-from Class.Common.AsWorld import AsWorld
-from Class.Util.fr_arg_parser import FrArgParser
-from Class.Event.FrLogger import FrLogger
-from Class.Common.AsUtil import AsUtil
-from Class.Common.CommType import *
-from Class.Common.ProcConnectionMgr import ProcConnectionMgr
-from Class.Common.ChildProcessManager import ChildProcessManager
-from Class.Util.fr_ssh_util import FrSshUtil
+from Common.AsWorld import AsWorld
+from Common.AsUtil import AsUtil
+from Common.ChildProcessManager import ChildProcessManager
+from Common.CommTypeList import (
+    AS_MMC_PUBLISH_T, AS_MMC_RESULT_T, AS_PROC_CONTROL_T,
+    AS_SESSION_CONTROL_T, AS_PROCESS_STATUS_T, AS_PORT_STATUS_INFO_T,
+    AS_LOG_STATUS_T, AS_CMD_LOG_CONTROL_T, AS_RULE_CHANGE_INFO_T,
+    AS_CMD_OPEN_PORT_T, AS_DATA_HANDLER_INFO_T, AS_DATA_ROUTING_INIT_T,
+    AS_ASCII_ERROR_MSG_T, AS_ROUTER_PORT_INFO_T,
+)
+from Common.CommType import (
+    ASCII_MANAGER, ASCII_CONNECTOR, ASCII_PARSER,
+    ASCII_ROUTER, ASCII_LOG_ROUTER, ASCII_DATA_ROUTER,
+    START, STOP, UPDATE_DATA, DELETE_DATA,
+    RESPONSE, R_ERROR,
+    ARG_NAME, ARG_SVR_IP, ARG_SVR_PORT, ARG_PORT_NO,
+    ARG_LOG_CYCLE, ARG_LOG_HOUR,
+    MANAGER_INIT_END, ROUTER_PORT_INFO, AS_SYSTEM_INFO,
+    PARSER_CONNECT,
+)
+from Common.ProcConnectionMgr import ProcConnectionMgr
+from Util.fr_arg_parser import ArgParser
 
-# Manager Imports (Lazy Import pattern for circular dependency safety)
-try:
-    from Class.ProcNaManager.DataRouterConnMgr import DataRouterConnMgr
-    from Class.ProcNaManager.ParserConnMgr import ParserConnMgr
-    from Class.ProcNaManager.ConnectorConnMgr import ConnectorConnMgr
-    from Class.ProcNaManager.RouterConnMgr import RouterConnMgr
-    from Class.ProcNaManager.LogRouterConnMgr import LogRouterConnMgr
-    from Class.ProcNaManager.ServerConnection import ServerConnection
-    from Class.ProcNaManager.AsciiManagerType import MmcPublishSetQueue, MmcPublishSet
-except ImportError:
-    pass
+from ProcNaManager.AsciiManagerType import (
+    MmcPublishSet, MmcPublishSetQueue, MmcPublishSetQueueList,
+)
 
+logger = logging.getLogger(__name__)
+
+# ── Unix 소켓 경로 상수 (C++ #define) ────────────────────────────────────────
+MGR_UNIX_PARSER         = "MGR_PARSER_LISTEN"
+MGR_UNIX_CONNECTOR      = "MGR_CONNECTOR_LISTEN"
+MGR_UNIX_ROUTER         = "MGR_ROUTER_LISTEN"
+MGR_UNIX_LOG_ROUTER     = "MGR_LOG_ROUTER_LISTEN"
+MGR_UNIX_DATAROUTER     = "MGR_DATAROUTER_LISTEN"
+UNIX_PARSER_LISTEN_PREFIX   = "/PARSER_LISTEN_"
+UNIX_ROUTER_LISTEN_PREFIX   = "/ROUTER_LISTEN_"
+UNIX_DATAROUTER_LISTEN_PREFIX = "/DATAROUTER_LISTEN_"
+
+# ── 인자 상수 ─────────────────────────────────────────────────────────────────
+ARG_MANAGER_SOCKET_PATH = "-mgrsocketpath"
+ARG_RULEID              = "-ruleid"
+ARG_DELAY_TIME          = "-delaytime"
+ARG_CMD_IDENT_TYPE      = "-cmdidenttype"
+ARG_CMD_RESPONSE_TYPE   = "-cmdresponsetype"
+
+MAX_ERR_MSG_BUF = 4096
+
+
+def MAINPTR() -> "AsciiManagerWorld":
+    return AsciiManagerWorld.m_WorldPtr
+
+
+# =============================================================================
 class AsciiManagerWorld(AsWorld):
     """
-    AsciiManager의 메인 월드 클래스.
-    서버 연결, 하위 프로세스 관리, MMC 라우팅 등을 수행합니다.
+    C++ AsciiManagerWorld (AsWorld 상속) 대응.
+    RUNTIME_EXEC(AsciiManagerWorld) → main.py 에서 직접 호출.
     """
-    _instance = None
 
-    # Constants (Macros from .h)
-    MGR_UNIX_PARSER             = "MGR_PARSER_LISTEN"
-    MGR_UNIX_CONNECTOR          = "MGR_CONNECTOR_LISTEN"
-    MGR_UNIX_ROUTER             = "MGR_ROUTER_LISTEN"
-    MGR_UNIX_LOG_ROUTER         = "MGR_LOG_ROUTER_LISTEN"
-    MGR_UNIX_DATAROUTER         = "MGR_DATAROUTER_LISTEN"
-    UNIX_PARSER_LISTEN_PREFIX   = "/PARSER_LISTEN_"
-    UNIX_ROUTER_LISTEN_PREFIX   = "/ROUTER_LISTEN_"
-    UNIX_DATAROUTER_LISTEN_PREFIX = "/DATAROUTER_LISTEN_"
+    m_WorldPtr: ClassVar[Optional["AsciiManagerWorld"]] = None
 
-    def __init__(self):
-        """
-        C++: AsciiManagerWorld()
-        """
+    def __init__(self) -> None:
         super().__init__()
-        AsciiManagerWorld._instance = self
-        
-        self.m_MsgId = 0
-        
-        # MMC Publish Queues (Priority 0, 1)
-        self.m_MmcPublishSetQueueList = []
+        AsciiManagerWorld.m_WorldPtr = self
+
+        self._msg_id:              int  = 0          # C++: unsigned int m_MsgId (감소)
+        self._server_address:      str  = ""
+        self._server_port:         int  = 0
+        self._router_listen_port:  int  = 0
+        self._log_router_listen_port: int = 0
+        self._process_start_delay: int  = 0
+
+        # 우선순위 큐 2개 (index 0: RESPONSE, index 1: 그 외)
+        self._mmc_publish_queue_list: MmcPublishSetQueueList = MmcPublishSetQueueList()
         for i in range(2):
-            self.m_MmcPublishSetQueueList.append(MmcPublishSetQueue(i))
-            
-        self.m_MMCPublishThreadStatus = True
-        self.m_MMCPublishThread = None
+            self._mmc_publish_queue_list.append(MmcPublishSetQueue(i))
 
-        # --- Connection Managers ---
-        self.m_DataRouterConnMgr = DataRouterConnMgr()
-        self.m_ParserConnMgr = ParserConnMgr()
-        self.m_ConnectorConnMgr = ConnectorConnMgr()
-        self.m_RouterConnMgr = RouterConnMgr()
-        self.m_LogRouterConnMgr = LogRouterConnMgr()
-        
-        # Server Connection (Connects to AsciiServer)
-        self.m_ServerConnection = ServerConnection(None)
+        # MMC 발행 스레드
+        self._mmc_publish_thread: Optional[threading.Thread] = None
+        self._thread_running:     bool = True
 
-        # --- Config & State ---
-        self.m_ProcName = ""
-        self.m_ServerAddress = ""
-        self.m_ServerPort = 0
-        self.m_RouterListenPort = 0
-        self.m_LogRouterListenPort = 0
-        
-        # Map: ProcessId -> AsProcControlT (설정 정보 저장)
-        self.m_ProcessInfo = {} 
-        # List: AsCmdOpenPortT (열린 포트 정보)
-        self.m_CmdOpenPortList = [] 
-        # Map: DataHandlerId -> AsDataHandlerInfoT
-        self.m_DataHandlerInfoMap = {} 
-        
-        self.m_ChildProcManager = ChildProcessManager()
-        self.m_SystemInfo = AsSystemInfoT() 
+        # 프로세스/포트 관리
+        self._process_info:        Dict[str, AS_PROC_CONTROL_T] = {}
+        self._cmd_open_port_list:  List[AS_CMD_OPEN_PORT_T]     = []
+        self._data_handler_info_map: Dict[str, AS_DATA_HANDLER_INFO_T] = {}
+        self._child_proc_manager:  ChildProcessManager           = ChildProcessManager()
 
-    def __del__(self):
-        """
-        C++: ~AsciiManagerWorld()
-        """
-        self.m_MMCPublishThreadStatus = False
-        if self.m_MMCPublishThread:
-            self.m_MMCPublishThread.join()
-        
-        self.m_MmcPublishSetQueueList.clear()
-        super().__del__()
+        # ConnMgr (지연 임포트로 순환참조 방지)
+        self._server_connection    = None
+        self._parser_conn_mgr      = None
+        self._connector_conn_mgr   = None
+        self._router_conn_mgr      = None
+        self._data_router_conn_mgr = None
+        self._log_router_conn_mgr  = None
 
-    @staticmethod
-    def get_instance():
-        return AsciiManagerWorld._instance
+    def __del__(self) -> None:
+        self._thread_running = False
+        if self._mmc_publish_thread and self._mmc_publish_thread.is_alive():
+            self._mmc_publish_thread.join(timeout=2.0)
 
-    # -------------------------------------------------------
-    # AppStart & Initialization
-    # -------------------------------------------------------
-    def app_start(self, argc, argv):
-        """
-        C++: bool AppStart(int Argc, char** Argv)
-        """
-        # 1. Config & System Check
-        if not self.init_config():
-            print(f"[AsciiManagerWorld] [CORE_ERROR] Env Init Error")
+    # =========================================================================
+    # AppStart
+    # =========================================================================
+
+    def AppStart(self, argc: int, argv: list) -> bool:
+        """C++: AppStart(int Argc, char** Argv)"""
+        if not self.InitConfig():
+            logger.error("Env Init Error")
             return False
 
-        if not self.ascii_system_dir_check():
-            print("[AsciiManagerWorld] [CORE_ERROR] AsciiSystemDirCheck ERROR")
+        if not self.AsciiSystemDirCheck():
+            logger.error("AsciiSystemDirCheck ERROR")
             return False
 
-        # 2. Logger Setup
-        FrLogger.get_instance().enable("AsciiManager", level=3)
-        FrLogger.get_instance().enable("Common", level=1)
-
-        # 3. Argument Parsing
         if argc != 7:
-            print(f"[Usage] {argv[0]} -name Manager1 -svrip 172.21.90.90 -svrport 3434")
+            print(f"[Usage] {argv[0]} "
+                  f"-name Manager1 -svrip 172.21.90.90 -svrport 3434")
             return False
 
-        parser = FrArgParser(argv)
-        self.m_ProcName = parser.get_value(ARG_NAME)
-        self.m_ServerAddress = parser.get_value(ARG_SVR_IP)
-        self.m_ServerPort = int(parser.get_value(ARG_SVR_PORT) or "0")
+        args = ArgParser(argv)
+        self._proc_name       = args.get_value(ARG_NAME)
+        self._server_address  = args.get_value(ARG_SVR_IP)
+        self._server_port     = int(args.get_value(ARG_SVR_PORT) or 0)
 
-        # 4. Load Ports from Env
-        self.m_RouterListenPort = int(self.get_env_value(ASCII_MANAGER, "router_listen_port") or "0")
-        self.m_LogRouterListenPort = int(self.get_env_value(ASCII_MANAGER, "log_router_listen_port") or "0")
+        self._router_listen_port = int(
+            self.GetEnvValue(ASCII_MANAGER, "router_listen_port") or 0)
+        self._log_router_listen_port = int(
+            self.GetEnvValue(ASCII_MANAGER, "log_router_listen_port") or 0)
 
-        self.set_log_file(ASCII_MANAGER)
-        self.set_system_info(ASCII_MANAGER, self.m_ProcName)
+        self.SetLogFile(ASCII_MANAGER)
+        self.SetSystemInfo(ASCII_MANAGER, self._proc_name)
 
-        print("[AsciiManagerWorld] Netadapter Manager Start..............")
+        logger.debug("Netadapter Manager Start..............")
 
-        if not self.config_value_check():
+        if not self.ConfigValueCheck():
             return False
 
-        if not self.init_manager(argc, argv):
-            print("[AsciiManagerWorld] Manager Init Fail")
+        if not self._init_manager(argc, argv):
+            logger.debug("Manager Init Fail")
             return False
 
-        print(f"[AsciiManagerWorld] Alive Check Interval : {self.get_proc_alive_check_time()}")
-        print(f"[AsciiManagerWorld] Alive Check Limit Cnt : {self.get_alive_check_limit_cnt()}")
-
+        logger.debug("Alive Check Interval : %d", self.GetProcAliveCheckTime())
+        logger.debug("Alive Check Limit Cnt : %d", self.GetAliveCheckLimitCnt())
         return True
 
-    def init_manager(self, argc, argv):
-        """
-        C++: bool InitManager(int Argc, char** Argv)
-        서버 연결, 리스닝 소켓 생성, 초기 프로세스 실행, 스레드 시작
-        """
-        # 1. Connect to Server
-        if not self.m_ServerConnection.connect(self.m_ServerAddress, self.m_ServerPort):
-            print(f"[AsciiManagerWorld] [CORE_ERROR] Server({self.m_ServerAddress}, {self.m_ServerPort}) Connect Error")
+    # =========================================================================
+    # InitManager
+    # =========================================================================
+
+    def _init_manager(self, argc: int, argv: list) -> bool:
+        """C++: InitManager(int Argc, char** Argv)"""
+        import socket
+        from ProcNaManager.ServerConnection import ServerConnection
+        from ProcNaManager.ParserConnMgr import ParserConnMgr
+        from ProcNaManager.ConnectorConnMgr import ConnectorConnMgr
+        from ProcNaManager.RouterConnMgr import RouterConnMgr
+        from ProcNaManager.DataRouterConnMgr import DataRouterConnMgr
+        from ProcNaManager.LogRouterConnMgr import LogRouterConnMgr
+
+        self._server_connection    = ServerConnection(None)
+        self._parser_conn_mgr      = ParserConnMgr()
+        self._connector_conn_mgr   = ConnectorConnMgr()
+        self._router_conn_mgr      = RouterConnMgr()
+        self._data_router_conn_mgr = DataRouterConnMgr()
+        self._log_router_conn_mgr  = LogRouterConnMgr()
+
+        # procNaServer TCP 접속
+        if not self._server_connection.Connect(
+                self._server_address, self._server_port):
+            logger.error("Server(%s, %d), Connect Error : %s",
+                         self._server_address, self._server_port,
+                         self._server_connection.GetObjErrMsg())
             return False
 
-        # 2. Create Unix Domain Sockets
-        unix_dir = self.get_unix_socket_dir()
+        # Unix Domain 소켓 Listen
+        unix_listens = [
+            (self._data_router_conn_mgr, MGR_UNIX_DATAROUTER, 200, "DataHandler"),
+            (self._parser_conn_mgr,      MGR_UNIX_PARSER,     200, "Parser"),
+            (self._connector_conn_mgr,   MGR_UNIX_CONNECTOR,  200, "Connect"),
+            (self._router_conn_mgr,      MGR_UNIX_ROUTER,     10,  "Router"),
+            (self._log_router_conn_mgr,  MGR_UNIX_LOG_ROUTER, 10,  "Log Router"),
+        ]
+        for mgr, unix_name, backlog, label in unix_listens:
+            if not mgr.Create(socket.AF_UNIX):
+                logger.error("%s Listener Create Error : %s",
+                             label, mgr.GetObjErrMsg())
+                return False
+            path = f"{self.GetUnixSocketDir()}/{unix_name}"
+            if not mgr.Listen(path, backlog):
+                logger.error("Listen Error For %s : %s",
+                             label, mgr.GetObjErrMsg())
+                return False
 
-        if not self.m_DataRouterConnMgr.init_unix_socket(f"{unix_dir}/{self.MGR_UNIX_DATAROUTER}"):
-             print(f"[AsciiManagerWorld] [CORE_ERROR] Listen Error For DataHandler")
-             return False
+        # ObjectName 설정
+        self._parser_conn_mgr.SetObjectName("ParserConnListener")
+        self._connector_conn_mgr.SetObjectName("ConnectorConnListener")
+        self._router_conn_mgr.SetObjectName("RouterConnListener")
+        self._data_router_conn_mgr.SetObjectName("DataRouterConnListener")
+        self._log_router_conn_mgr.SetObjectName("LogRouterConnListener")
 
-        if not self.m_ParserConnMgr.init_unix_socket(f"{unix_dir}/{self.MGR_UNIX_PARSER}"):
-             print(f"[AsciiManagerWorld] [CORE_ERROR] Listen Error For Parser")
-             return False
+        # Router / LogRouter 프로세스 기동
+        self.StartProc(ASCII_ROUTER, "Router")
+        self.StartProc(ASCII_LOG_ROUTER, "LogRouter")
 
-        if not self.m_ConnectorConnMgr.init_unix_socket(f"{unix_dir}/{self.MGR_UNIX_CONNECTOR}"):
-             print(f"[AsciiManagerWorld] [CORE_ERROR] Listen Error For Connector")
-             return False
+        # MMC 발행 스레드
+        self._mmc_publish_thread = threading.Thread(
+            target=self._mmc_publish_manager,
+            name="MMCPublishManager",
+            daemon=True,
+        )
+        self._mmc_publish_thread.start()
+        logger.info("Thread Create Success For MMCPublish Management")
 
-        if not self.m_RouterConnMgr.init_unix_socket(f"{unix_dir}/{self.MGR_UNIX_ROUTER}"):
-             print(f"[AsciiManagerWorld] [CORE_ERROR] Listen Error For Router")
-             return False
+        # 세션 식별 → Manager 초기화 완료 통보
+        asyncio.ensure_future(
+            self._server_connection.SetSessionIdentify(
+                ASCII_MANAGER, self._proc_name,
+                self.GetProcAliveCheckTime()))
 
-        if not self.m_LogRouterConnMgr.init_unix_socket(f"{unix_dir}/{self.MGR_UNIX_LOG_ROUTER}"):
-             print(f"[AsciiManagerWorld] [CORE_ERROR] Listen Error For Log Router")
-             return False
+        self.ParsingRuleCopy()
+        self.MappingRuleCopy()
 
-        # 3. Start Default Processes
-        self.start_proc_by_type(ASCII_ROUTER, "Router")
-        self.start_proc_by_type(ASCII_LOG_ROUTER, "LogRouter")
+        asyncio.ensure_future(
+            self._server_connection.SendAck(MANAGER_INIT_END, 1))
 
-        # 4. Start MMC Thread
-        try:
-            self.m_MMCPublishThread = threading.Thread(target=self.mmc_publish_manager, daemon=True)
-            self.m_MMCPublishThread.start()
-            print("[AsciiManagerWorld] Thread Create Success For MMCPublish Management")
-        except Exception as e:
-            print(f"[AsciiManagerWorld] [CORE_ERROR] Thread Create Fail : {e}")
-            return False
+        # Router 포트 번호 전송
+        router_port = AS_ROUTER_PORT_INFO_T()
+        router_port.RouterPortNo = self._router_listen_port
+        asyncio.ensure_future(
+            self._server_connection.SendPacket(
+                ROUTER_PORT_INFO, _pack(router_port), _size(router_port)))
 
-        # 5. Handshake with Server
-        self.m_ServerConnection.set_session_identify(ASCII_MANAGER, self.m_ProcName, self.get_proc_alive_check_time())
+        asyncio.ensure_future(
+            self._server_connection.SendPacket(
+                AS_SYSTEM_INFO, _pack(self._system_info),
+                _size(self._system_info)))
 
-        # 6. Rule Sync
-        self.parsing_rule_copy()
-        self.mapping_rule_copy()
+        self.SetLogStatus(ASCII_MANAGER, self._proc_name)
 
-        self.m_ServerConnection.send_ack(MANAGER_INIT_END, 1)
-
-        # 7. Send Info to Server
-        router_port_info = AsRouterPortInfoT()
-        router_port_info.RouterPortNo = self.m_RouterListenPort
-        body = router_port_info.pack()
-        self.m_ServerConnection.packet_send(PacketT(ROUTER_PORT_INFO, len(body), body))
-
-        body_sys = self.m_SystemInfo.pack()
-        self.m_ServerConnection.packet_send(PacketT(AS_SYSTEM_INFO, len(body_sys), body_sys))
-
-        # 8. Send Process Info
-        proc_info = AsProcessStatusT()
-        proc_info.Pid = os.getpid()
-        proc_info.ProcessId = self.m_ProcName
-        proc_info.Status = START
+        # 자신의 프로세스 상태 등록
+        proc_info = AS_PROCESS_STATUS_T()
+        ProcConnectionMgr.get_process_info_by_pid(os.getpid(), proc_info)
+        proc_info.ProcessId   = self._proc_name
+        proc_info.Status      = START
         proc_info.ProcessType = ASCII_MANAGER
-        self.send_process_info(proc_info)
+        self.SendProcessInfo(proc_info)
 
-        # 9. SockMgr (Optional)
-        sock_mgr_port = int(self.get_env_value(ASCII_MANAGER, "sock_mgr_listen_port") or "0")
+        sock_mgr_port = int(
+            self.GetEnvValue(ASCII_MANAGER, "sock_mgr_listen_port") or 0)
         if sock_mgr_port > 3000:
-            # self.enable_sock_mgr_session("ManagerSockMgrListener", sock_mgr_port)
-            pass
-
+            asyncio.ensure_future(
+                self.EnableSockMgrSession("ManagerSockMgrListener",
+                                          sock_mgr_port))
         return True
 
-    # -------------------------------------------------------
-    # Process Start Logic
-    # -------------------------------------------------------
-    def start_proc(self, proc_ctl):
-        """
-        C++: void StartProc(AS_PROC_CONTROL_T* ProcCtl)
-        설정 정보를 받아 프로세스 시작 (Parser/Connector 등)
-        """
-        print(f"[AsciiManagerWorld] StartProc Request : {proc_ctl.ProcessId}, Delay: {proc_ctl.DelayTime}")
-        
-        # 설정 정보 저장 (Map Insert)
-        self.m_ProcessInfo[proc_ctl.ProcessId] = copy.deepcopy(proc_ctl)
-        
-        self.start_proc_by_type(ASCII_PARSER, proc_ctl.ProcessId, proc_ctl.RuleId, 
-                                proc_ctl.MmcIdentType, proc_ctl.CmdResponseType, 
-                                0, proc_ctl.LogCycle) # DelayTime은 C++에서 0으로 초기화됨
+    # =========================================================================
+    # PID 관리
+    # =========================================================================
 
-    def start_proc_by_type(self, proc_type, name, rule_id="", msg_ident_type=1, cmd_response_type=0, delay_time=0, log_cycle=0):
-        """
-        C++: void StartProc(int ProcType, string Name, ...)
-        실제 프로세스 실행 (Fork/Exec)
-        """
-        args = []
-        proc_bin_name = AsUtil.get_process_type_string(proc_type)
-        bin_path = f"{self.get_bin_dir()}/{proc_bin_name}" 
-        unix_dir = self.get_unix_socket_dir()
-        
-        # Common Arguments
-        args.append(bin_path) # Argv[0]
-        args.append(ARG_NAME) # -name
+    def AddPid(self, pid: int) -> None:
+        self._child_proc_manager.add_pid(pid)       # ChildProcessManager.add_pid()
 
-        pid = -1
+    def RemovePid(self, pid: int) -> None:
+        self._child_proc_manager.remove_pid(pid)    # ChildProcessManager.remove_pid()
+
+    # =========================================================================
+    # 에러 전송
+    # =========================================================================
+
+    def SendAsciiError(self, priority_or_msg, fmt: str = "", *args) -> None:
+        """
+        C++ 오버로드 2종 통합:
+          SendAsciiError(AS_ASCII_ERROR_MSG_T*)
+          SendAsciiError(int Priority, const char* format, ...)
+        """
+        if isinstance(priority_or_msg, AS_ASCII_ERROR_MSG_T):
+            err = priority_or_msg
+            logger.debug(err.ErrMsg)
+            asyncio.ensure_future(
+                self._server_connection.SendAsciiError(err))
+        else:
+            msg = fmt % args if args else fmt
+            err = AS_ASCII_ERROR_MSG_T()
+            err.Priority    = priority_or_msg
+            err.ProcessType = ASCII_MANAGER
+            err.ErrMsg      = msg
+            err.ProcessId   = self.GetProcName()
+            self.SendAsciiError(err)
+
+    # =========================================================================
+    # StartProc
+    # =========================================================================
+
+    def StartProc(self, proc_type_or_ctl, name: str = "",
+                  rule_id: str = "", mmc_ident_type: int = 1,
+                  cmd_response_type: int = 0, delay_time: int = 0,
+                  log_cycle: int = 0) -> None:
+        """
+        C++ 오버로드 2종 통합:
+          StartProc(AS_PROC_CONTROL_T*)
+          StartProc(int ProcType, string Name, ...)
+        """
+        if isinstance(proc_type_or_ctl, AS_PROC_CONTROL_T):
+            ctl = proc_type_or_ctl
+            logger.debug("Delay Time : %d", ctl.DelayTime)
+            delay = ctl.DelayTime
+            ctl.DelayTime = 0
+            self._process_info[ctl.ProcessId] = ctl
+            self.StartProc(ASCII_PARSER, ctl.ProcessId, ctl.RuleId,
+                           ctl.MmcIdentType, ctl.CmdResponseType,
+                           delay, ctl.LogCycle)
+            return
+
+        proc_type = proc_type_or_ctl
+        args = [
+            self.GetProcPosition() + self.GetProcessName(proc_type),
+            self.GetProcessName(proc_type),
+            ARG_NAME,
+        ]
 
         if proc_type == ASCII_PARSER:
-            enc_name = self.parser_id_encode(name)
-            args.append(enc_name)
-            args.append(ARG_MANAGER_SOCKET_PATH)
-            args.append(f"{unix_dir}/{self.MGR_UNIX_PARSER}")
-            args.append(ARG_RULEID); args.append(rule_id)
-            args.append(ARG_DELAY_TIME); args.append(str(delay_time))
-            args.append(ARG_CMD_IDENT_TYPE); args.append(str(msg_ident_type))
-            
-            pid = self.m_ParserConnMgr.start_proc(enc_name, args)
+            enc_name = self._parser_id_encode(name)
+            args += [enc_name, ARG_MANAGER_SOCKET_PATH,
+                     f"{self.GetUnixSocketDir()}/{MGR_UNIX_PARSER}",
+                     ARG_RULEID, rule_id,
+                     ARG_DELAY_TIME, str(delay_time),
+                     ARG_CMD_IDENT_TYPE, str(mmc_ident_type)]
+            pid = self._parser_conn_mgr.start_proc(enc_name, args)
 
         elif proc_type == ASCII_CONNECTOR:
-            enc_name = self.connector_id_encode(name)
-            # print(f"Connector Name : {enc_name}")
-            args.append(enc_name)
-            args.append(ARG_MANAGER_SOCKET_PATH)
-            args.append(f"{unix_dir}/{self.MGR_UNIX_CONNECTOR}")
-            args.append(ARG_CMD_RESPONSE_TYPE); args.append(str(cmd_response_type))
+            enc_name = self._connector_id_encode(name)
+            logger.debug("Connector Name : %s", enc_name)
+            args += [enc_name, ARG_MANAGER_SOCKET_PATH,
+                     f"{self.GetUnixSocketDir()}/{MGR_UNIX_CONNECTOR}",
+                     ARG_CMD_RESPONSE_TYPE, str(cmd_response_type)]
             if log_cycle == 1:
-                args.append(ARG_LOG_CYCLE)
-                args.append(ARG_LOG_HOUR)
-                
-            pid = self.m_ConnectorConnMgr.start_proc(enc_name, args)
+                args += [ARG_LOG_CYCLE, ARG_LOG_HOUR]
+            pid = self._connector_conn_mgr.start_proc(enc_name, args)
 
         elif proc_type == ASCII_ROUTER:
-            args.append(name)
-            args.append(ARG_MANAGER_SOCKET_PATH)
-            args.append(f"{unix_dir}/{self.MGR_UNIX_ROUTER}")
-            args.append("-portno"); args.append(str(self.m_RouterListenPort))
-            args.append("-socketpathforparser")
-            args.append(self.get_router_listen_socket_path(name))
-            
-            pid = self.m_RouterConnMgr.start_proc(name, args)
+            args += [name, ARG_MANAGER_SOCKET_PATH,
+                     f"{self.GetUnixSocketDir()}/{MGR_UNIX_ROUTER}",
+                     "-portno", str(self._router_listen_port),
+                     "-socketpathforparser",
+                     self.GetRouterListenSocketPath(name)]
+            pid = self._router_conn_mgr.start_proc(name, args)
 
         elif proc_type == ASCII_LOG_ROUTER:
-            args.append(name)
-            args.append(ARG_MANAGER_SOCKET_PATH)
-            args.append(f"{unix_dir}/{self.MGR_UNIX_LOG_ROUTER}")
-            args.append(ARG_PORT_NO); args.append(str(self.m_LogRouterListenPort))
-            
-            pid = self.m_LogRouterConnMgr.start_proc(name, args)
+            args += [name, ARG_MANAGER_SOCKET_PATH,
+                     f"{self.GetUnixSocketDir()}/{MGR_UNIX_LOG_ROUTER}",
+                     ARG_PORT_NO, str(self._log_router_listen_port)]
+            pid = self._log_router_conn_mgr.start_proc(name, args)
 
         elif proc_type == ASCII_DATA_ROUTER:
-            args.append(name)
-            args.append(ARG_MANAGER_SOCKET_PATH)
-            args.append(f"{unix_dir}/{self.MGR_UNIX_DATAROUTER}")
-            
-            pid = self.m_DataRouterConnMgr.start_proc(name, args)
+            args += [name, ARG_MANAGER_SOCKET_PATH,
+                     f"{self.GetUnixSocketDir()}/{MGR_UNIX_DATAROUTER}"]
+            pid = self._data_router_conn_mgr.start_proc(name, args)
 
         else:
-            print(f"[AsciiManagerWorld] [CORE_ERROR] Unknown Process Type : {proc_type}")
+            logger.error("Unknown Process Type......%d", proc_type)
             return
 
-        # Check PID
         if pid == -1:
-            msg = f"Forking the process in {AsUtil.get_process_type_string(ASCII_MANAGER)}({self.m_ProcName}) fails."
-            self.send_ascii_error(1, msg)
+            self.SendAsciiError(
+                1, "Forking the process in %s(%s) fails.",
+                AsUtil.GetProcessTypeString(ASCII_MANAGER),
+                self.GetProcName())
         else:
-            self.add_pid(pid)
-            print(f"[AsciiManagerWorld] Process Execute : {AsUtil.get_process_type_string(proc_type)}({name}, pid:{pid})")
+            self.AddPid(pid)
+            logger.debug("Process Execute : %s(%s, pid:%d)",
+                         AsUtil.GetProcessTypeString(proc_type), name, pid)
 
-    # -------------------------------------------------------
-    # Rule Management
-    # -------------------------------------------------------
-    def parsing_rule_copy(self):
-        """
-        C++: bool ParsingRuleCopy()
-        룰 파일을 복사합니다. (시스템 명령 호출)
-        """
-        cmd = "~/NAA/Bin/RuleCopy -name RuleCopy -type 0"
-        print(f"[AsciiManagerWorld] RuleCopy : {cmd}")
-        
-        retry = 0
-        while True:
-            if retry < 2:
-                ret = os.system(cmd)
-                print(f"[AsciiManagerWorld] ParsingRule Rule RCopy Result : {ret}")
-                if ret != 0:
-                    print("[AsciiManagerWorld] [CORE_ERROR] PARSING RULE DOWN Fail")
-                    retry += 1
+    # =========================================================================
+    # MMC 발행 스레드
+    # =========================================================================
+
+    def _mmc_publish_manager(self) -> None:
+        """C++: MMCPublishManager(void* Arg) — pthread → threading.Thread"""
+        from Common.AsUtil import AsUtil as _AsUtil
+
+        while self._thread_running:
+            q_list = self._mmc_publish_queue_list
+            queue_empty_cnt = len(q_list)
+
+            for mmcSetQueue in q_list:
+                mmc_set = mmcSetQueue.GetMmcPublishSet()
+                if mmc_set is None:
+                    queue_empty_cnt -= 1
                     continue
-                else:
-                    break
-            else:
-                print("[AsciiManagerWorld] [CORE_ERROR] PARSING RULE DOWN RETRY FAIL")
-                break
-        
-        print("[AsciiManagerWorld] Rule Down Success")
-        return True
 
-    def mapping_rule_copy(self):
-        """
-        C++: bool MappingRuleCopy()
-        """
-        cmd = "~/NAA/Bin/RuleCopy -name RuleCopy -type 1"
-        print(f"[AsciiManagerWorld] Mapping Rule Copy : {cmd}")
-        
-        retry = 0
-        while True:
-            if retry < 2:
-                ret = os.system(cmd)
-                print(f"[AsciiManagerWorld] Mapping Rule RCopy Result : {ret}")
-                if ret != 0:
-                    print("[AsciiManagerWorld] [CORE_ERROR] Mapping Down Fail")
-                    retry += 1
-                    continue
-                else:
-                    break
-            else:
-                print("[AsciiManagerWorld] [CORE_ERROR] Mapping Rule Down Retry Error")
-                break
-                
-        print("[AsciiManagerWorld] Mapping Down Success")
-        return True
+                logger.debug("MmcPublish Queue Send Command : ne(%s), mmc(%s)",
+                             mmc_set.m_MmcPublish.ne,
+                             mmc_set.m_MmcPublish.mmc)
 
-    # -------------------------------------------------------
-    # MMC Command Handling
-    # -------------------------------------------------------
-    def send_mmc_command(self, mmc_com):
-        """
-        C++: void SendMMCCommand(AS_MMC_PUBLISH_T* MMCCom)
-        MMC 명령을 받아 적절한 Connector를 찾아 큐에 삽입하거나 에러를 반환합니다.
-        """
-        result = False
-        print(f"[AsciiManagerWorld] Receive MMC Command : msgid({mmc_com.id}), ne({mmc_com.ne}), mmc({mmc_com.mmc})")
+                if self._connector_conn_mgr.SendMMCCommand(
+                        mmc_set.m_ConnectorId, mmc_set.m_MmcPublish):
+                    logger.debug("MMC(%s) Send Success(%s)",
+                                 mmc_set.m_MmcPublish.mmc,
+                                 mmc_set.m_MmcPublish.ne)
 
-        # 1. 명령어 필터링 (Blacklist)
-        # 예시: "DIS-MS:", "RTRV-MS-INF:" 등
-        cmd_str = mmc_com.mmc.strip()
-        blocked_cmds = ["DIS-MS:", "DIS-3GMS:", "RTRV-MS-INF:", "DIS-MS MDN"]
-        
-        is_blocked = any(cmd_str.startswith(b) for b in blocked_cmds)
+            if queue_empty_cnt == 0:
+                _AsUtil.AsSleep(70000)              # C++: AsUtil::AsSleep(70000)
 
-        if is_blocked:
-            res = AsMmcResultT()
-            res.id = mmc_com.id
+    def InsertMMCPublishSet(self, mmc_com_set: MmcPublishSet) -> None:
+        """C++: InsertMMCPublishSet(MmcPublishSet*)"""
+        if mmc_com_set.m_MmcPublish.responseMode == RESPONSE:
+            logger.debug("Mmcpublish push back to list1 ne(%s), mmc(%s)",
+                         mmc_com_set.m_MmcPublish.ne,
+                         mmc_com_set.m_MmcPublish.mmc)
+            self._mmc_publish_queue_list[0].InsertMMCPublishSet(mmc_com_set)
+        else:
+            logger.debug("Mmcpublish push back to list2 ne(%s), mmc(%s)",
+                         mmc_com_set.m_MmcPublish.ne,
+                         mmc_com_set.m_MmcPublish.mmc)
+            self._mmc_publish_queue_list[1].InsertMMCPublishSet(mmc_com_set)
+
+    # =========================================================================
+    # MMC 명령 전송
+    # =========================================================================
+
+    def SendMMCCommand(self, mmc_com: AS_MMC_PUBLISH_T) -> None:
+        """C++: SendMMCCommand(AS_MMC_PUBLISH_T*)"""
+        # 특정 MMC 명령은 불허 (한글 메시지 → 영문 대체)
+        blocked_prefixes = (
+            "DIS-MS:", "DIS-3GMS:", "RTRV-MS-INF:", "DIS-MS MDN",
+            "DIS-3G-MS MSISDN", "DIS-MSUB:", "DIS-MS-INFO:",
+            "DIS-NSN=", "DIS-MS-INF:",
+        )
+        if any(mmc_com.mmc.startswith(p) for p in blocked_prefixes):
+            res = AS_MMC_RESULT_T()
+            res.id         = mmc_com.id
             res.resultMode = R_ERROR
-            res.result = " 감사/권고 사항으로 인하여 Command를 발행할 수 없습니다."
-            self.send_command_response(res)
+            res.result     = "This command is not allowed for subscriber inquiry."
+            self.SendCommandResponse(res)
             return
 
-        # 2. 적절한 Port 찾기 (Open Port List 검색)
-        for port_info in self.m_CmdOpenPortList:
-            if port_info.EquipId == mmc_com.ne:
+        result = False
+        for port in self._cmd_open_port_list:
+            if port.EquipId == mmc_com.ne:
                 result = True
-                if port_info.CommandPortFlag == 1:
-                    # 큐에 삽입
-                    new_mmc = copy.deepcopy(mmc_com)
-                    self.insert_mmc_publish_set(MmcPublishSet(new_mmc, port_info.ConnectorId))
+                if port.CommandPortFlag == 1:
+                    import copy
+                    mmcCom = copy.copy(mmc_com)
+                    self.InsertMMCPublishSet(
+                        MmcPublishSet(mmcCom, port.ConnectorId))
                     return
 
-        # 3. 실패 처리
-        res = AsMmcResultT()
-        res.id = mmc_com.id
+        res = AS_MMC_RESULT_T()
+        res.id         = mmc_com.id
         res.resultMode = R_ERROR
         if result:
-            msg = f"The NE({mmc_com.ne}) is found, but has no command port."
+            res.result = f"The NE({mmc_com.ne}) is found, but has no command port."
         else:
-            msg = f"The NE({mmc_com.ne}) is not found."
-        
-        res.result = msg
-        print(f"[AsciiManagerWorld] {msg}")
-        self.send_command_response(res)
+            res.result = f"The NE({mmc_com.ne}) is not found."
+        self.SendCommandResponse(res)
 
-    def insert_mmc_publish_set(self, mmc_com_set):
-        """
-        C++: void InsertMMCPublishSet(MmcPublishSet* MMCComSet)
-        """
-        if mmc_com_set.m_MmcPublish.responseMode == RESPONSE:
-            self.m_MmcPublishSetQueueList[0].insert_mmc_publish_set(mmc_com_set)
+    def SendCommandResponse(self, mmc_result: AS_MMC_RESULT_T) -> None:
+        asyncio.ensure_future(
+            self._server_connection.SendCommandResponse(mmc_result))
+
+    # =========================================================================
+    # 프로세스 상태/포트 정보 전송
+    # =========================================================================
+
+    def SendProcessInfo(self, proc_info: AS_PROCESS_STATUS_T) -> None:
+        proc_info.ManagerId = self._proc_name
+        asyncio.ensure_future(
+            self._server_connection.SendProcessInfo(proc_info))
+
+    def SendProcessInfoList(self) -> None:
+        """C++: SendProcessInfoList()"""
+        proc_list = []
+        for mgr in (self._parser_conn_mgr, self._connector_conn_mgr,
+                    self._router_conn_mgr, self._data_router_conn_mgr):
+            mgr.get_process_info_list(proc_list)
+        for p in proc_list:
+            p.ManagerId = self._proc_name
+        asyncio.ensure_future(
+            self._server_connection.SendProcessInfoList(proc_list))
+
+    def SendPortInfo(self, status_info: AS_PORT_STATUS_INFO_T) -> None:
+        status_info.ManagerId  = self._proc_name
+        status_info.ConnectorId = self._connector_id_decode(
+            status_info.ConnectorId)
+        asyncio.ensure_future(
+            self._server_connection.SendPortInfo(status_info))
+
+    def SendLogStatus(self, status: AS_LOG_STATUS_T) -> None:
+        log = AS_LOG_STATUS_T()
+        log.name   = status.name
+        log.status = status.status
+        log.logs   = f"{self.GetProcName()},{status.logs}"
+        asyncio.ensure_future(
+            self._server_connection.SendLogStatus(log))
+
+    # =========================================================================
+    # 프로세스 상태 관리
+    # =========================================================================
+
+    def SetParserProcStatus(self, session_name: str) -> bool:
+        """C++: SetParserProcStatus(string SessionName)"""
+        name = self._parser_id_decode(session_name)
+        info = self._process_info.get(name)
+        if info is None:
+            logger.error("Not Exist SessionName : %s", session_name)
+            return False
+
+        info.ParserStatus = True
+        if info.ConnectorStatus:
+            open_port = AS_CMD_OPEN_PORT_T()
+            open_port.ProtocolType = PARSER_CONNECT
+            enc_session = self._connector_id_encode(
+                self._parser_id_decode(session_name))
+            open_port.ConnectorId = enc_session
+            open_port.PortPath    = self.GetParserListenSocketPath(enc_session)
+            self._connector_conn_mgr.SendCmdOpenInfo(open_port)
         else:
-            self.m_MmcPublishSetQueueList[1].insert_mmc_publish_set(mmc_com_set)
-
-    def mmc_publish_manager(self):
-        """
-        C++: void* MMCPublishManager(void* Arg)
-        MMC 전송 스레드. 큐에서 명령을 꺼내 ConnectorConnMgr를 통해 전송.
-        """
-        while self.m_MMCPublishThreadStatus:
-            processed_any = False
-            
-            for queue in self.m_MmcPublishSetQueueList:
-                mmc_set = queue.get_mmc_publish_set()
-                if not mmc_set:
-                    continue
-                
-                processed_any = True
-                print(f"[AsciiManagerWorld] MmcPublish Queue Send Command : ne({mmc_set.m_MmcPublish.ne}), mmc({mmc_set.m_MmcPublish.mmc})")
-                
-                # Send via ConnectorConnMgr
-                if self.m_ConnectorConnMgr.send_mmc_command(mmc_set.m_ConnectorId, mmc_set.m_MmcPublish):
-                    print(f"[AsciiManagerWorld] MMC Send Success")
-            
-            # Idle 시 Sleep
-            if not processed_any:
-                time.sleep(0.07) # 70ms
-
-    def send_command_response(self, mmc_result):
-        self.m_ServerConnection.send_command_response(mmc_result)
-
-    # -------------------------------------------------------
-    # Process & Status Control
-    # -------------------------------------------------------
-    def recv_process_control(self, proc_ctl):
-        """
-        C++: void RecvProcessControl(AS_PROC_CONTROL_T* ProcCtl)
-        서버로부터 프로세스 제어 명령 수신 (Start/Stop)
-        """
-        print(f"[AsciiManagerWorld] Recv Process Control : {proc_ctl.ProcessId}, Status: {proc_ctl.Status}")
-        
-        proc_type = proc_ctl.ProcessType
-        
-        if proc_type in [ASCII_PARSER, ASCII_CONNECTOR]:
-            if proc_ctl.Status == START:
-                if proc_ctl.ProcessId in self.m_ProcessInfo:
-                    self.send_ascii_error(1, f"The process({proc_ctl.ProcessId}) has already been being executed.")
-                    return
-                self.start_proc(proc_ctl)
-                
-            elif proc_ctl.Status == STOP:
-                if proc_ctl.ProcessId not in self.m_ProcessInfo:
-                    self.send_ascii_error(1, f"The process({proc_ctl.ProcessId}) has not been executed.")
-                    return
-                
-                del self.m_ProcessInfo[proc_ctl.ProcessId]
-                
-                # Remove from Port List
-                self.m_CmdOpenPortList = [p for p in self.m_CmdOpenPortList if p.ConnectorId != proc_ctl.ProcessId]
-                
-                # Stop Logic
-                self.m_ParserConnMgr.stop_process(self.parser_id_encode(proc_ctl.ProcessId))
-                self.m_ConnectorConnMgr.stop_process(self.connector_id_encode(proc_ctl.ProcessId))
-
-    def recv_session_control(self, session_ctl):
-        """
-        C++: void RecvSessionControl(AS_SESSION_CONTROL_T* SessionCtl)
-        """
-        if session_ctl.Status == STOP:
-            enc_id = self.connector_id_encode(session_ctl.ConnectorId)
-            session_ctl.ConnectorId = enc_id
-            
-            # Remove from Port List based on Sequence/ID
-            # (Simplified logic)
-            self.m_CmdOpenPortList = [p for p in self.m_CmdOpenPortList if p.Sequence != session_ctl.Sequence]
-            
-            self.m_ConnectorConnMgr.send_session_control(session_ctl)
-
-    def process_dead(self, proc_type, name, pid):
-        """
-        C++: void ProcessDead(int ProcessType, string ProcessName, int Pid)
-        """
-        msg = f"The {AsUtil.get_process_type_string(proc_type)}({name}) is killed abnormal."
-        self.send_ascii_error(1, msg)
-        
-        # Core file handling (omitted or use simple move)
-        # os.system(f"mv core core_{pid}_{name}")
-        
-        self.remove_pid(pid)
-        
-        # Restart Logic
-        if proc_type in [ASCII_CONNECTOR, ASCII_PARSER]:
-            decoded_name = self.connector_id_decode(name) # Or Parser decode, same logic
-            
-            if decoded_name in self.m_ProcessInfo:
-                info = self.m_ProcessInfo[decoded_name]
-                
-                # Status flag update logic (simplified)
-                if proc_type == ASCII_CONNECTOR:
-                    # Update status, remove ports
-                    self.m_CmdOpenPortList = [p for p in self.m_CmdOpenPortList if p.ConnectorId != decoded_name]
-                
-                # Restart
-                self.start_proc_by_type(proc_type, info.ProcessId, info.RuleId, info.MmcIdentType, info.CmdResponseType, 0, info.LogCycle)
-                
-        elif proc_type == ASCII_ROUTER:
-            self.start_proc_by_type(ASCII_ROUTER, "Router")
-        elif proc_type == ASCII_LOG_ROUTER:
-            self.start_proc_by_type(ASCII_LOG_ROUTER, "LogRouter")
-        elif proc_type == ASCII_DATA_ROUTER:
-            # DataRouter restart logic based on DataHandlerInfoMap
-            pass
-
-    # -------------------------------------------------------
-    # Info Exchange
-    # -------------------------------------------------------
-    def send_cmd_open_info(self, port_info):
-        """
-        C++: void SendCmdOpenInfo(AS_CMD_OPEN_PORT_T* PortInfo)
-        """
-        AsUtil.cmd_open_port_display(port_info)
-        
-        # Encode ID
-        port_info.ConnectorId = self.connector_id_encode(port_info.ConnectorId)
-        
-        if self.m_ConnectorConnMgr.send_cmd_open_info(port_info):
-            self.m_CmdOpenPortList.append(copy.deepcopy(port_info))
-
-    def set_parser_proc_status(self, session_name):
-        decoded = self.parser_id_decode(session_name)
-        if decoded in self.m_ProcessInfo:
-            # Update status logic
-            return True
-        return False
-
-    def set_connector_proc_status(self, session_name):
-        decoded = self.connector_id_decode(session_name)
-        if decoded in self.m_ProcessInfo:
-            # Trigger Open Port logic if Parser is ready
-            # (Simplification: Just request port info from Server)
-            self.m_ServerConnection.connector_port_info_request(decoded)
-            return True
-        return False
-
-    def router_start(self, router_name):
-        self.m_ParserConnMgr.send_router_conn_info(router_name)
-
-    def recv_cmd_parsing_rule_down(self):
-        if self.parsing_rule_copy():
-            self.m_ParserConnMgr.send_cmd_rule_down()
-
-    def recv_cmd_mapping_rule_down(self):
-        if self.mapping_rule_copy():
-            self.m_ParserConnMgr.send_cmd_mapping_rule_down()
-
-    def parser_rule_change(self, change_info):
-        # Update Info in Map
-        if change_info.ProcessId in self.m_ProcessInfo:
-            self.m_ProcessInfo[change_info.ProcessId].RuleId = change_info.RuleId
-            self.m_ProcessInfo[change_info.ProcessId].MmcIdentType = change_info.MmcIdentType
-            
-        enc_id = self.parser_id_encode(change_info.ProcessId)
-        change_info.ProcessId = enc_id
-        
-        self.m_ParserConnMgr.parser_rule_change(change_info)
-
-    def recv_data_handler_info(self, info):
-        """
-        C++: void RecvDataHandlerInfo(AS_DATA_HANDLER_INFO_T* Info)
-        """
-        # Logic to update m_DataHandlerInfoMap and start/stop DataRouter processes
-        if info.DataHandlerId not in self.m_DataHandlerInfoMap:
-            self.m_DataHandlerInfoMap[info.DataHandlerId] = copy.deepcopy(info)
-        else:
-            # Update
-            self.m_DataHandlerInfoMap[info.DataHandlerId] = copy.deepcopy(info)
-            
-        if info.SettingStatus == START:
-            self.start_proc_by_type(ASCII_DATA_ROUTER, info.DataHandlerId)
-        elif info.SettingStatus == STOP:
-            self.m_DataRouterConnMgr.stop_process(info.DataHandlerId)
-            
-        self.m_ParserConnMgr.send_data_handler_info(info)
-
-    def recv_init_info(self, init_info):
-        self.m_DataRouterConnMgr.recv_init_info(init_info)
-
-    def send_process_info(self, proc_info):
-        proc_info.ManagerId = self.m_ProcName
-        self.m_ServerConnection.send_process_info(proc_info)
-
-    def send_ascii_error(self, priority, fmt, *args):
-        msg = fmt
-        if args: msg = fmt % args
-        err = AsAsciiErrorMsgT()
-        err.Priority = priority
-        err.ErrMsg = msg
-        self.m_ServerConnection.send_ascii_error(err)
-
-    def send_log_status(self, status):
-        # C++: sprintf(logs, "%s,%s", GetProcName(), Status->logs)
-        status.logs = f"{self.m_ProcName},{status.logs}"
-        self.m_ServerConnection.send_log_status(status)
-
-    def receive_cmd_log_status_change(self, log_ctl):
-        proc_type = log_ctl.ProcessType
-        if proc_type == ASCII_MANAGER:
-            pass # Self log logic
-        elif proc_type == ASCII_CONNECTOR:
-            self.m_ConnectorConnMgr.send_cmd_log_status_change(log_ctl, log_ctl.ProcessId)
-        elif proc_type == ASCII_PARSER:
-            self.m_ParserConnMgr.send_cmd_log_status_change(log_ctl, log_ctl.ProcessId)
-        # ... others ...
-
-    # -------------------------------------------------------
-    # Utilities
-    # -------------------------------------------------------
-    def parser_id_encode(self, name): return "PARSER_" + name
-    def parser_id_decode(self, name): return name.replace("PARSER_", "", 1)
-    def connector_id_encode(self, name): return "CONNECTOR_" + name
-    def connector_id_decode(self, name): return name.replace("CONNECTOR_", "", 1)
-    
-    def add_pid(self, pid): self.m_ChildProcManager.add_pid(pid)
-    def remove_pid(self, pid): self.m_ChildProcManager.remove_pid(pid)
-    
-    def config_value_check(self):
-        if self.m_RouterListenPort == 0: return False
-        if self.m_LogRouterListenPort == 0: return False
+            self.StartProc(
+                ASCII_CONNECTOR,
+                self._connector_id_decode(session_name),
+                info.RuleId, info.MmcIdentType,
+                info.CmdResponseType, 0, info.LogCycle)
         return True
 
-    def get_unix_socket_dir(self): return "/tmp" # Or AsUtil
-    def get_bin_dir(self): return "../Bin"
-    def get_proc_alive_check_time(self): return 30
-    def get_alive_check_limit_cnt(self): return 5
-    
-    def get_parser_listen_socket_path(self, session_name):
-        return f"{self.get_unix_socket_dir()}{self.UNIX_PARSER_LISTEN_PREFIX}{self.parser_id_decode(session_name)}"
-    def get_router_listen_socket_path(self, session_name):
-        return f"{self.get_unix_socket_dir()}{self.UNIX_ROUTER_LISTEN_PREFIX}{session_name}"
-    def get_data_router_listen_socket_path(self, session_name):
-        return f"{self.get_unix_socket_dir()}{self.UNIX_DATAROUTER_LISTEN_PREFIX}{session_name}"
+    def SetConnectorProcStatus(self, session_name: str) -> bool:
+        """C++: SetConnectorProcStatus(string SessionName)"""
+        name = self._connector_id_decode(session_name)
+        info = self._process_info.get(name)
+        if info is None:
+            logger.error("Not Exist SessionName : %s", session_name)
+            return False
 
-    def get_data_handler_info(self, data_handler_id):
-        return self.m_DataHandlerInfoMap.get(data_handler_id)
-    def get_data_handler_info_map(self):
-        return self.m_DataHandlerInfoMap
+        info.ConnectorStatus = True
+        if info.ParserStatus:
+            open_port = AS_CMD_OPEN_PORT_T()
+            open_port.ProtocolType = PARSER_CONNECT
+            open_port.ConnectorId  = session_name
+            open_port.PortPath     = self.GetParserListenSocketPath(session_name)
+            self._connector_conn_mgr.SendCmdOpenInfo(open_port)
+
+        asyncio.ensure_future(
+            self._server_connection.ConnectorPortInfoRequest(
+                self._connector_id_decode(session_name)))
+        return True
+
+    # =========================================================================
+    # ProcessDead
+    # =========================================================================
+
+    def ProcessDead(self, process_type: int,
+                    process_name: str, pid: int) -> None:
+        """C++: ProcessDead(int ProcessType, string ProcessName, int Pid)"""
+        self.SendAsciiError(
+            1, "The %s(%s) is killed abnormal.",
+            AsUtil.GetProcessTypeString(process_type), process_name)
+
+        # core 파일 이름 변경
+        cmd = f"mv ~/core ~/core_{pid}_{process_name}"
+        logger.debug(cmd)
+        subprocess.call(cmd, shell=True)
+
+        self.RemovePid(pid)
+
+        if process_type in (ASCII_CONNECTOR, ASCII_PARSER):
+            name = self._connector_id_decode(process_name)
+            info = self._process_info.get(name)
+            if info is None:
+                logger.error("Can't Find Process Info")
+                return
+
+            if process_type == ASCII_CONNECTOR:
+                self._cmd_open_port_list = [
+                    p for p in self._cmd_open_port_list
+                    if p.ConnectorId != name
+                ]
+                info.ConnectorStatus = False
+            else:
+                info.ParserStatus = False
+
+            self.StartProc(process_type, info.ProcessId, info.RuleId,
+                           info.MmcIdentType, info.CmdResponseType,
+                           0, info.LogCycle)
+
+        elif process_type == ASCII_ROUTER:
+            self.StartProc(ASCII_ROUTER, "Router")
+
+        elif process_type == ASCII_LOG_ROUTER:
+            self.StartProc(ASCII_LOG_ROUTER, "LogRouter")
+
+        elif process_type == ASCII_DATA_ROUTER:
+            info = self._data_handler_info_map.get(process_name)
+            if info is None:
+                logger.error("Can't Find DataHandler Info : %s", process_name)
+                return
+            if info.SettingStatus == START:
+                self.StartProc(ASCII_DATA_ROUTER, info.DataHandlerId)
+        else:
+            logger.error("Unknown ProcessType : %d", process_type)
+
+    # =========================================================================
+    # RecvProcessControl / RecvSessionControl
+    # =========================================================================
+
+    def RecvProcessControl(self, proc_ctl: AS_PROC_CONTROL_T) -> None:
+        """C++: RecvProcessControl(AS_PROC_CONTROL_T*)"""
+        logger.debug("Receive Process Control ProcessType:%s ManagerId:%s "
+                     "ProcessId:%s Status:%s",
+                     AsUtil.GetProcessTypeString(proc_ctl.ProcessType),
+                     proc_ctl.ManagerId, proc_ctl.ProcessId,
+                     AsUtil.GetStatusString(proc_ctl.Status))
+
+        if proc_ctl.ProcessType in (ASCII_PARSER, ASCII_CONNECTOR):
+            if proc_ctl.Status == START:
+                if proc_ctl.ProcessId in self._process_info:
+                    self.SendAsciiError(
+                        1, "The process(%s) has already been being executed.",
+                        proc_ctl.ProcessId)
+                    return
+                self.StartProc(proc_ctl)
+
+            elif proc_ctl.Status == STOP:
+                if proc_ctl.ProcessId not in self._process_info:
+                    self.SendAsciiError(
+                        1, "The process(%s) has not been executed.",
+                        proc_ctl.ProcessId)
+                    return
+                del self._process_info[proc_ctl.ProcessId]
+                self._cmd_open_port_list = [
+                    p for p in self._cmd_open_port_list
+                    if p.ConnectorId != proc_ctl.ProcessId
+                ]
+                self._parser_conn_mgr.StopProcess(
+                    self._parser_id_encode(proc_ctl.ProcessId))
+                self._connector_conn_mgr.StopProcess(
+                    self._connector_id_encode(proc_ctl.ProcessId))
+        else:
+            logger.debug("Unknown ProcessType : %d", proc_ctl.ProcessType)
+
+    def RecvSessionControl(self, session_ctl: AS_SESSION_CONTROL_T) -> None:
+        """C++: RecvSessionControl(AS_SESSION_CONTROL_T*)"""
+        logger.debug("Receive Session Control ManagerId:%s ConnectorId:%s "
+                     "Sequence:%d Status:%s",
+                     session_ctl.ManagerId, session_ctl.ConnectorId,
+                     session_ctl.Sequence,
+                     AsUtil.GetStatusString(session_ctl.Status))
+
+        if session_ctl.Status == STOP:
+            session_ctl.ConnectorId = self._connector_id_encode(
+                session_ctl.ConnectorId)
+            self._cmd_open_port_list = [
+                p for p in self._cmd_open_port_list
+                if p.Sequence != session_ctl.Sequence
+            ]
+            asyncio.ensure_future(
+                self._connector_conn_mgr.SendSessionControl(session_ctl))
+        else:
+            logger.error("Not allow Session Control Type....")
+
+    # =========================================================================
+    # 룰 다운 처리
+    # =========================================================================
+
+    def RecvCmdParsingRuleDown(self) -> None:
+        logger.debug("Receive Cmd Rule Down")
+        if self.ParsingRuleCopy():
+            asyncio.ensure_future(self._parser_conn_mgr.SendCmdRuleDown())
+
+    def RecvCmdMappingRuleDown(self) -> None:
+        logger.debug("Receive MappingCmd Rule Down")
+        if self.MappingRuleCopy():
+            asyncio.ensure_future(
+                self._parser_conn_mgr.SendCmdMappingRuleDown())
+
+    def ParserRuleChange(self, change_info: AS_RULE_CHANGE_INFO_T) -> None:
+        info = self._process_info.get(change_info.ProcessId)
+        if info is None:
+            logger.error("Can't Find Process Info")
+            return
+        info.RuleId       = change_info.RuleId
+        info.MmcIdentType = change_info.MmcIdentType
+        change_info.ProcessId = self._parser_id_encode(change_info.ProcessId)
+        asyncio.ensure_future(
+            self._parser_conn_mgr.ParserRuleChange(change_info))
+
+    # =========================================================================
+    # 룰 복사
+    # =========================================================================
+
+    def ParsingRuleCopy(self) -> bool:
+        """C++: ParsingRuleCopy() — RuleCopy 외부 명령 실행."""
+        cmd = "~/NAA/Bin/RuleCopy -name RuleCopy -type 0"
+        return self._run_rule_copy(cmd, "PARSING RULE DOWN")
+
+    def MappingRuleCopy(self) -> bool:
+        """C++: MappingRuleCopy() — RuleCopy 외부 명령 실행."""
+        cmd = "~/NAA/Bin/RuleCopy -name RuleCopy -type 1"
+        return self._run_rule_copy(cmd, "Mapping Rule Copy")
+
+    def _run_rule_copy(self, cmd: str, label: str) -> bool:
+        logger.debug("%s : %s", label, cmd)
+        for retry in range(2):
+            ret = subprocess.call(cmd, shell=True)
+            logger.debug("%s Result : %d", label, ret)
+            if ret != -1:
+                logger.debug("%s Success", label)
+                return True
+            logger.error("%s Fail", label)
+        logger.error("%s RETRY FAIL", label)
+        return True                                 # C++ 원본: 항상 true 반환
+
+    # =========================================================================
+    # SendCmdOpenInfo
+    # =========================================================================
+
+    def SendCmdOpenInfo(self, port_info: AS_CMD_OPEN_PORT_T) -> None:
+        logger.debug("Receive CmdOpenInfo")
+        AsUtil.CmdOpenPortDisplay(port_info)
+        port_info.ConnectorId = self._connector_id_encode(
+            port_info.ConnectorId)
+        if self._connector_conn_mgr.SendCmdOpenInfo(port_info):
+            self._cmd_open_port_list.append(port_info)
+
+    # =========================================================================
+    # DataHandler 관련
+    # =========================================================================
+
+    def RecvDataHandlerInfo(self, info: AS_DATA_HANDLER_INFO_T) -> None:
+        """C++: RecvDataHandlerInfo(AS_DATA_HANDLER_INFO_T*)"""
+        import copy
+        logger.debug("Recv DataHandler Info DataHandlerId:%s "
+                     "RequestStatus:%s SettingStatus:%s",
+                     info.DataHandlerId,
+                     AsUtil.GetRequestStatusString(info.RequestStatus),
+                     AsUtil.GetStatusString(info.SettingStatus))
+
+        if info.RequestStatus == "UPDATE_DATA":
+            self._data_handler_info_map.pop(info.OldDataHandlerId, None)
+            self._data_handler_info_map[info.DataHandlerId] = copy.copy(info)
+        else:
+            existing = self._data_handler_info_map.get(info.DataHandlerId)
+            if existing is None:
+                existing = copy.copy(info)
+                self._data_handler_info_map[info.DataHandlerId] = existing
+            else:
+                existing.__dict__.update(info.__dict__)
+
+            if existing.RequestStatus == "DELETE_DATA":
+                del self._data_handler_info_map[info.DataHandlerId]
+            elif info.SettingStatus == START:
+                self.StartProc(ASCII_DATA_ROUTER, info.DataHandlerId)
+            elif existing.SettingStatus == STOP:
+                self._data_router_conn_mgr.StopProcess(info.DataHandlerId)
+
+        asyncio.ensure_future(
+            self._parser_conn_mgr.SendDataHandlerInfo(info))
+
+    def RecvInitInfo(self, init_info: AS_DATA_ROUTING_INIT_T) -> None:
+        logger.debug("Recv DataRouter Init Cmd DataRouter:%s Desc:%s",
+                     init_info.DataHandlerId, init_info.Desc)
+        self._data_router_conn_mgr.RecvInitInfo(init_info)
+
+    def GetDataHandlerInfo(self, dh_id: str) -> Optional[AS_DATA_HANDLER_INFO_T]:
+        return self._data_handler_info_map.get(dh_id)
+
+    def GetDataHandlerInfoMap(self) -> dict:
+        return self._data_handler_info_map
+
+    # =========================================================================
+    # 로그 상태 변경
+    # =========================================================================
+
+    def ReceiveCmdLogStatusChange(self,
+                                   log_ctl: AS_CMD_LOG_CONTROL_T) -> None:
+        dispatch = {
+            ASCII_CONNECTOR:   (self._connector_conn_mgr,   log_ctl.ProcessId),
+            ASCII_PARSER:      (self._parser_conn_mgr,      log_ctl.ProcessId),
+            ASCII_DATA_ROUTER: (self._data_router_conn_mgr, log_ctl.ProcessId),
+            ASCII_ROUTER:      (self._connector_conn_mgr,   log_ctl.ProcessId),
+        }
+        entry = dispatch.get(log_ctl.ProcessType)
+        if entry:
+            mgr, pid = entry
+            mgr.send_cmd_log_status_change(log_ctl, pid)
+        elif log_ctl.ProcessType == ASCII_MANAGER:
+            pass                                    # C++ 원본 동일하게 처리 없음
+        else:
+            logger.debug("Unknown Log Control ProcessType : %d",
+                         log_ctl.ProcessType)
+
+    # =========================================================================
+    # RouterStart
+    # =========================================================================
+
+    def RouterStart(self, router_name: str) -> None:
+        asyncio.ensure_future(
+            self._parser_conn_mgr.SendRouterConnInfo(router_name))
+
+    # =========================================================================
+    # 소켓 경로 헬퍼
+    # =========================================================================
+
+    def GetParserListenSocketPath(self, session_name: str) -> str:
+        pos = session_name.find("_")
+        name = session_name[pos + 1:] if pos != -1 else session_name
+        return self.GetUnixSocketDir() + UNIX_PARSER_LISTEN_PREFIX + name
+
+    def GetRouterListenSocketPath(self, session_name: str) -> str:
+        return self.GetUnixSocketDir() + UNIX_ROUTER_LISTEN_PREFIX + session_name
+
+    def GetDataRouterListenSocketPath(self, session_name: str) -> str:
+        return (self.GetUnixSocketDir() +
+                UNIX_DATAROUTER_LISTEN_PREFIX + session_name)
+
+    def GetMsgId(self) -> int:
+        self._msg_id -= 1
+        return self._msg_id
+
+    def GetAliveCheckLimitCnt(self) -> int:
+        cnt = int(self.GetEnvValue("MANAGER", "alive_check_maxcount") or 0)
+        return max(cnt, 5)
+
+    # =========================================================================
+    # ID 인코딩/디코딩
+    # =========================================================================
+
+    def _connector_id_encode(self, name: str) -> str:
+        return f"CONNECTOR_{name}"
+
+    def _connector_id_decode(self, session_name: str) -> str:
+        pos = session_name.find("_")
+        return session_name[pos + 1:] if pos != -1 else session_name
+
+    def _parser_id_encode(self, name: str) -> str:
+        return f"PARSER_{name}"
+
+    def _parser_id_decode(self, session_name: str) -> str:
+        pos = session_name.find("_")
+        return session_name[pos + 1:] if pos != -1 else session_name
+
+    # =========================================================================
+    # ConfigValueCheck / ReceiveTimeOut
+    # =========================================================================
+
+    def ConfigValueCheck(self) -> bool:
+        if not self._router_listen_port:
+            logger.error("Can't Find Config Value "
+                         "[ASCII_MANAGER:router_listen_port]")
+            return False
+        if not self._log_router_listen_port:
+            logger.error("Can't Find Config Value "
+                         "[ASCII_MANAGER:log_router_listen_port]")
+            return False
+        return True
+
+    def ReceiveTimeOut(self, reason: int, extra_reason=None) -> None:
+        logger.debug("Unknown TimeOut Reason : %d", reason)
+
+    # =========================================================================
+    # RunCommand (SSH — 치트시트: paramiko)
+    # =========================================================================
+
+    def RunCommand(self, ssh_id: str, ssh_pass: str,
+                   ip: str, command: str) -> bool:
+        try:
+            client = paramiko.SSHClient()
+            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            client.connect(ip, port=22, username=ssh_id,
+                           password=ssh_pass, timeout=10)
+            client.exec_command(command)
+            client.close()
+            logger.info("SSH Connect !!!!!! [%s@%s]", ssh_id, ip)
+            return True
+        except Exception as e:
+            logger.info("SSH Connect Fail!!!!!! : %s", e)
+            return False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 패킷 직렬화 헬퍼
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _pack(obj) -> bytes:
+    if hasattr(obj, 'pack'):
+        return obj.pack()
+    return b''
+
+def _size(obj) -> int:
+    return len(_pack(obj))

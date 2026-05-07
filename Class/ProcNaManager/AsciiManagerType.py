@@ -1,70 +1,96 @@
-import threading
-from collections import deque
+"""
+AsciiManagerType.py
+C++ AsciiManagerType.h/.C → Python 변환
 
-# -------------------------------------------------------
-# MmcPublishSet Class
-# -------------------------------------------------------
+ProcNaManager 전역 데이터 구조 정의.
+  - MmcPublishSet        : MMC 명령 + ConnectorId 묶음
+  - MmcPublishSetQueue   : thread-safe MMC 발행 큐
+  - MmcPublishSetQueueList : 우선순위별 큐 목록 (list[MmcPublishSetQueue])
+"""
+
+import threading
+import logging
+from collections import deque
+from typing import Optional
+
+from Common.CommTypeList import AS_MMC_PUBLISH_T
+
+logger = logging.getLogger(__name__)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MmcPublishSet
+# ─────────────────────────────────────────────────────────────────────────────
+
 class MmcPublishSet:
     """
-    MMC 명령과 해당 명령을 처리할 Connector ID를 묶어주는 데이터 클래스
+    C++: MmcPublishSet(AS_MMC_PUBLISH_T* MMCCom, string ConnectorId)
+    MMC 명령과 전송 대상 ConnectorId를 묶는 데이터 클래스.
     """
-    def __init__(self, mmc_publish, connector_id):
-        """
-        :param mmc_publish: AsMmcPublishT 객체 (MMC 명령어 정보)
-        :param connector_id: str (전송할 Connector 식별자)
-        """
-        self.m_MmcPublish = mmc_publish
-        self.m_ConnectorId = connector_id
 
-# -------------------------------------------------------
-# MmcPublishSetQueue Class
-# -------------------------------------------------------
+    def __init__(self, mmc_publish: AS_MMC_PUBLISH_T,
+                 connector_id: str) -> None:
+        self.m_MmcPublish:  AS_MMC_PUBLISH_T = mmc_publish
+        self.m_ConnectorId: str              = connector_id
+
+    def __del__(self) -> None:
+        # C++: delete m_MmcPublish → Python GC 처리
+        self.m_MmcPublish = None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MmcPublishSetQueue
+# ─────────────────────────────────────────────────────────────────────────────
+
 class MmcPublishSetQueue:
     """
-    MmcPublishSet 객체들을 저장하는 스레드 안전 큐 (Thread-Safe Queue)
+    C++: MmcPublishSetQueue : public list<MmcPublishSet*>
+    thread-safe MmcPublishSet 큐.
+    C++ pthread_mutex → threading.Lock
+    C++ list<MmcPublishSet*> → collections.deque
     """
-    def __init__(self, queue_number=0):
-        """
-        C++: MmcPublishSetQueue(int QueueNumber)
-        """
-        self.m_QueueNumber = queue_number
-        self.m_MmcPublishSetLock = threading.Lock()
-        
-        # C++ std::list -> Python deque (Double-ended queue)
-        # deque는 양쪽 끝에서의 추가/삭제가 O(1)로 효율적임
-        self.m_Queue = deque()
 
-    def __del__(self):
-        """
-        C++: ~MmcPublishSetQueue()
-        """
-        self.m_Queue.clear()
+    def __init__(self, queue_number: int = 0) -> None:
+        self.m_QueueNumber:        int            = queue_number
+        self._lock:                threading.Lock = threading.Lock()
+        self._queue: deque[MmcPublishSet]         = deque()
 
-    def get_mmc_publish_set(self):
+    def __del__(self) -> None:
+        self._queue.clear()
+
+    def GetMmcPublishSet(self) -> Optional[MmcPublishSet]:
         """
         C++: MmcPublishSet* GetMmcPublishSet()
-        큐의 맨 앞에서 데이터를 꺼내 반환 (Pop Front)
+        큐 앞에서 MmcPublishSet을 꺼내 반환. 비어있으면 None.
+        C++: pthread_mutex_lock/unlock → threading.Lock (with 문)
         """
-        mmc_com_set = None
-        
-        # C++: pthread_mutex_lock
-        with self.m_MmcPublishSetLock:
-            if self.m_Queue:
-                # C++: begin(), erase() -> pop_front()
-                mmc_com_set = self.m_Queue.popleft()
-                
-        # C++: pthread_mutex_unlock (with 블록 종료 시 자동 처리)
-        return mmc_com_set
+        with self._lock:
+            if self._queue:
+                return self._queue.popleft()    # C++: begin() → erase()
+        return None
 
-    def insert_mmc_publish_set(self, mmc_publish_set):
+    def InsertMMCPublishSet(self, mmc_publish_set: MmcPublishSet) -> None:
         """
         C++: void InsertMMCPublishSet(MmcPublishSet* MMCPublishSet)
-        큐의 맨 뒤에 데이터를 추가 (Push Back)
+        큐 뒤에 MmcPublishSet 추가.
         """
-        # 디버그 로그 (필요 시 주석 해제)
-        # print(f"[MmcPublishSetQueue] Queue({self.m_QueueNumber}) Lock")
-        
-        with self.m_MmcPublishSetLock:
-            self.m_Queue.append(mmc_publish_set)
-            
-        # print(f"[MmcPublishSetQueue] Queue({self.m_QueueNumber}) UnLock")
+        logger.debug("Queue(%d) Lock", self.m_QueueNumber)
+        with self._lock:
+            self._queue.append(mmc_publish_set)  # C++: push_back()
+        logger.debug("Queue(%d) UnLock", self.m_QueueNumber)
+
+    def __len__(self) -> int:
+        return len(self._queue)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MmcPublishSetQueueList
+# ─────────────────────────────────────────────────────────────────────────────
+
+class MmcPublishSetQueueList(list):
+    """
+    C++: MmcPublishSetQueueList : public vector<MmcPublishSetQueue*>
+    우선순위별 MmcPublishSetQueue 목록.
+    AsciiManagerWorld.__init__ 에서 큐 2개를 생성하여 채운다.
+    """
+    pass

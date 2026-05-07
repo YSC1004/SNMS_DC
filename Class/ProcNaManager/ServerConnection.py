@@ -1,199 +1,201 @@
-import sys
+"""
+ProcNaManager/ServerConnection.py
+C++ ServerConnection.h/.C (procNaManager) → Python 변환
+
+procNaServer와의 TCP 소켓 연결 처리.
+  - procNaServer로부터 CMD_OPEN_PORT / CMD_MMC_PUBLISH_REQ 등 수신
+  - procNaServer로 PROCESS_INFO / PORT_STATUS_INFO / MMC_RESULT 등 전송
+  - 소켓 종료 시 프로세스 종료 (SIGINT → sys.exit)
+
+※ ProcNaServer의 ServerConnection(Active↔Standby)과 다른 별개 클래스.
+"""
+
+import asyncio
+import logging
 import os
 import signal
-import copy
+import sys
+from typing import List, TYPE_CHECKING
 
-# -------------------------------------------------------
-# Project Path Setup
-# -------------------------------------------------------
-current_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.abspath(os.path.join(current_dir, '../..'))
-if project_root not in sys.path:
-    sys.path.append(project_root)
+from Common.AsSocket import AsSocket                    # 가상함수 오버라이드 (치트시트)
+from Common.CommTypeList import (
+    AS_CMD_OPEN_PORT_T, AS_MMC_PUBLISH_T, AS_MMC_RESULT_T,
+    AS_LOG_STATUS_T, AS_CMD_LOG_CONTROL_T, AS_ASCII_ERROR_MSG_T,
+    AS_PROCESS_STATUS_T, AS_PROCESS_STATUS_LIST_T,
+    AS_PORT_STATUS_INFO_T, AS_PROC_CONTROL_T, AS_SESSION_CONTROL_T,
+    AS_RULE_CHANGE_INFO_T, AS_DATA_HANDLER_INFO_T, AS_DATA_ROUTING_INIT_T,
+    AS_CONNECTOR_PORT_INFO_REQ_T,
+)
+from Common.CommType import (
+    CMD_OPEN_PORT, CMD_MMC_PUBLISH_REQ, CMD_LOG_STATUS_CHANGE,
+    PROC_CONTROL, SESSION_CONTROL, CMD_PROC_TERMINATE,
+    CMD_PARSING_RULE_DOWN, CMD_MAPPING_RULE_DOWN,
+    CMD_PARSING_RULE_CHANGE,
+    AS_DATA_HANDLER_INFO, AS_DATA_ROUTING_INIT,
+    CMD_MMC_PUBLISH_RES, CONNECTOR_PORT_INFO_REQ,
+    ASCII_ERROR_MSG, PROCESS_INFO, PROCESS_INFO_LIST,
+    PORT_STATUS_INFO,
+)
 
-from Class.Common.AsSocket import AsSocket
-from Class.Common.CommType import *
-from Class.Common.AsUtil import AsUtil
+logger = logging.getLogger(__name__)
+
+# AS_PROCESS_STATUS_LIST_T의 최대 개수
+try:
+    from Common.CommType import PROCESS_STATUS_LIST_MAX
+except ImportError:
+    PROCESS_STATUS_LIST_MAX = 50                    # fallback 기본값
+
 
 class ServerConnection(AsSocket):
     """
-    Handles the upstream connection to the Main Server (Active/Standby).
-    Receives control commands and sends status updates/results.
+    C++ ServerConnection (AsSocket 상속, procNaManager 버전) 대응.
+
+    procNaServer에 Connect하는 클라이언트 소켓.
+    AsciiManagerWorld._server_connection 으로 보유.
+
+    AsSocket 가상 메서드 오버라이드:
+      receive_packet()  ← C++ ReceivePacket()
+      close_socket()    ← C++ CloseSocket()
     """
-    def __init__(self, parent_mgr):
-        """
-        C++: ServerConnection() (Managed manually in World, not via ConnMgr usually)
-        """
+
+    def __init__(self, conn_mgr=None) -> None:
         super().__init__()
-        self.m_ParentMgr = parent_mgr # Usually None or passed for structure
+        # conn_mgr 인자는 인터페이스 통일용 (ServerConnMgr 없음)
 
-    def __del__(self):
-        """
-        C++: ~ServerConnection()
-        """
-        super().__del__()
+    # =========================================================================
+    # AsSocket 가상 메서드 오버라이드
+    # =========================================================================
 
-    def receive_packet(self, packet, session_identify=0):
-        """
-        C++: void ReceivePacket(PACKET_T* Packet, const int SessionIdentify)
-        """
-        msg_id = packet.msg_id
-        
-        from AsciiManagerWorld import AsciiManagerWorld
-        world = AsciiManagerWorld._instance
+    def receive_packet(self, packet, session_identify: int = -1) -> None:
+        """C++: virtual ReceivePacket(PACKET_T*, const int SessionIdentify)"""
+        from ProcNaManager.AsciiManagerWorld import MAINPTR
+
+        msg_id = packet.MsgId
 
         if msg_id == CMD_OPEN_PORT:
-            info = AsCmdOpenPortT.unpack(packet.msg_body)
-            if info: self.recv_cmd_open_port_req(info)
+            MAINPTR().SendCmdOpenInfo(packet.Msg)
 
         elif msg_id == CMD_MMC_PUBLISH_REQ:
-            mmc_pub = AsMmcPublishT.unpack(packet.msg_body)
-            if mmc_pub: self.receive_mmc_command(mmc_pub)
+            MAINPTR().SendMMCCommand(packet.Msg)
 
         elif msg_id == CMD_LOG_STATUS_CHANGE:
-            log_ctl = AsCmdLogControlT.unpack(packet.msg_body)
-            if log_ctl: self.receive_cmd_log_status_change(log_ctl)
+            MAINPTR().ReceiveCmdLogStatusChange(packet.Msg)
 
         elif msg_id == PROC_CONTROL:
-            proc_ctl = AsProcControlT.unpack(packet.msg_body)
-            if proc_ctl: world.recv_process_control(proc_ctl)
+            MAINPTR().RecvProcessControl(packet.Msg)
 
         elif msg_id == SESSION_CONTROL:
-            sess_ctl = AsSessionControlT.unpack(packet.msg_body)
-            if sess_ctl: world.recv_session_control(sess_ctl)
+            MAINPTR().RecvSessionControl(packet.Msg)
 
         elif msg_id == CMD_PROC_TERMINATE:
-            print("[ServerConnection] RECV CMD_PROC_TERMINATE..............")
+            # C++: CloseSocket(0); return
+            logger.debug("RECV CMD_PROC_TERMINATE..............")
             self.close_socket(0)
-            return
 
         elif msg_id == CMD_PARSING_RULE_DOWN:
-            world.recv_cmd_parsing_rule_down()
+            MAINPTR().RecvCmdParsingRuleDown()
 
         elif msg_id == CMD_MAPPING_RULE_DOWN:
-            world.recv_cmd_mapping_rule_down()
+            MAINPTR().RecvCmdMappingRuleDown()
 
         elif msg_id == CMD_PARSING_RULE_CHANGE:
-            info = AsRuleChangeInfoT.unpack(packet.msg_body)
-            if info: world.parser_rule_change(info)
+            MAINPTR().ParserRuleChange(packet.Msg)
 
         elif msg_id == AS_DATA_HANDLER_INFO:
-            info = AsDataHandlerInfoT.unpack(packet.msg_body)
-            if info: world.recv_data_handler_info(info)
+            MAINPTR().RecvDataHandlerInfo(packet.Msg)
 
         elif msg_id == AS_DATA_ROUTING_INIT:
-            info = AsDataRoutingInitT.unpack(packet.msg_body)
-            if info: world.recv_init_info(info)
+            MAINPTR().RecvInitInfo(packet.Msg)
 
         else:
-            print(f"[ServerConnection] Unknown Msg Id : {msg_id}")
+            logger.debug("Unknown Msg Id : %d", msg_id)
 
-    def close_socket(self, errno_val=0):
+    def close_socket(self, errno_val: int) -> None:
         """
-        C++: void CloseSocket(int Errno)
-        If the server connection breaks, the Manager process terminates itself
-        to allow HA or restart mechanisms to take over.
+        C++: virtual CloseSocket(int Errno)
+        C++: kill(getpid(), SIGINT) → Python: os.kill(os.getpid(), SIGINT)
+        서버 연결 끊김 시 프로세스 종료.
         """
-        print("[ServerConnection] [CORE_ERROR] Server Connection Broken")
-        # C++: kill(getpid(), SIGINT)
-        os.kill(os.getpid(), signal.SIGINT)
+        logger.error("Server Connection Broken")
+        try:
+            os.kill(os.getpid(), signal.SIGINT)
+        except Exception:
+            sys.exit(1)
 
-    def connector_port_info_request(self, connector_name):
-        """
-        C++: void ConnectorPortInfoRequest(string ConnectorName)
-        """
-        req = AsConnectorPortInfoReqT()
+    # =========================================================================
+    # 전송 메서드
+    # =========================================================================
+
+    async def ConnectorPortInfoRequest(self, connector_name: str) -> None:
+        """C++: ConnectorPortInfoRequest(string ConnectorName)"""
+        req = AS_CONNECTOR_PORT_INFO_REQ_T()
         req.ConnectorId = connector_name
-        
-        print(f"[ServerConnection] Send ConnectorPortInfoReq : {connector_name}")
-        
-        body = req.pack()
-        self.packet_send(PacketT(CONNECTOR_PORT_INFO_REQ, len(body), body))
+        payload = _pack(req)
+        await self.SendPacket(CONNECTOR_PORT_INFO_REQ, payload, len(payload))
+        logger.debug("Send ConnectorPortInfoReq : %s", connector_name)
 
-    def recv_cmd_open_port_req(self, port_info):
-        """
-        C++: void RecvCmdOpenPortReq(AS_CMD_OPEN_PORT_T* PortInfo)
-        """
-        from AsciiManagerWorld import AsciiManagerWorld
-        AsciiManagerWorld._instance.send_cmd_open_info(port_info)
+    async def SendCommandResponse(self, mmc_result: AS_MMC_RESULT_T) -> None:
+        """C++: SendCommandResponse(AS_MMC_RESULT_T*)"""
+        payload = _pack(mmc_result)
+        await self.SendPacket(CMD_MMC_PUBLISH_RES, payload, len(payload))
 
-    def receive_mmc_command(self, mmc_com):
-        """
-        C++: void ReceiveMMCCommand(AS_MMC_PUBLISH_T* MMCCom)
-        """
-        from AsciiManagerWorld import AsciiManagerWorld
-        AsciiManagerWorld._instance.send_mmc_command(mmc_com)
+    def SendLogStatus(self, status: AS_LOG_STATUS_T) -> None:
+        """C++: SendLogStatus(AS_LOG_STATUS_T*) — C++ 원본 미사용(주석처리)."""
+        pass                                        # C++ 원본: not use
 
-    def send_command_response(self, mmc_result):
-        """
-        C++: void SendCommandResponse(AS_MMC_RESULT_T* MmcResult)
-        """
-        body = mmc_result.pack()
-        self.packet_send(PacketT(CMD_MMC_PUBLISH_RES, len(body), body))
+    async def SendAsciiError(self, err_msg: AS_ASCII_ERROR_MSG_T) -> None:
+        """C++: SendAsciiError(AS_ASCII_ERROR_MSG_T*)"""
+        from ProcNaManager.AsciiManagerWorld import MAINPTR
+        err_msg.ManagerId = MAINPTR().GetProcName()
+        payload = _pack(err_msg)
+        await self.SendPacket(ASCII_ERROR_MSG, payload, len(payload))
 
-    def send_log_status(self, status):
-        """
-        C++: void SendLogStatus(AS_LOG_STATUS_T* Status)
-        """
-        # C++ comment: not use
-        # body = status.pack()
-        # self.packet_send(PacketT(AS_LOG_INFO, len(body), body))
-        pass
+    async def SendProcessInfo(
+            self, proc_info: AS_PROCESS_STATUS_T) -> None:
+        """C++: SendProcessInfo(AS_PROCESS_STATUS_T*) — 단일 프로세스 상태."""
+        payload = _pack(proc_info)
+        await self.SendPacket(PROCESS_INFO, payload, len(payload))
 
-    def receive_cmd_log_status_change(self, log_ctl):
+    async def SendProcessInfoList(
+            self, proc_info_list: List[AS_PROCESS_STATUS_T]) -> None:
         """
-        C++: void ReceiveCmdLogStatusChange(AS_CMD_LOG_CONTROL_T* LogCtl)
+        C++: SendProcessInfo(ProcessInfoList*) — 복수 프로세스 상태.
+        PROCESS_STATUS_LIST_MAX 단위로 분할 전송.
         """
-        from AsciiManagerWorld import AsciiManagerWorld
-        AsciiManagerWorld._instance.receive_cmd_log_status_change(log_ctl)
+        proc_status_list = AS_PROCESS_STATUS_LIST_T()
+        pos = 0
 
-    def send_ascii_error(self, err_msg):
-        """
-        C++: void SendAsciiError(AS_ASCII_ERROR_MSG_T* ErrMsg)
-        """
-        from AsciiManagerWorld import AsciiManagerWorld
-        # Set ManagerId before sending
-        err_msg.ManagerId = AsciiManagerWorld._instance.get_proc_name()
-        
-        body = err_msg.pack()
-        self.packet_send(PacketT(ASCII_ERROR_MSG, len(body), body))
+        for proc_info in proc_info_list:
+            proc_status_list.ProcStatus[pos] = proc_info
+            if pos >= PROCESS_STATUS_LIST_MAX - 2:
+                proc_status_list.ProcStatusNo = PROCESS_STATUS_LIST_MAX
+                payload = _pack(proc_status_list)
+                await self.SendPacket(
+                    PROCESS_INFO_LIST, payload, len(payload))
+                proc_status_list = AS_PROCESS_STATUS_LIST_T()
+                pos = -1
+            pos += 1
 
-    def send_process_info_list(self, proc_info_list):
-        """
-        C++: void SendProcessInfo(ProcessInfoList* ProcInfoList)
-        Chunks the list into PROCESS_STATUS_LIST_MAX blocks and sends them.
-        """
-        # PROCESS_STATUS_LIST_MAX is defined in CommType, assume e.g., 50
-        
-        chunk_size = PROCESS_STATUS_LIST_MAX - 2 # Logic from C++: if pos > MAX-2
-        
-        # In Python, we can simply chunk the list
-        for i in range(0, len(proc_info_list), chunk_size):
-            chunk = proc_info_list[i : i + chunk_size]
-            
-            proc_status_list = AsProcessStatusListT()
-            proc_status_list.ProcStatusNo = len(chunk)
-            proc_status_list.ProcStatus = chunk # List of AsProcessStatusT
-            
-            # Pad with dummy if strict struct packing is used, 
-            # or AsProcessStatusListT.pack() handles variable length.
-            # Assuming CommType handles it.
-            
-            body = proc_status_list.pack()
-            self.packet_send(PacketT(PROCESS_INFO_LIST, len(body), body))
+        if pos > 0:
+            proc_status_list.ProcStatusNo = pos
+            payload = _pack(proc_status_list)
+            await self.SendPacket(PROCESS_INFO_LIST, payload, len(payload))
 
-        print(f"[ServerConnection] Process Info List Send Success(cnt : {len(proc_info_list)})")
+        logger.debug("Process Info List Send Success(cnt : %d)",
+                     len(proc_info_list))
 
-    def send_process_info(self, proc_info):
-        """
-        C++: void SendProcessInfo(AS_PROCESS_STATUS_T* ProcInfo)
-        """
-        body = proc_info.pack()
-        self.packet_send(PacketT(PROCESS_INFO, len(body), body))
+    async def SendPortInfo(self,
+                           status_info: AS_PORT_STATUS_INFO_T) -> None:
+        """C++: SendPortInfo(AS_PORT_STATUS_INFO_T*)"""
+        payload = _pack(status_info)
+        await self.SendPacket(PORT_STATUS_INFO, payload, len(payload))
 
-    def send_port_info(self, status_info):
-        """
-        C++: void SendPortInfo(AS_PORT_STATUS_INFO_T* StatusInfo)
-        """
-        body = status_info.pack()
-        self.packet_send(PacketT(PORT_STATUS_INFO, len(body), body))
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 패킷 직렬화 헬퍼
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _pack(obj) -> bytes:
+    if hasattr(obj, 'pack'):
+        return obj.pack()
+    return b''
